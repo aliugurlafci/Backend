@@ -1,0 +1,55 @@
+import type { EntityDef } from "../types";
+
+export const campaignEntity: EntityDef = {
+  name: "campaign",
+  label: "Campaign",
+  pluralLabel: "Campaigns",
+  icon: "campaign",
+  group: "marketing",
+  titleField: "name",
+  ownable: true,
+  board: { groupByField: "status" },
+  fields: [
+    { name: "name", label: "Campaign Name", type: "string", required: true, searchable: true, sortable: true, min: 1, max: 160 },
+    {
+      name: "channel",
+      label: "Channel",
+      type: "enum",
+      required: true,
+      filterable: true,
+      defaultValue: "email",
+      options: [
+        { value: "email", label: "Email", tone: "info" },
+        { value: "sms", label: "SMS", tone: "neutral" },
+        { value: "social", label: "Social", tone: "success" },
+        { value: "whatsapp", label: "WhatsApp", tone: "success" },
+      ],
+    },
+    {
+      name: "status",
+      label: "Status",
+      type: "enum",
+      required: true,
+      filterable: true,
+      sortable: true,
+      defaultValue: "draft",
+      options: [
+        { value: "draft", label: "Draft", tone: "neutral" },
+        { value: "scheduled", label: "Scheduled", tone: "info" },
+        { value: "running", label: "Running", tone: "warning" },
+        { value: "completed", label: "Completed", tone: "success" },
+        { value: "archived", label: "Archived", tone: "neutral" },
+      ],
+    },
+    { name: "budget", label: "Budget", type: "currency", sortable: true, min: 0 },
+    { name: "sent", label: "Sent", type: "number", sortable: true, min: 0 },
+    { name: "startDate", label: "Start Date", type: "date", sortable: true },
+    { name: "endDate", label: "End Date", type: "date", sortable: true },
+  ],
+  listColumns: [
+    { field: "name", width: 220 },
+    { field: "channel", width: 120 },
+    { field: "status", width: 130 },
+    { field: "budget", width: 120 },
+  ],
+};
