@@ -14,6 +14,8 @@ export const employeeEntity: EntityDef = {
     { name: "phone", label: "Phone", type: "phone", pii: true },
     { name: "title", label: "Job Title", type: "string", searchable: true, sortable: true, suggest: true },
     { name: "departmentId", label: "Department", type: "reference", referenceEntity: "department", filterable: true },
+    { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
+    { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
     {
       name: "status",
       label: "Status",
@@ -29,9 +31,11 @@ export const employeeEntity: EntityDef = {
     },
   ],
   listColumns: [
-    { field: "firstName", width: 160 },
-    { field: "lastName", width: 160 },
-    { field: "title", width: 200 },
+    { field: "firstName", width: 150 },
+    { field: "lastName", width: 150 },
+    { field: "title", width: 180 },
+    { field: "branchId", width: 160 },
+    { field: "dealerId", width: 160 },
     { field: "status", width: 120 },
   ],
 };

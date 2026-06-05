@@ -1,5 +1,5 @@
 import type { EntityDef } from "../types";
-import { CURRENCY_OPTIONS } from "./shared";
+import { branchRef, currencyField, dealerRef, moneyTotals, notesField, numberField, paidBalance } from "./shared";
 
 /** Phase F5 — Invoice header (AR). Totals computed from lines; amountPaid/balance
  *  computed from applied payments. `number` assigned by the finance service. */
@@ -12,9 +12,11 @@ export const invoiceEntity: EntityDef = {
   titleField: "number",
   ownable: true,
   fields: [
-    { name: "number", label: "Number", type: "string", readOnly: true, searchable: true, sortable: true },
+    numberField(),
     { name: "accountId", label: "Account", type: "reference", referenceEntity: "account", required: true, filterable: true },
     { name: "quoteId", label: "Source Quote", type: "reference", referenceEntity: "quote" },
+    branchRef(),
+    dealerRef(),
     {
       name: "status",
       label: "Status",
@@ -32,15 +34,12 @@ export const invoiceEntity: EntityDef = {
         { value: "void", label: "Void", tone: "neutral" },
       ],
     },
-    { name: "currencyCode", label: "Currency", type: "enum", defaultValue: "USD", options: CURRENCY_OPTIONS },
+    currencyField(),
     { name: "issueDate", label: "Issue Date", type: "date", sortable: true },
     { name: "dueDate", label: "Due Date", type: "date", sortable: true },
-    { name: "subtotal", label: "Subtotal", type: "currency", computed: true },
-    { name: "taxTotal", label: "Tax", type: "currency", computed: true },
-    { name: "total", label: "Total", type: "currency", computed: true, sortable: true },
-    { name: "amountPaid", label: "Paid", type: "currency", computed: true },
-    { name: "balance", label: "Balance", type: "currency", computed: true, sortable: true },
-    { name: "notes", label: "Notes", type: "text" },
+    ...moneyTotals(),
+    ...paidBalance(),
+    notesField(),
   ],
   listColumns: [
     { field: "number", width: 120 },

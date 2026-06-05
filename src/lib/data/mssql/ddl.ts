@@ -4,6 +4,12 @@
  * Produces idempotent CREATE TABLE / CREATE INDEX statements for every entity
  * plus the platform support tables. Re-runnable: each statement guards itself
  * with IF NOT EXISTS so `migrate` can be applied repeatedly without error.
+ *
+ * Record ids are `INT IDENTITY(1,1)` and reference columns are `INT`. NOTE: this
+ * is a fresh-DB schema — the additive ALTER path below only adds nullable
+ * columns and never converts an existing column's type, so a database already
+ * provisioned with the old NVARCHAR id columns cannot be migrated in place;
+ * pick up INT ids by creating/seeding a fresh database.
  */
 import type { EntityDef } from "@/lib/metadata/types";
 import { entityColumns, ident, type ColumnDesc } from "./schema-map";
@@ -25,6 +31,10 @@ function ddlColumnType(col: ColumnDesc): string {
 }
 
 function columnDdl(col: ColumnDesc): string {
+  if (col.identity) {
+    // The id PK: DB-assigned, monotonically increasing by 1.
+    return `${ident(col.name)} INT IDENTITY(1,1) NOT NULL`;
+  }
   return `${ident(col.name)} ${ddlColumnType(col)} ${col.notNull ? "NOT NULL" : "NULL"}`;
 }
 

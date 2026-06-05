@@ -13,6 +13,8 @@ export const paymentEntity: EntityDef = {
     { name: "number", label: "Number", type: "string", readOnly: true, searchable: true, sortable: true },
     { name: "invoiceId", label: "Invoice", type: "reference", referenceEntity: "invoice", required: true, filterable: true },
     { name: "accountId", label: "Account", type: "reference", referenceEntity: "account", filterable: true },
+    { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
+    { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
     { name: "amount", label: "Amount", type: "currency", required: true, min: 0, sortable: true },
     {
       name: "method",

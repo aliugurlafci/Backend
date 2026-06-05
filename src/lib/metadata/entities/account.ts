@@ -27,6 +27,8 @@ export const accountEntity: EntityDef = {
     { name: "phone", label: "Phone", type: "phone" },
     { name: "annualRevenue", label: "Annual Revenue", type: "currency", sortable: true, filterable: true, min: 0 },
     { name: "employees", label: "Employees", type: "number", sortable: true, min: 0 },
+    { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
+    { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
   ],
   listColumns: [
     { field: "name", width: 260 },

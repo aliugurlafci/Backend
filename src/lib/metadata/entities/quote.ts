@@ -1,5 +1,5 @@
 import type { EntityDef } from "../types";
-import { CURRENCY_OPTIONS } from "./shared";
+import { branchRef, currencyField, dealerRef, moneyTotals, notesField, numberField } from "./shared";
 
 /** Phase F4 — Quote header. Totals are computed from quote lines. `number` is
  *  assigned by the finance service on create. */
@@ -12,7 +12,7 @@ export const quoteEntity: EntityDef = {
   titleField: "number",
   ownable: true,
   fields: [
-    { name: "number", label: "Number", type: "string", readOnly: true, searchable: true, sortable: true },
+    numberField(),
     { name: "accountId", label: "Account", type: "reference", referenceEntity: "account", required: true, filterable: true },
     {
       name: "status",
@@ -30,12 +30,12 @@ export const quoteEntity: EntityDef = {
         { value: "expired", label: "Expired", tone: "warning" },
       ],
     },
-    { name: "currencyCode", label: "Currency", type: "enum", defaultValue: "USD", options: CURRENCY_OPTIONS },
+    currencyField(),
+    branchRef(),
+    dealerRef(),
     { name: "validUntil", label: "Valid Until", type: "date", sortable: true },
-    { name: "subtotal", label: "Subtotal", type: "currency", computed: true },
-    { name: "taxTotal", label: "Tax", type: "currency", computed: true },
-    { name: "total", label: "Total", type: "currency", computed: true, sortable: true },
-    { name: "notes", label: "Notes", type: "text" },
+    ...moneyTotals(),
+    notesField(),
   ],
   listColumns: [
     { field: "number", width: 120 },

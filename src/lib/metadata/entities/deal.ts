@@ -36,6 +36,8 @@ export const dealEntity: EntityDef = {
     { name: "probability", label: "Probability %", type: "number", min: 0, max: 100 },
     { name: "closeDate", label: "Close Date", type: "date", sortable: true },
     { name: "accountId", label: "Account", type: "reference", referenceEntity: "account", filterable: true },
+    { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
+    { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
   ],
   listColumns: [
     { field: "name", width: 240 },

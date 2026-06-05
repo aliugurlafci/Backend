@@ -1,30 +1,47 @@
 /**
  * Email transport — SMTP send (nodemailer) + IMAP fetch (imapflow).
  *
- * Both are optional: when the SMTP and IMAP env vars are unset the mailbox is
- * DB-only (compose just stores to "sent"; sync is a no-op). When configured,
- * compose sends real mail and `/email/sync` pulls the real inbox into the
- * `email` entity table.
+ * The connection is resolved from the DB-backed Email integration (Automation →
+ * Integrations) with the SMTP/IMAP env vars as the fallback. So mail config is
+ * managed in the database and editable from the app; when nothing is configured
+ * the mailbox is DB-only (compose stores to "sent"; sync is a no-op).
  */
 import nodemailer, { type Transporter } from "nodemailer";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { env, smtpConfigured, imapConfigured } from "@/lib/config/env";
+import { automationStore } from "@/lib/automation/store";
+import { resolveEmailConfig, type ResolvedEmailConfig } from "@/lib/automation/integrations";
 import { logger } from "@/lib/observability/logger";
 
-let transporter: Transporter | null = null;
+/** Tenant scope used to resolve the per-tenant email connection. */
+export interface EmailScope {
+  tenantId: string;
+  orgId: string;
+}
 
-function getTransporter(): Transporter | null {
-  if (!smtpConfigured) return null;
-  if (!transporter) {
-    transporter = nodemailer.createTransport({
-      host: env.SMTP_HOST,
-      port: env.SMTP_PORT,
-      secure: env.SMTP_SECURE, // true for 465, false for 587/STARTTLS
-      auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASS } : undefined,
+/** Resolve the effective email connection: DB integration (per tenant) → env. */
+async function resolve(scope?: EmailScope): Promise<ResolvedEmailConfig> {
+  if (scope) return automationStore.resolveEmail(scope.tenantId, scope.orgId);
+  return resolveEmailConfig(null, true); // env-only fallback (treated as enabled)
+}
+
+// SMTP transporters are cached per distinct connection so repeated sends reuse a
+// pooled connection; the cache key is the resolved SMTP tuple.
+const transporters = new Map<string, Transporter>();
+
+function transporterFor(cfg: ResolvedEmailConfig): Transporter {
+  const key = `${cfg.smtpHost}:${cfg.smtpPort}:${cfg.smtpUser}:${cfg.smtpSecure}`;
+  let tx = transporters.get(key);
+  if (!tx) {
+    tx = nodemailer.createTransport({
+      host: cfg.smtpHost,
+      port: cfg.smtpPort,
+      secure: cfg.smtpSecure, // true for 465, false for 587/STARTTLS
+      auth: cfg.smtpUser ? { user: cfg.smtpUser, pass: cfg.smtpPass } : undefined,
     });
+    transporters.set(key, tx);
   }
-  return transporter;
+  return tx;
 }
 
 export interface OutgoingMail {
@@ -34,11 +51,11 @@ export interface OutgoingMail {
 }
 
 /** Send an email via SMTP. Returns the provider message id, or null when SMTP is unconfigured. */
-export async function sendMail(mail: OutgoingMail): Promise<string | null> {
-  const tx = getTransporter();
-  if (!tx) return null;
-  const info = await tx.sendMail({
-    from: env.SMTP_FROM || env.SMTP_USER,
+export async function sendMail(mail: OutgoingMail, scope?: EmailScope): Promise<string | null> {
+  const cfg = await resolve(scope);
+  if (!cfg.smtpConfigured) return null;
+  const info = await transporterFor(cfg).sendMail({
+    from: cfg.smtpFrom || cfg.smtpUser,
     to: mail.to,
     subject: mail.subject,
     text: mail.text,
@@ -55,12 +72,12 @@ export interface FetchedMail {
   messageId: string;
 }
 
-function makeImapClient(): ImapFlow {
+function makeImapClient(cfg: ResolvedEmailConfig): ImapFlow {
   return new ImapFlow({
-    host: env.IMAP_HOST!,
-    port: env.IMAP_PORT,
-    secure: env.IMAP_SECURE,
-    auth: { user: env.IMAP_USER!, pass: env.IMAP_PASS ?? "" },
+    host: cfg.imapHost,
+    port: cfg.imapPort,
+    secure: cfg.imapSecure,
+    auth: { user: cfg.imapUser, pass: cfg.imapPass },
     logger: false,
   });
 }
@@ -75,13 +92,14 @@ export interface MailHeader {
  * are new. With no `limit` the whole mailbox is scanned; pass a positive number
  * to scan just the most recent N (new mail is always recent, so this stays fast).
  */
-export async function fetchHeaders(limit?: number): Promise<MailHeader[]> {
-  if (!imapConfigured) return [];
-  const client = makeImapClient();
+export async function fetchHeaders(scope?: EmailScope, limit?: number): Promise<MailHeader[]> {
+  const cfg = await resolve(scope);
+  if (!cfg.imapConfigured) return [];
+  const client = makeImapClient(cfg);
   const out: MailHeader[] = [];
   await client.connect();
   try {
-    const lock = await client.getMailboxLock(env.IMAP_MAILBOX);
+    const lock = await client.getMailboxLock(cfg.imapMailbox);
     try {
       const mailbox = client.mailbox;
       const total = typeof mailbox === "object" && mailbox ? mailbox.exists : 0;
@@ -100,13 +118,14 @@ export async function fetchHeaders(limit?: number): Promise<MailHeader[]> {
 }
 
 /** Download + parse full bodies for the given UIDs (chunked to keep IMAP commands small). */
-export async function fetchBodiesByUid(uids: number[]): Promise<FetchedMail[]> {
-  if (!imapConfigured || uids.length === 0) return [];
-  const client = makeImapClient();
+export async function fetchBodiesByUid(uids: number[], scope?: EmailScope): Promise<FetchedMail[]> {
+  const cfg = await resolve(scope);
+  if (!cfg.imapConfigured || uids.length === 0) return [];
+  const client = makeImapClient(cfg);
   const out: FetchedMail[] = [];
   await client.connect();
   try {
-    const lock = await client.getMailboxLock(env.IMAP_MAILBOX);
+    const lock = await client.getMailboxLock(cfg.imapMailbox);
     try {
       for (let i = 0; i < uids.length; i += 200) {
         const chunk = uids.slice(i, i + 200);
@@ -117,7 +136,7 @@ export async function fetchBodiesByUid(uids: number[]): Promise<FetchedMail[]> {
             subject: parsed.subject ?? "(no subject)",
             body: parsed.text ?? parsed.html?.toString() ?? "",
             receivedAt: (parsed.date ?? new Date()).toISOString(),
-            messageId: parsed.messageId ?? `${msg.uid}@${env.IMAP_HOST}`,
+            messageId: parsed.messageId ?? `${msg.uid}@${cfg.imapHost}`,
           });
         }
       }
@@ -135,19 +154,19 @@ export async function fetchBodiesByUid(uids: number[]): Promise<FetchedMail[]> {
  * mailbox is pulled; pass a positive number to fetch only the most recent N.
  * Returns an empty list when IMAP is unconfigured.
  */
-export async function fetchInbox(limit?: number): Promise<FetchedMail[]> {
-  if (!imapConfigured) return [];
-  const client = makeImapClient();
+export async function fetchInbox(scope?: EmailScope, limit?: number): Promise<FetchedMail[]> {
+  const cfg = await resolve(scope);
+  if (!cfg.imapConfigured) return [];
+  const client = makeImapClient(cfg);
 
   const out: FetchedMail[] = [];
   await client.connect();
   try {
-    const lock = await client.getMailboxLock(env.IMAP_MAILBOX);
+    const lock = await client.getMailboxLock(cfg.imapMailbox);
     try {
       const mailbox = client.mailbox;
       const total = typeof mailbox === "object" && mailbox ? mailbox.exists : 0;
       if (!total) return [];
-      // No limit → fetch the entire mailbox (1:*); otherwise just the most recent N.
       const from = limit && limit > 0 ? Math.max(1, total - limit + 1) : 1;
       for await (const msg of client.fetch(`${from}:*`, { source: true })) {
         const parsed = await simpleParser(msg.source as Buffer);
@@ -156,7 +175,7 @@ export async function fetchInbox(limit?: number): Promise<FetchedMail[]> {
           subject: parsed.subject ?? "(no subject)",
           body: parsed.text ?? parsed.html?.toString() ?? "",
           receivedAt: (parsed.date ?? new Date()).toISOString(),
-          messageId: parsed.messageId ?? `${msg.uid}@${env.IMAP_HOST}`,
+          messageId: parsed.messageId ?? `${msg.uid}@${cfg.imapHost}`,
         });
       }
     } finally {

@@ -10,7 +10,6 @@
  *
  * Higher layers (domain services, API) never touch the repository directly.
  */
-import { newId } from "@/lib/core/ids";
 import { systemClock, type Clock } from "@/lib/core/clock";
 import {
   assertAllowed,
@@ -86,9 +85,8 @@ export class QueryEngine {
     await this.assertUnique(ctx, entity, values);
 
     const now = this.clock.isoNow();
-    const id = newId(entityName);
     const record: EntityRecord = {
-      id,
+      id: "", // assigned by the store (DB IDENTITY / in-memory counter)
       tenantId: ctx.tenantId,
       orgId: ctx.orgId,
       ownerId: entity.ownable ? ctx.userId : null,
@@ -99,8 +97,8 @@ export class QueryEngine {
       version: 1,
       ...values,
     };
-    await this.repo.insert(record);
-    return this.project(ctx, entity, record);
+    const saved = await this.repo.insert(entityName, record);
+    return this.project(ctx, entity, saved);
   }
 
   /**
@@ -122,7 +120,7 @@ export class QueryEngine {
 
     const now = this.clock.isoNow();
     const record: EntityRecord = {
-      id: newId(entityName),
+      id: "", // assigned by the store (DB IDENTITY / in-memory counter)
       tenantId: ctx.tenantId,
       orgId: ctx.orgId,
       ownerId: entity.ownable ? ctx.userId : null,
@@ -133,8 +131,8 @@ export class QueryEngine {
       version: 1,
       ...values,
     };
-    await this.repo.insert(record);
-    return this.project(ctx, entity, record);
+    const saved = await this.repo.insert(entityName, record);
+    return this.project(ctx, entity, saved);
   }
 
   /**

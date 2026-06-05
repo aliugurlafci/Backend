@@ -21,6 +21,14 @@ export interface ColumnDesc {
   indexed: boolean;
   /** A tenant-scoped filtered unique index is created for unique fields. */
   unique: boolean;
+  /** `id` PK only: emitted as `INT IDENTITY(1,1)` and excluded from runtime INSERTs. */
+  identity?: boolean;
+  /**
+   * Stored as INT but represents a record id (the `id` PK or a `reference` field).
+   * The app layer keeps ids as strings, so the read path stringifies these while
+   * leaving numeric business fields (FLOAT) and `version` (INT) as numbers.
+   */
+  idLike?: boolean;
 }
 
 /** Max key length (in nchars) for an indexable NVARCHAR column (900 bytes). */
@@ -28,7 +36,7 @@ const MAX_INDEX_NCHARS = 450;
 
 /** System columns present on every entity table, in physical order. */
 export const SYSTEM_COLUMNS: ColumnDesc[] = [
-  { name: "id", kind: "nvarchar", length: 80, notNull: true, indexed: false, unique: false },
+  { name: "id", kind: "int", length: 0, notNull: true, indexed: false, unique: false, identity: true, idLike: true },
   { name: "tenantId", kind: "nvarchar", length: 80, notNull: true, indexed: true, unique: false },
   { name: "orgId", kind: "nvarchar", length: 80, notNull: true, indexed: false, unique: false },
   { name: "ownerId", kind: "nvarchar", length: 80, notNull: false, indexed: false, unique: false },
@@ -71,7 +79,8 @@ export function fieldColumn(field: FieldDef): ColumnDesc {
     case "enum":
       return { ...base, kind: "nvarchar", length: 64 };
     case "reference":
-      return { ...base, kind: "nvarchar", length: 80 };
+      // Reference values are foreign record ids → INT (idLike: stringified on read).
+      return { ...base, kind: "int", length: 0, idLike: true };
     case "date":
     case "datetime":
       return { ...base, kind: "nvarchar", length: 40 };
@@ -106,6 +115,11 @@ export function sqlTypeFor(col: ColumnDesc): sql.ISqlType {
   }
 }
 
+/** Whether a column stores a record id (id PK or reference) as INT. */
+export function isIdLike(col: ColumnDesc): boolean {
+  return Boolean(col.idLike);
+}
+
 /** Coerce a JS value to the storage representation for its column kind. */
 export function toStorage(col: ColumnDesc, value: unknown): unknown {
   if (value === undefined || value === null) return null;
@@ -113,6 +127,8 @@ export function toStorage(col: ColumnDesc, value: unknown): unknown {
     case "float":
       return typeof value === "number" ? value : Number(value);
     case "int":
+      // "" reaches here for an unset id/reference column → store NULL, not NaN.
+      if (value === "") return null;
       return typeof value === "number" ? value : Number(value);
     case "bit":
       return value === true || value === 1 || value === "true";
@@ -129,9 +145,4 @@ export function ident(name: string): string {
 /** The physical table name for an entity (bracketed). */
 export function tableName(entity: string): string {
   return ident(entity);
-}
-
-/** Derive the entity name from a record id (`<entity>_<uuid>`). */
-export function entityFromId(id: string): string {
-  return id.split("_")[0] || "unknown";
 }

@@ -1,4 +1,5 @@
 import type { EntityDef } from "../types";
+import { branchRef, dealerRef } from "./shared";
 
 /**
  * An application user (login). `passwordHash` is `computed` so it can never be
@@ -19,6 +20,10 @@ export const userEntity: EntityDef = {
     { name: "passwordHash", label: "Password", type: "string", computed: true, max: 400 },
     { name: "positionId", label: "Position", type: "reference", referenceEntity: "position", required: true, filterable: true },
     { name: "active", label: "Active", type: "boolean", filterable: true, defaultValue: true },
+    // Org placement (merkez = headquarters branch, şube = branch, bayi = dealer)
+    // — drives the chat user picker's grouping.
+    branchRef(),
+    dealerRef(),
     // self-service profile fields
     { name: "phone", label: "Phone", type: "phone", pii: true },
     { name: "timezone", label: "Timezone", type: "string", max: 64 },

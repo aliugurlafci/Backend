@@ -94,7 +94,10 @@ export const entityDefSchema = z
     listColumns: z.array(listColumnSchema).optional(),
     ownable: z.boolean().optional(),
     group: z
-      .enum(["crm", "sales", "projects", "marketing", "support", "people", "finance", "admin"])
+      .enum([
+        "crm", "sales", "inventory", "purchasing", "accounting",
+        "projects", "marketing", "support", "people", "finance", "branches", "admin",
+      ])
       .optional(),
     viewType: z.enum(["table", "board", "calendar"]).optional(),
     board: z.object({ groupByField: z.string().min(1) }).optional(),

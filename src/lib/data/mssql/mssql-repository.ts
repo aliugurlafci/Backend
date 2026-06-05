@@ -17,8 +17,8 @@ import type { AggregateQuery, AggregateRow, Filter, Page, RepoQuery } from "../q
 import { getPool, sql } from "./connection";
 import {
   entityColumns,
-  entityFromId,
   ident,
+  isIdLike,
   sqlTypeFor,
   tableName,
   toStorage,
@@ -136,8 +136,16 @@ export class MssqlRepository implements Repository {
 
   private toRecord(entity: string, row: Record<string, unknown>): EntityRecord {
     const rec: Record<string, unknown> = {};
-    for (const col of this.cols(entity)) rec[col.name] = row[col.name] ?? null;
+    for (const col of this.cols(entity)) {
+      const v = row[col.name] ?? null;
+      // id + reference columns are INT in the DB but strings in the app layer.
+      rec[col.name] = v !== null && isIdLike(col) ? String(v) : v;
+    }
     return rec as EntityRecord;
+  }
+
+  private idCol(entity: string): ColumnDesc {
+    return this.colMap(entity).get("id")!;
   }
 
   async list(scope: TenantScope, entity: string, query: RepoQuery): Promise<Page> {
@@ -180,7 +188,7 @@ export class MssqlRepository implements Repository {
 
   async get(scope: TenantScope, entity: string, id: string): Promise<EntityRecord | null> {
     const p = new Params();
-    const idP = p.raw(nvarchar(80), id);
+    const idP = p.col(this.idCol(entity), id);
     const where = `${ident("id")} = ${idP} AND ${this.scopeClause(scope, p)}`;
     const selectCols = this.cols(entity).map((c) => ident(c.name)).join(", ");
     const text = `SELECT ${selectCols} FROM ${tableName(entity)} WHERE ${where}`;
@@ -189,13 +197,31 @@ export class MssqlRepository implements Repository {
     return row ? this.toRecord(entity, row) : null;
   }
 
-  async insert(record: EntityRecord): Promise<EntityRecord> {
-    const entity = entityFromId(record.id);
-    const cols = this.cols(entity);
+  async insert(entity: string, record: EntityRecord): Promise<EntityRecord> {
+    const t = tableName(entity);
     const p = new Params();
+    const data = record as Record<string, unknown>;
+
+    if (!record.id) {
+      // Runtime create: let IDENTITY assign the id, exclude it, read it back.
+      const cols = this.cols(entity).filter((c) => !c.identity);
+      const names = cols.map((c) => ident(c.name)).join(", ");
+      const values = cols.map((c) => p.col(c, data[c.name])).join(", ");
+      const text =
+        `INSERT INTO ${t} (${names}) OUTPUT INSERTED.${ident("id")} AS [id] VALUES (${values})`;
+      const result = await p.apply(await this.request()).query(text);
+      const assigned = (result.recordset as Array<{ id: unknown }>)[0]?.id;
+      return { ...record, id: String(assigned) };
+    }
+
+    // Seeding with an explicit id: IDENTITY_INSERT lets us write the id column.
+    const cols = this.cols(entity);
     const names = cols.map((c) => ident(c.name)).join(", ");
-    const values = cols.map((c) => p.col(c, (record as Record<string, unknown>)[c.name])).join(", ");
-    const text = `INSERT INTO ${tableName(entity)} (${names}) VALUES (${values})`;
+    const values = cols.map((c) => p.col(c, data[c.name])).join(", ");
+    const text =
+      `SET IDENTITY_INSERT ${t} ON; ` +
+      `INSERT INTO ${t} (${names}) VALUES (${values}); ` +
+      `SET IDENTITY_INSERT ${t} OFF;`;
     await p.apply(await this.request()).query(text);
     return record;
   }
@@ -211,7 +237,7 @@ export class MssqlRepository implements Repository {
     const sets = cols
       .map((c) => `${ident(c.name)} = ${p.col(c, (next as Record<string, unknown>)[c.name])}`)
       .join(", ");
-    const idP = p.raw(nvarchar(80), next.id);
+    const idP = p.col(this.idCol(entity), next.id);
     let where = `${ident("id")} = ${idP} AND ${this.scopeClause(scope, p)}`;
     if (expectedVersion !== undefined) {
       where += ` AND ${ident("version")} = ${p.raw(sql.Int() as unknown as sql.ISqlType, expectedVersion)}`;
@@ -231,7 +257,7 @@ export class MssqlRepository implements Repository {
 
   async delete(scope: TenantScope, entity: string, id: string, expectedVersion?: number): Promise<void> {
     const p = new Params();
-    const idP = p.raw(nvarchar(80), id);
+    const idP = p.col(this.idCol(entity), id);
     let where = `${ident("id")} = ${idP} AND ${this.scopeClause(scope, p)}`;
     if (expectedVersion !== undefined) {
       where += ` AND ${ident("version")} = ${p.raw(sql.Int() as unknown as sql.ISqlType, expectedVersion)}`;
@@ -258,7 +284,7 @@ export class MssqlRepository implements Repository {
     const p = new Params();
     let where = `${this.scopeClause(scope, p)} AND ${ident(field)} = ${p.col(col, value)}`;
     if (exceptId !== undefined) {
-      where += ` AND ${ident("id")} <> ${p.raw(nvarchar(80), exceptId)}`;
+      where += ` AND ${ident("id")} <> ${p.col(this.idCol(entity), exceptId)}`;
     }
     const text = `SELECT TOP 1 1 AS x FROM ${tableName(entity)} WHERE ${where}`;
     const result = await p.apply(await this.request()).query(text);

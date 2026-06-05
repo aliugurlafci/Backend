@@ -60,6 +60,8 @@ function matchSearch(record: EntityRecord, term: string, fields: string[]): bool
 
 export class InMemoryRepository implements Repository {
   private collections = new Map<string, Map<string, EntityRecord>>();
+  /** Per-entity id counter — emulates `INT IDENTITY(1,1)`. */
+  private counters = new Map<string, number>();
 
   private collection(entity: string): Map<string, EntityRecord> {
     let c = this.collections.get(entity);
@@ -103,10 +105,20 @@ export class InMemoryRepository implements Repository {
     return record;
   }
 
-  async insert(record: EntityRecord): Promise<EntityRecord> {
-    // ids are formatted `<entity>_<uuid>`, so the prefix names the collection.
-    this.collection(entityFromId(record)).set(record.id, record);
-    return record;
+  async insert(entity: string, record: EntityRecord): Promise<EntityRecord> {
+    let stored = record;
+    if (record.id) {
+      // Explicit id (seeding): keep it, advance the counter past it.
+      const n = Number(record.id);
+      if (Number.isFinite(n)) this.counters.set(entity, Math.max(this.counters.get(entity) ?? 0, n));
+    } else {
+      // Runtime create: assign the next sequential int (as a string).
+      const next = (this.counters.get(entity) ?? 0) + 1;
+      this.counters.set(entity, next);
+      stored = { ...record, id: String(next) };
+    }
+    this.collection(entity).set(stored.id, stored);
+    return stored;
   }
 
   async update(
@@ -195,10 +207,4 @@ export class InMemoryRepository implements Repository {
     }
     return out;
   }
-}
-
-function entityFromId(record: EntityRecord): string {
-  // ids are formatted `<entity>_<uuid>`; fall back to a stored hint.
-  const prefix = record.id.split("_")[0];
-  return prefix || "unknown";
 }

@@ -12,7 +12,13 @@ import type { AggregateQuery, AggregateRow, Page, RepoQuery } from "./query";
 export interface Repository {
   list(scope: TenantScope, entity: string, query: RepoQuery): Promise<Page>;
   get(scope: TenantScope, entity: string, id: string): Promise<EntityRecord | null>;
-  insert(record: EntityRecord): Promise<EntityRecord>;
+  /**
+   * Persist a new record into `entity`'s table. When `record.id` is empty the
+   * store assigns the next sequential int id (DB IDENTITY / in-memory counter);
+   * when it is set (seeding) that explicit id is used. Returns the stored record
+   * carrying its assigned id.
+   */
+  insert(entity: string, record: EntityRecord): Promise<EntityRecord>;
   /**
    * Replace a record. `expectedVersion`, when provided, must match the stored
    * version or a concurrency conflict is raised (optimistic locking).

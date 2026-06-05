@@ -93,11 +93,15 @@ export interface ListColumn {
 export type EntityGroup =
   | "crm"
   | "sales"
+  | "inventory"
+  | "purchasing"
+  | "accounting"
   | "projects"
   | "marketing"
   | "support"
   | "people"
   | "finance"
+  | "branches"
   | "admin";
 
 /** Default record view for the `[entity]` screen. */

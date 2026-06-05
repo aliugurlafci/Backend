@@ -27,6 +27,8 @@ export const salesOrderEntity: EntityDef = {
         { value: "cancelled", label: "Cancelled", tone: "danger" },
       ],
     },
+    { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
+    { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
     { name: "amount", label: "Amount", type: "currency", sortable: true, filterable: true, min: 0 },
     { name: "orderDate", label: "Order Date", type: "date", sortable: true },
   ],

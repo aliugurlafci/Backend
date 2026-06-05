@@ -20,6 +20,11 @@ import {
 } from "@/lib/http/handler";
 import { getDomainService } from "@/lib/domain";
 import { getFinanceService, type LineInput, type PaymentInput } from "@/lib/finance/service";
+import { getPurchasingService, type GrnLineInput } from "@/lib/purchasing/service";
+import { getAccountingService, type JournalLineInput } from "@/lib/accounting/service";
+import { getPayablesService } from "@/lib/payables/service";
+import { postStockTransfer, postStockAdjustment } from "@/lib/accounting/postings";
+import { permissionEngine } from "@/lib/permissions/engine";
 import { metadata } from "@/lib/metadata";
 import { search } from "@/lib/search/service";
 import { cache } from "@/lib/cache/cache";
@@ -29,15 +34,29 @@ import { webhookRegistry, testWebhook } from "@/lib/integrations/webhooks";
 import { exportCsv, importCsv } from "@/lib/integrations/import-export";
 import { exportXlsx, exportPdf } from "@/lib/integrations/export-formats";
 import { runAllJobs, jobsStatus } from "@/lib/jobs/scheduler";
+import {
+  automationStore,
+  buildCatalog,
+  executeRule,
+  runScheduledAutomations,
+  INTEGRATION_PROVIDERS,
+  SYSTEM_SETTINGS,
+  type AssignmentRule,
+  type AutomationAction,
+  type AutomationStatus,
+  type ConditionGroup,
+  type IntegrationConfig,
+} from "@/lib/automation";
 import { publishMetadata } from "@/lib/config/governance";
 import { releaseLog } from "@/lib/config/release";
 import { MIGRATIONS } from "@/lib/config/migrations";
 import { metrics } from "@/lib/observability/metrics";
-import { env, isProduction, usingInMemoryBackends, imapConfigured, smtpConfigured } from "@/lib/config/env";
+import { env, isProduction, usingInMemoryBackends } from "@/lib/config/env";
 import { BadRequestError, ForbiddenError, NotFoundError, toAppError } from "@/lib/enforcement/errors";
 import type { Filter, Measure } from "@/lib/data/query";
 import { issuePersonaToken } from "@/lib/security/auth-config";
 import { saveBlob, openBlob, blobExists } from "@/lib/integrations/file-storage";
+import { listChatUsers, listConversations, listMessages, createMessage as createChatMessage } from "@/lib/chat/service";
 import { sendMail, fetchHeaders, fetchBodiesByUid } from "@/lib/integrations/email-transport";
 import { login, getPosition, parseScreens, findUserById } from "@/lib/security/auth-service";
 import { SESSION_COOKIE } from "@/lib/security/auth";
@@ -50,6 +69,20 @@ import type { EntityRecord } from "@/lib/metadata/types";
 /** Cookie options for the session JWT. */
 function sessionCookieOpts(ttlSec: number) {
   return { httpOnly: true, sameSite: "lax" as const, path: "/", maxAge: ttlSec * 1000, secure: isProduction };
+}
+
+/** Best-effort content-type from a filename (used for inline file/image serving). */
+function guessFileContentType(name: string): string {
+  switch (name.toLowerCase().split(".").pop()) {
+    case "png": return "image/png";
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "gif": return "image/gif";
+    case "webp": return "image/webp";
+    case "svg": return "image/svg+xml";
+    case "pdf": return "application/pdf";
+    default: return "application/octet-stream";
+  }
 }
 
 /** Drop the password hash before returning a user record to a client. */
@@ -636,6 +669,262 @@ export function buildApiRouter(): Router {
     ),
   );
 
+  // ---- purchasing: purchase orders + goods receipts --------------------
+  r.post(
+    "/purchase-orders",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          supplierId: string; warehouseId: string; currencyCode?: string;
+          orderDate?: string | null; expectedDate?: string | null; branchId?: string | null;
+          notes?: string | null; lines?: LineInput[];
+        };
+        const pur = await getPurchasingService();
+        return pur.createPO(
+          rc,
+          {
+            supplierId: body.supplierId,
+            warehouseId: body.warehouseId,
+            currencyCode: body.currencyCode ?? "USD",
+            orderDate: body.orderDate ?? null,
+            expectedDate: body.expectedDate ?? null,
+            branchId: body.branchId ?? null,
+            notes: body.notes ?? null,
+            status: "draft",
+          },
+          body.lines ?? [],
+        );
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.get("/purchase-orders/:id", runApi(async (rc, req) => {
+    const pur = await getPurchasingService();
+    return pur.getPO(rc, req.params.id);
+  }));
+
+  r.put(
+    "/purchase-orders/:id",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { header?: Record<string, unknown>; lines?: LineInput[] };
+        const pur = await getPurchasingService();
+        return pur.savePO(rc, req.params.id, body.header, body.lines ?? []);
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/goods-receipts",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          poId?: string | null; supplierId?: string | null; warehouseId: string;
+          receiptDate?: string | null; branchId?: string | null; notes?: string | null;
+          lines?: GrnLineInput[];
+        };
+        const pur = await getPurchasingService();
+        return pur.createGRN(
+          rc,
+          {
+            poId: body.poId ?? null,
+            supplierId: body.supplierId ?? null,
+            warehouseId: body.warehouseId,
+            receiptDate: body.receiptDate ?? null,
+            branchId: body.branchId ?? null,
+            notes: body.notes ?? null,
+          },
+          body.lines ?? [],
+        );
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.get("/goods-receipts/:id", runApi(async (rc, req) => {
+    const pur = await getPurchasingService();
+    return pur.getGRN(rc, req.params.id);
+  }));
+
+  r.post(
+    "/goods-receipts/:id/post",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "goodsReceipt", action: "goodsReceipt:post" })) {
+          throw new ForbiddenError("not allowed to post goods receipts");
+        }
+        const pur = await getPurchasingService();
+        const goodsReceipt = await pur.postGRN(rc, req.params.id);
+        return { goodsReceipt };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // ---- accounting: journal entries -------------------------------------
+  r.post(
+    "/journal-entries",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          date: string; memo?: string | null; branchId?: string | null;
+          lines: JournalLineInput[]; post?: boolean;
+        };
+        const acc = await getAccountingService();
+        const { entry } = await acc.createEntry(rc, { date: body.date, memo: body.memo ?? null, source: "manual", branchId: body.branchId ?? null }, body.lines ?? []);
+        if (body.post) {
+          if (!permissionEngine.can(rc, { entity: "journalEntry", action: "journalEntry:post" })) {
+            throw new ForbiddenError("not allowed to post journal entries");
+          }
+          const posted = await acc.postEntry(rc, entry.id);
+          return { entry: posted };
+        }
+        return { entry };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.post(
+    "/journal-entries/:id/post",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "journalEntry", action: "journalEntry:post" })) {
+          throw new ForbiddenError("not allowed to post journal entries");
+        }
+        const acc = await getAccountingService();
+        return { entry: await acc.postEntry(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/journal-entries/:id/void",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "journalEntry", action: "journalEntry:post" })) {
+          throw new ForbiddenError("not allowed to void journal entries");
+        }
+        const acc = await getAccountingService();
+        return { entry: await acc.voidEntry(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.get("/accounting/trial-balance", runApi(async (rc, req) => {
+    const acc = await getAccountingService();
+    const branchId = typeof req.query.branchId === "string" ? req.query.branchId : undefined;
+    return { rows: await acc.trialBalance(rc, branchId) };
+  }));
+
+  // ---- accounts payable: vendor bills + bill payments ------------------
+  r.post(
+    "/vendor-bills",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          supplierId: string; goodsReceiptId?: string | null; currencyCode?: string;
+          billDate?: string | null; dueDate?: string | null; branchId?: string | null;
+          notes?: string | null; lines?: LineInput[];
+        };
+        const ap = await getPayablesService();
+        return ap.createBill(
+          rc,
+          {
+            supplierId: body.supplierId,
+            goodsReceiptId: body.goodsReceiptId ?? null,
+            currencyCode: body.currencyCode ?? "USD",
+            billDate: body.billDate ?? null,
+            dueDate: body.dueDate ?? null,
+            branchId: body.branchId ?? null,
+            notes: body.notes ?? null,
+          },
+          body.lines ?? [],
+        );
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.get("/vendor-bills/:id", runApi(async (rc, req) => {
+    const ap = await getPayablesService();
+    const [doc, payments] = await Promise.all([ap.getBill(rc, req.params.id), ap.listBillPayments(rc, req.params.id)]);
+    return { ...doc, payments };
+  }));
+
+  r.put(
+    "/vendor-bills/:id",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { header?: Record<string, unknown>; lines?: LineInput[] };
+        const ap = await getPayablesService();
+        return ap.saveBill(rc, req.params.id, body.header, body.lines ?? []);
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/vendor-bills/:id/receive",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "vendorBill", action: "vendorBill:receive" })) {
+          throw new ForbiddenError("not allowed to receive vendor bills");
+        }
+        const ap = await getPayablesService();
+        return { vendorBill: await ap.receiveBill(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/vendor-bills/:id/payments",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { amount?: number; method?: string; paidAt?: string; notes?: string | null };
+        if (typeof body.amount !== "number" || body.amount <= 0) throw new BadRequestError("amount must be positive");
+        if (!body.paidAt) throw new BadRequestError("paidAt is required");
+        const ap = await getPayablesService();
+        const vendorBill = await ap.payBill(rc, req.params.id, { amount: body.amount, method: body.method ?? "bank", paidAt: body.paidAt, notes: body.notes ?? null });
+        const payments = await ap.listBillPayments(rc, req.params.id);
+        return { vendorBill, payments };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  // ---- inventory: stock transfer / adjustment posting ------------------
+  r.post(
+    "/stock-transfers/:id/post",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "stockTransfer", action: "stockTransfer:post" })) {
+          throw new ForbiddenError("not allowed to post stock transfers");
+        }
+        return { stockTransfer: await postStockTransfer(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/stock-adjustments/:id/post",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "stockAdjustment", action: "stockAdjustment:post" })) {
+          throw new ForbiddenError("not allowed to post stock adjustments");
+        }
+        return { stockAdjustment: await postStockAdjustment(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
   // ---- recurring billing + cron ----------------------------------------
   r.post(
     "/recurring/run",
@@ -655,6 +944,12 @@ export function buildApiRouter(): Router {
       async (rc) => {
         if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
         const results = await runAllJobs(rc);
+        // Also fire any active schedule-triggered automations.
+        const automations = await runScheduledAutomations(systemContext(rc.tenantId, rc.orgId));
+        if (automations.length) {
+          const ok = automations.filter((a) => a.status === "success").length;
+          results.push({ name: "automations", at: rc.at, summary: `${ok}/${automations.length} scheduled automation(s) ran` });
+        }
         return { results };
       },
       { mutating: true },
@@ -663,6 +958,443 @@ export function buildApiRouter(): Router {
 
   // Scheduled-job registry + last-run status (for the Automation screen).
   r.get("/jobs", runApi(async () => ({ jobs: jobsStatus() })));
+
+  // ---- automation platform (admin only) --------------------------------
+  // User-defined Trigger → Condition → Action rules, their run logs, processing
+  // queue, assignment rules, settings and the builder catalog.
+  const adminOnly = (rc: { roles: readonly string[] }) => {
+    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+  };
+
+  // Builder catalog (entities, fields, operators, action types) + assignable users.
+  r.get("/automation/catalog", runApi(async (rc) => {
+    adminOnly(rc);
+    const domain = await getDomainService();
+    const users = await domain.list(rc, "user", { pageSize: 200, sort: [{ field: "displayName", dir: "asc" }] });
+    return {
+      catalog: buildCatalog(),
+      users: users.items.map((u) => ({ id: String(u.id), displayName: String(u.displayName ?? u.email ?? u.id) })),
+    };
+  }));
+
+  // Dashboard stats (aggregated across the tenant's rules + recent runs).
+  r.get("/automation/stats", runApi(async (rc) => {
+    adminOnly(rc);
+    const rules = await automationStore.listRules(rc.tenantId, rc.orgId);
+    const runs = await automationStore.listRuns(rc.tenantId, rc.orgId, { limit: 500 });
+    const totals = rules.reduce(
+      (acc, r) => {
+        acc.runs += r.stats.runs;
+        acc.success += r.stats.success;
+        acc.failure += r.stats.failure;
+        acc.impact += r.stats.impact;
+        acc.avgMsSum += r.stats.avgMs * Math.max(1, r.stats.runs);
+        acc.avgMsCount += Math.max(1, r.stats.runs);
+        return acc;
+      },
+      { runs: 0, success: 0, failure: 0, impact: 0, avgMsSum: 0, avgMsCount: 0 },
+    );
+    const queue = await automationStore.listQueue(rc.tenantId, rc.orgId);
+    return {
+      active: rules.filter((r) => r.status === "active").length,
+      paused: rules.filter((r) => r.status === "paused").length,
+      draft: rules.filter((r) => r.status === "draft").length,
+      total: rules.length,
+      runs: totals.runs,
+      success: totals.success,
+      failure: totals.failure,
+      successRate: totals.runs ? Math.round((totals.success / totals.runs) * 100) : 0,
+      avgMs: totals.avgMsCount ? Math.round(totals.avgMsSum / totals.avgMsCount) : 0,
+      impact: totals.impact,
+      queue: {
+        pending: queue.filter((q) => q.state === "pending").length,
+        retry: queue.filter((q) => q.state === "retry").length,
+        dead: queue.filter((q) => q.state === "dead").length,
+      },
+      recentRuns: runs.slice(0, 8),
+      topRules: [...rules].sort((a, b) => b.stats.runs - a.stats.runs).slice(0, 5).map((r) => ({
+        id: r.id,
+        name: r.name,
+        runs: r.stats.runs,
+        successRate: r.stats.runs ? Math.round((r.stats.success / r.stats.runs) * 100) : 0,
+        status: r.status,
+      })),
+    };
+  }));
+
+  // List + create rules.
+  r.get("/automations", runApi(async (rc) => {
+    adminOnly(rc);
+    return { rules: await automationStore.listRules(rc.tenantId, rc.orgId) };
+  }));
+
+  r.post(
+    "/automations",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as {
+          name?: string;
+          description?: string;
+          status?: AutomationStatus;
+          trigger?: unknown;
+          conditions?: ConditionGroup;
+          actions?: AutomationAction[];
+          tags?: string[];
+          requiresApproval?: boolean;
+        };
+        if (!body.name) throw new BadRequestError("name is required");
+        if (!body.trigger) throw new BadRequestError("trigger is required");
+        const conditions: ConditionGroup = body.conditions ?? { type: "group", logic: "AND", children: [] };
+        return await automationStore.createRule({
+          tenantId: rc.tenantId,
+          orgId: rc.orgId,
+          name: body.name,
+          description: body.description,
+          status: body.status,
+          trigger: body.trigger as never,
+          conditions,
+          actions: body.actions ?? [],
+          tags: body.tags,
+          requiresApproval: body.requiresApproval,
+          by: rc.userId,
+        });
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.get("/automations/:id", runApi(async (rc, req) => {
+    adminOnly(rc);
+    const rule = await automationStore.getRule(rc.tenantId, rc.orgId, req.params.id);
+    if (!rule) throw new NotFoundError("automation", req.params.id);
+    return rule;
+  }));
+
+  r.patch(
+    "/automations/:id",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as Record<string, unknown>;
+        const updated = await automationStore.updateRule(rc.tenantId, rc.orgId, req.params.id, body, rc.userId);
+        if (!updated) throw new NotFoundError("automation", req.params.id);
+        return updated;
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.delete(
+    "/automations/:id",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        if (!(await automationStore.removeRule(rc.tenantId, rc.orgId, req.params.id))) {
+          throw new NotFoundError("automation", req.params.id);
+        }
+        return { deleted: true, id: req.params.id };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/automations/:id/status",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as { status?: AutomationStatus };
+        if (!body.status) throw new BadRequestError("status is required");
+        const updated = await automationStore.setStatus(rc.tenantId, rc.orgId, req.params.id, body.status, rc.userId);
+        if (!updated) throw new NotFoundError("automation", req.params.id);
+        return updated;
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/automations/:id/rollback",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as { version?: number };
+        if (typeof body.version !== "number") throw new BadRequestError("version is required");
+        const updated = await automationStore.rollback(rc.tenantId, rc.orgId, req.params.id, body.version, rc.userId);
+        if (!updated) throw new NotFoundError("automation version", String(body.version));
+        return updated;
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Dry-run a rule against a real or sample record (no side effects).
+  r.post(
+    "/automations/:id/run",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const rule = await automationStore.getRule(rc.tenantId, rc.orgId, req.params.id);
+        if (!rule) throw new NotFoundError("automation", req.params.id);
+        const body = readJson(req) as { recordId?: string; sample?: Record<string, unknown> };
+        let record: Record<string, unknown> = body.sample ?? {};
+        if (body.recordId && rule.trigger.entity) {
+          const domain = await getDomainService();
+          try {
+            record = await domain.get(rc, rule.trigger.entity, body.recordId);
+          } catch {
+            /* fall back to whatever sample was provided */
+          }
+        }
+        if (Object.keys(record).length === 0) record = { id: "sample", name: "Sample record" };
+        const run = await executeRule(rule, systemContext(rc.tenantId, rc.orgId), record, {
+          test: true,
+          trigger: "manual test",
+        });
+        return run;
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Execution logs.
+  r.get("/automation/runs", runApi(async (rc, req) => {
+    adminOnly(rc);
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    return {
+      runs: await automationStore.listRuns(rc.tenantId, rc.orgId, {
+        ruleId: req.query.ruleId ? String(req.query.ruleId) : undefined,
+        status: req.query.status ? String(req.query.status) : undefined,
+        limit,
+      }),
+    };
+  }));
+
+  r.get("/automation/runs/:id", runApi(async (rc, req) => {
+    adminOnly(rc);
+    const run = await automationStore.getRun(rc.tenantId, rc.orgId, req.params.id);
+    if (!run) throw new NotFoundError("run", req.params.id);
+    return run;
+  }));
+
+  // Re-run a past execution live, replaying its captured input.
+  r.post(
+    "/automation/runs/:id/retry",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const run = await automationStore.getRun(rc.tenantId, rc.orgId, req.params.id);
+        if (!run) throw new NotFoundError("run", req.params.id);
+        const rule = await automationStore.getRule(rc.tenantId, rc.orgId, run.ruleId);
+        if (!rule) throw new NotFoundError("automation", run.ruleId);
+        const fresh = await executeRule(rule, systemContext(rc.tenantId, rc.orgId), run.input, {
+          test: false,
+          trigger: "manual re-run",
+        });
+        return fresh;
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Processing queue (pending / retry / dead-letter).
+  r.get("/automation/queue", runApi(async (rc) => {
+    adminOnly(rc);
+    return { items: await automationStore.listQueue(rc.tenantId, rc.orgId) };
+  }));
+
+  r.post(
+    "/automation/queue/:id/retry",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const item = await automationStore.getQueueItem(rc.tenantId, rc.orgId, req.params.id);
+        if (!item) throw new NotFoundError("queue item", req.params.id);
+        const rule = await automationStore.getRule(rc.tenantId, rc.orgId, item.ruleId);
+        if (!rule) throw new NotFoundError("automation", item.ruleId);
+        const run = await executeRule(rule, systemContext(rc.tenantId, rc.orgId), item.input, {
+          test: false,
+          trigger: "queue retry",
+        });
+        if (run.status === "success") {
+          await automationStore.removeQueueItem(rc.tenantId, rc.orgId, item.id);
+        } else {
+          item.attempts += 1;
+          item.lastError = run.error;
+          item.state = item.attempts >= item.maxAttempts ? "dead" : "retry";
+          await automationStore.updateQueueItem(rc.tenantId, rc.orgId, item.id, {
+            attempts: item.attempts,
+            lastError: item.lastError,
+            state: item.state,
+          });
+        }
+        return { run, item };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.delete(
+    "/automation/queue/:id",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        if (!(await automationStore.removeQueueItem(rc.tenantId, rc.orgId, req.params.id))) {
+          throw new NotFoundError("queue item", req.params.id);
+        }
+        return { deleted: true, id: req.params.id };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Assignment rules.
+  r.get("/automation/assignment", runApi(async (rc) => {
+    adminOnly(rc);
+    return { rules: await automationStore.listAssignment(rc.tenantId, rc.orgId) };
+  }));
+
+  r.post(
+    "/automation/assignment",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as Partial<AssignmentRule>;
+        if (!body.name || !body.entity || !body.strategy) {
+          throw new BadRequestError("name, entity and strategy are required");
+        }
+        return await automationStore.upsertAssignment({
+          tenantId: rc.tenantId,
+          orgId: rc.orgId,
+          id: body.id,
+          name: body.name,
+          entity: body.entity,
+          strategy: body.strategy,
+          pool: body.pool ?? [],
+          territoryMap: body.territoryMap,
+          enabled: body.enabled ?? true,
+        });
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.delete(
+    "/automation/assignment/:id",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        if (!(await automationStore.removeAssignment(rc.tenantId, rc.orgId, req.params.id))) {
+          throw new NotFoundError("assignment rule", req.params.id);
+        }
+        return { deleted: true, id: req.params.id };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Settings / governance.
+  r.get("/automation/settings", runApi(async (rc) => {
+    adminOnly(rc);
+    return await automationStore.getSettings(rc.tenantId, rc.orgId);
+  }));
+
+  r.patch(
+    "/automation/settings",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as Record<string, unknown>;
+        return await automationStore.updateSettings(rc.tenantId, rc.orgId, body);
+      },
+      { mutating: true },
+    ),
+  );
+
+  // ---- integration hub (admin only; values stored in the DB) -----------
+  r.get("/automation/integrations", runApi(async (rc) => {
+    adminOnly(rc);
+    return {
+      providers: INTEGRATION_PROVIDERS,
+      integrations: await automationStore.listIntegrations(rc.tenantId, rc.orgId),
+    };
+  }));
+
+  r.patch(
+    "/automation/integrations/:provider",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const provider = req.params.provider;
+        if (!INTEGRATION_PROVIDERS.some((p) => p.key === provider)) {
+          throw new NotFoundError("integration", provider);
+        }
+        const body = readJson(req) as { enabled?: boolean; config?: IntegrationConfig };
+        return await automationStore.upsertIntegration(rc.tenantId, rc.orgId, provider, {
+          enabled: body.enabled,
+          config: body.config,
+        });
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Lightweight connection check: confirms required variables are present.
+  r.post(
+    "/automation/integrations/:provider/test",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const provider = req.params.provider;
+        const def = INTEGRATION_PROVIDERS.find((p) => p.key === provider);
+        if (!def) throw new NotFoundError("integration", provider);
+        const state = await automationStore.getIntegration(rc.tenantId, rc.orgId, provider);
+        if (provider === "email") {
+          const cfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
+          return {
+            ok: cfg.smtpConfigured || cfg.imapConfigured,
+            message: `SMTP ${cfg.smtpConfigured ? "ready" : "not configured"} · IMAP ${cfg.imapConfigured ? "ready" : "not configured"}`,
+          };
+        }
+        const filled = def.fields.filter((f) => {
+          const v = state.config[f.key];
+          return v !== undefined && v !== null && String(v) !== "";
+        }).length;
+        const ok = state.enabled && filled > 0;
+        return {
+          ok,
+          message: ok
+            ? `${filled} setting(s) configured — connection looks ready`
+            : state.enabled
+              ? "No connection details configured yet"
+              : "Integration is disabled",
+        };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // ---- system / environment settings (admin only; stored in the DB) ----
+  r.get("/system/settings", runApi(async (rc) => {
+    adminOnly(rc);
+    return {
+      groups: [...new Set(SYSTEM_SETTINGS.map((s) => s.group))],
+      settings: await automationStore.getSystemSettings(rc.tenantId, rc.orgId),
+    };
+  }));
+
+  r.patch(
+    "/system/settings",
+    runApi(
+      async (rc, req) => {
+        adminOnly(rc);
+        const body = readJson(req) as Record<string, unknown>;
+        return { settings: await automationStore.updateSystemSettings(rc.tenantId, rc.orgId, body) };
+      },
+      { mutating: true },
+    ),
+  );
 
   // ---- webhooks ---------------------------------------------------------
   r.get("/webhooks", runApi(async (rc) => {
@@ -825,9 +1557,13 @@ export function buildApiRouter(): Router {
     const domain = await getDomainService();
     const record = await domain.get(rc, "file", req.params.id); // enforces read + tenant scope
     if (!(await blobExists(req.params.id))) throw new NotFoundError("file", req.params.id);
+    const name = String(record.name);
+    // `?inline=1` serves with a guessed content-type + inline disposition so chat
+    // image attachments render in <img>; the default stays a forced download.
+    const inline = req.query.inline === "1" || req.query.inline === "true";
     setApiHeaders(res, rc.correlationId);
-    res.setHeader("content-type", "application/octet-stream");
-    res.setHeader("content-disposition", `attachment; filename="${encodeURIComponent(String(record.name))}"`);
+    res.setHeader("content-type", inline ? guessFileContentType(name) : "application/octet-stream");
+    res.setHeader("content-disposition", `${inline ? "inline" : "attachment"}; filename="${encodeURIComponent(name)}"`);
     await new Promise<void>((resolve, reject) => {
       const stream = openBlob(req.params.id);
       stream.on("error", reject);
@@ -835,6 +1571,29 @@ export function buildApiRouter(): Router {
       stream.pipe(res);
     });
   }));
+
+  // ---- chat: user picker + conversations + messages (privacy via chat/service) -
+  r.get("/chat/users", runApi(async (rc) => ({ users: await listChatUsers(rc) })));
+  r.get("/chat/conversations", runApi(async (rc) => ({ conversations: await listConversations(rc) })));
+  r.get(
+    "/chat/messages",
+    runApi(async (rc, req) => ({ items: await listMessages(rc, String(req.query.conversationId ?? "")) })),
+  );
+  r.post(
+    "/chat/messages",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          participants?: Array<string | number>;
+          conversationId?: string;
+          body?: string | null;
+          attachments?: { fileId: string; name: string; kind: "image" | "file"; sizeKb?: number }[] | null;
+        };
+        return createChatMessage(rc, body);
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
 
   // ---- email: SMTP send + IMAP sync (env-driven; DB-only when unconfigured) -
   r.post(
@@ -848,11 +1607,13 @@ export function buildApiRouter(): Router {
           .filter(Boolean);
         if (recipients.length === 0) throw new BadRequestError("`to` is required");
         const domain = await getDomainService();
+        const scope = { tenantId: rc.tenantId, orgId: rc.orgId };
+        const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
         const records = [];
         let sentCount = 0;
         // One real message + one Sent record per recipient (individual delivery, no shared To).
         for (const to of recipients) {
-          const messageId = await sendMail({ to, subject: body.subject ?? "", text: body.body ?? "" });
+          const messageId = await sendMail({ to, subject: body.subject ?? "", text: body.body ?? "" }, scope);
           if (messageId !== null) sentCount++;
           records.push(
             await domain.create(rc, "email", {
@@ -864,7 +1625,7 @@ export function buildApiRouter(): Router {
             }),
           );
         }
-        return { records, record: records[0], sent: sentCount > 0, count: records.length, smtpConfigured };
+        return { records, record: records[0], sent: sentCount > 0, count: records.length, smtpConfigured: emailCfg.smtpConfigured };
       },
       { mutating: true, status: 201 },
     ),
@@ -874,7 +1635,9 @@ export function buildApiRouter(): Router {
     "/email/sync",
     runApi(
       async (rc) => {
-        if (!imapConfigured) return { configured: false, synced: 0 };
+        const scope = { tenantId: rc.tenantId, orgId: rc.orgId };
+        const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
+        if (!emailCfg.imapConfigured) return { configured: false, synced: 0 };
         const domain = await getDomainService();
         const norm = (id: unknown) => String(id ?? "").replace(/[<>]/g, "").trim().toLowerCase();
         // Dedup precisely by Message-ID (one row per real email); fall back to
@@ -897,11 +1660,11 @@ export function buildApiRouter(): Router {
         // Cheap envelope scan of the whole mailbox (no bodies) → only the UIDs
         // whose Message-ID is new. We then download bodies ONLY for new mail,
         // capped per run so a large mailbox never times out the request.
-        const headers = await fetchHeaders();
+        const headers = await fetchHeaders(scope);
         const freshUids = headers.filter((h) => !seen.has(`mid:${norm(h.messageId)}`)).map((h) => h.uid);
         if (freshUids.length === 0) return { configured: true, synced: 0, remaining: 0 };
         const BATCH = 100;
-        const messages = await fetchBodiesByUid(freshUids.slice(0, BATCH));
+        const messages = await fetchBodiesByUid(freshUids.slice(0, BATCH), scope);
         let synced = 0;
         for (const m of messages) {
           const key = keyOf(m.messageId, m.sender, m.subject);

@@ -28,6 +28,7 @@ export const positionEntity: EntityDef = {
         { value: "sales_manager", label: "Sales Manager", tone: "info" },
         { value: "sales_rep", label: "Sales Rep", tone: "neutral" },
         { value: "accountant", label: "Accountant", tone: "success" },
+        { value: "warehouse_manager", label: "Warehouse Manager", tone: "warning" },
       ],
     },
     { name: "screens", label: "Screens", type: "text", helpText: "JSON array of screen keys this position can access." },

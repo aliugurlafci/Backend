@@ -14,6 +14,7 @@ import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
 import { docTotals, lineTotals } from "./totals";
 import { numberSequence, NumberSequence } from "./number-sequence";
+import { postPaymentGL } from "@/lib/accounting/postings";
 
 export interface LineInput {
   productId?: string | null;
@@ -158,16 +159,18 @@ export class FinanceService {
     return page.items;
   }
 
-  /** Record a payment, then recompute the invoice's amountPaid/balance/status. */
+  /** Record a payment, post it to the GL, then recompute the invoice. */
   async applyPayment(ctx: RequestContext, invoiceId: string, input: PaymentInput): Promise<EntityRecord> {
     const invoice = await this.qe.get(ctx, "invoice", invoiceId);
     const number = await this.seq.next(ctx.tenantId, "P");
-    await this.qe.createWithComputed(
+    const payment = await this.qe.createWithComputed(
       ctx,
       "payment",
       {
         invoiceId,
         accountId: invoice.accountId,
+        branchId: invoice.branchId ?? null,
+        dealerId: invoice.dealerId ?? null,
         amount: input.amount,
         method: input.method,
         paidAt: input.paidAt,
@@ -175,6 +178,8 @@ export class FinanceService {
       },
       { number },
     );
+    // Synchronous, idempotent GL posting (Dr Cash, Cr AR).
+    await postPaymentGL(ctx, payment);
     return this.recomputeInvoice(ctx, invoiceId);
   }
 

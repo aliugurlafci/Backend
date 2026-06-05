@@ -42,44 +42,56 @@ export async function ensureAuthSeed(repo: Repository): Promise<void> {
 
   const managerScreens = [
     "home", "sales-dashboard", "leads-dashboard", "deals-dashboard", "executive-dashboard",
-    "growth-dashboard", "revenue-dashboard", "project-dashboard",
+    "growth-dashboard", "revenue-dashboard", "branch-dashboard", "inventory-dashboard", "accounting-dashboard",
     "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
     "proposal", "estimation", "contract", "salesOrder", "quote", "invoice",
-    "project", "milestone", "timesheet", "campaign", "ticket",
-    "reports", "finance", "email", "chat", "calls", "notes", "todo", "social-feed", "file-manager",
+    "branch", "dealer", "warehouse", "supplier", "product",
+    "reports", "finance", "email", "chat", "calls", "notes", "todo", "file-manager",
   ];
   const repScreens = [
     "home", "sales-dashboard", "leads-dashboard", "deals-dashboard",
     "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
-    "quote", "proposal", "project", "ticket",
-    "email", "chat", "calls", "notes", "todo", "social-feed", "file-manager",
+    "quote", "proposal", "dealer",
+    "email", "chat", "calls", "notes", "todo", "file-manager",
   ];
   const accountantScreens = [
-    "home", "revenue-dashboard", "executive-dashboard",
-    "account", "contact", "activity", "calendar",
+    "home", "revenue-dashboard", "executive-dashboard", "accounting-dashboard", "branch-dashboard",
+    "account", "contact", "activity", "calendar", "branch", "dealer",
     "quote", "invoice", "payment", "product", "recurringPlan", "finance", "reports",
-    "notes", "todo", "file-manager",
+    "notes", "todo", "file-manager", "chat",
   ];
 
+  // Explicit sequential int ids (as strings) for each table, matching the
+  // DEMO_USERS ids the demo seed uses as record owners (see context/dev.ts).
   const positions = [
-    { id: "position_admin", name: "Administrator", role: "admin", screens: all },
-    { id: "position_manager", name: "Sales Manager", role: "sales_manager", screens: has(...managerScreens) },
-    { id: "position_rep", name: "Sales Rep", role: "sales_rep", screens: has(...repScreens) },
-    { id: "position_accountant", name: "Accountant", role: "accountant", screens: has(...accountantScreens) },
+    { id: "1", name: "Administrator", role: "admin", screens: all },
+    { id: "2", name: "Sales Manager", role: "sales_manager", screens: has(...managerScreens) },
+    { id: "3", name: "Sales Rep", role: "sales_rep", screens: has(...repScreens) },
+    { id: "4", name: "Accountant", role: "accountant", screens: has(...accountantScreens) },
   ];
   for (const p of positions) {
-    await repo.insert(rec(p.id, { name: p.name, role: p.role, screens: JSON.stringify(p.screens), description: null }));
+    await repo.insert("position", rec(p.id, { name: p.name, role: p.role, screens: JSON.stringify(p.screens), description: null }));
   }
+
+  // Place each login user under a branch (merkez/şube) so the chat picker groups
+  // them. Runs after the demo seed, so branches exist; look them up by code.
+  const branchPage = await repo.list(scope, "branch", { filters: [], sort: [], page: 1, pageSize: 50 });
+  const branchByCode = new Map(branchPage.items.map((b) => [String(b.code), String(b.id)]));
+  const hqId = branchByCode.get("HQ") ?? null;
+  const eastId = branchByCode.get("BR-E") ?? null;
 
   const passwordHash = hashPassword(DEFAULT_PASSWORD);
   const users = [
-    { id: "user_admin", email: "avery@acme.test", displayName: "Avery Admin", positionId: "position_admin" },
-    { id: "user_manager", email: "morgan@acme.test", displayName: "Morgan Manager", positionId: "position_manager" },
-    { id: "user_rep", email: "riley@acme.test", displayName: "Riley Rep", positionId: "position_rep" },
-    { id: "user_accountant", email: "casey@acme.test", displayName: "Casey Accountant", positionId: "position_accountant" },
+    { id: "1", email: "avery@acme.test", displayName: "Avery Admin", positionId: "1", branchId: hqId },
+    { id: "2", email: "morgan@acme.test", displayName: "Morgan Manager", positionId: "2", branchId: hqId },
+    { id: "3", email: "riley@acme.test", displayName: "Riley Rep", positionId: "3", branchId: eastId },
+    { id: "4", email: "casey@acme.test", displayName: "Casey Accountant", positionId: "4", branchId: hqId },
   ];
   for (const u of users) {
-    await repo.insert(rec(u.id, { email: u.email, displayName: u.displayName, passwordHash, positionId: u.positionId, active: true }));
+    await repo.insert(
+      "user",
+      rec(u.id, { email: u.email, displayName: u.displayName, passwordHash, positionId: u.positionId, active: true, branchId: u.branchId, dealerId: null }),
+    );
   }
 
   logger.info("auth seed complete", { positions: positions.length, users: users.length });

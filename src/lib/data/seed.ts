@@ -5,7 +5,6 @@
  * are written directly (trusted) with explicit owners across two tenants to
  * exercise ownership ABAC and cross-tenant isolation.
  */
-import { newId } from "@/lib/core/ids";
 import {
   DEMO_ORG,
   DEMO_TENANT,
@@ -28,6 +27,22 @@ export async function isSeeded(): Promise<boolean> {
 
 const T0 = "2026-01-15T09:00:00.000Z";
 
+/**
+ * Seed ids are explicit, per-entity sequential integers (as strings) so the
+ * cross-referenced graph below can link records before they are inserted. The
+ * repository adopts these ids (via IDENTITY_INSERT on MSSQL) and continues the
+ * IDENTITY sequence from there for runtime-created rows.
+ */
+const idCounters = new Map<string, number>();
+function nextId(entity: string): string {
+  const n = (idCounters.get(entity) ?? 0) + 1;
+  idCounters.set(entity, n);
+  return String(n);
+}
+
+/** Each seed record remembers its entity so `put` can route the insert. */
+const entityOf = new WeakMap<EntityRecord, string>();
+
 function mk(
   entity: string,
   tenantId: string,
@@ -35,8 +50,8 @@ function mk(
   ownerId: string,
   fields: Record<string, FieldValue>,
 ): EntityRecord {
-  return {
-    id: newId(entity),
+  const rec: EntityRecord = {
+    id: nextId(entity),
     tenantId,
     orgId,
     ownerId,
@@ -47,11 +62,15 @@ function mk(
     version: 1,
     ...fields,
   };
+  entityOf.set(rec, entity);
+  return rec;
 }
 
 export async function seedInto(repo: Repository): Promise<void> {
   const rep = DEMO_USERS.rep.userId;
   const mgr = DEMO_USERS.manager.userId;
+  /** Insert a record built by `mk`, routing to its remembered entity table. */
+  const put = (rec: EntityRecord) => repo.insert(entityOf.get(rec) ?? "unknown", rec);
 
   // --- Demo tenant accounts ---
   const initech = mk("account", DEMO_TENANT, DEMO_ORG, mgr, {
@@ -79,10 +98,31 @@ export async function seedInto(repo: Repository): Promise<void> {
     employees: 30000,
   });
 
-  for (const a of [initech, umbrella, stark]) await repo.insert(a);
+  for (const a of [initech, umbrella, stark]) await put(a);
+
+  // --- Branches + dealers ---
+  const hq = mk("branch", DEMO_TENANT, DEMO_ORG, mgr, {
+    code: "HQ", name: "Headquarters", type: "headquarters", managerId: null,
+    phone: "+1-555-0000", address: "1 Market Street, Metropolis", active: true,
+  });
+  const branchEast = mk("branch", DEMO_TENANT, DEMO_ORG, mgr, {
+    code: "BR-E", name: "East Region Branch", type: "branch", managerId: null,
+    phone: "+1-555-0010", address: "22 East Avenue, Gotham", active: true,
+  });
+  for (const b of [hq, branchEast]) await put(b);
+
+  const dealerAcme = mk("dealer", DEMO_TENANT, DEMO_ORG, rep, {
+    code: "DLR-1", name: "Acme Reseller", branchId: branchEast.id, contactId: null,
+    email: "sales@acme-reseller.example", phone: "+1-555-0500", creditLimit: 50_000, balance: 0, active: true,
+  });
+  const dealerVertex = mk("dealer", DEMO_TENANT, DEMO_ORG, mgr, {
+    code: "DLR-2", name: "Vertex Distribution", branchId: hq.id, contactId: null,
+    email: "ops@vertex.example", phone: "+1-555-0501", creditLimit: 120_000, balance: 0, active: true,
+  });
+  for (const d of [dealerAcme, dealerVertex]) await put(d);
 
   // --- Contacts ---
-  await repo.insert(
+  await put(
     mk("contact", DEMO_TENANT, DEMO_ORG, mgr, {
       firstName: "Bill",
       lastName: "Lumbergh",
@@ -92,7 +132,7 @@ export async function seedInto(repo: Repository): Promise<void> {
       accountId: initech.id,
     }),
   );
-  await repo.insert(
+  await put(
     mk("contact", DEMO_TENANT, DEMO_ORG, rep, {
       firstName: "Alice",
       lastName: "Wesker",
@@ -104,7 +144,7 @@ export async function seedInto(repo: Repository): Promise<void> {
   );
 
   // --- Deals across stages and owners (for ABAC) ---
-  await repo.insert(
+  await put(
     mk("deal", DEMO_TENANT, DEMO_ORG, rep, {
       name: "Initech — Printer Fleet",
       stage: "qualified",
@@ -114,7 +154,7 @@ export async function seedInto(repo: Repository): Promise<void> {
       accountId: initech.id,
     }),
   );
-  await repo.insert(
+  await put(
     mk("deal", DEMO_TENANT, DEMO_ORG, mgr, {
       name: "Umbrella — Lab Systems",
       stage: "negotiation",
@@ -124,7 +164,7 @@ export async function seedInto(repo: Repository): Promise<void> {
       accountId: umbrella.id,
     }),
   );
-  await repo.insert(
+  await put(
     mk("deal", DEMO_TENANT, DEMO_ORG, mgr, {
       name: "Stark — Defense Platform",
       stage: "won",
@@ -134,7 +174,7 @@ export async function seedInto(repo: Repository): Promise<void> {
       accountId: stark.id,
     }),
   );
-  await repo.insert(
+  await put(
     mk("deal", DEMO_TENANT, DEMO_ORG, rep, {
       name: "Initech — Expansion",
       stage: "lead",
@@ -146,7 +186,7 @@ export async function seedInto(repo: Repository): Promise<void> {
   );
 
   // --- Tasks ---
-  await repo.insert(
+  await put(
     mk("task", DEMO_TENANT, DEMO_ORG, rep, {
       subject: "Follow up with Bill",
       status: "open",
@@ -157,7 +197,7 @@ export async function seedInto(repo: Repository): Promise<void> {
   );
 
   // --- Leads ---
-  await repo.insert(
+  await put(
     mk("lead", DEMO_TENANT, DEMO_ORG, rep, {
       name: "Dana Scully",
       company: "Wayne Enterprises",
@@ -168,7 +208,7 @@ export async function seedInto(repo: Repository): Promise<void> {
       status: "working",
     }),
   );
-  await repo.insert(
+  await put(
     mk("lead", DEMO_TENANT, DEMO_ORG, mgr, {
       name: "Frank Castle",
       company: "Cyberdyne",
@@ -187,7 +227,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     { code: "GBP", symbol: "£", rate: 1.27 },
     { code: "TRY", symbol: "₺", rate: 0.03 },
   ]) {
-    await repo.insert(mk("currency", DEMO_TENANT, DEMO_ORG, mgr, c));
+    await put(mk("currency", DEMO_TENANT, DEMO_ORG, mgr, c));
   }
 
   // --- Tax rates ---
@@ -196,7 +236,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     { name: "Reduced VAT", rate: 10, region: "EU" },
     { name: "Zero", rate: 0, region: "Global" },
   ]) {
-    await repo.insert(mk("taxRate", DEMO_TENANT, DEMO_ORG, mgr, t));
+    await put(mk("taxRate", DEMO_TENANT, DEMO_ORG, mgr, t));
   }
 
   // --- Products ---
@@ -206,46 +246,168 @@ export async function seedInto(repo: Repository): Promise<void> {
     { name: "Premium Support", sku: "SVC-SUP", unitPrice: 2_000, currencyCode: "USD", taxRate: 10, active: true },
     { name: "Data Migration", sku: "SVC-MIG", unitPrice: 7_500, currencyCode: "EUR", taxRate: 20, active: true },
   ]) {
-    await repo.insert(mk("product", DEMO_TENANT, DEMO_ORG, mgr, p));
+    await put(mk("product", DEMO_TENANT, DEMO_ORG, mgr, p));
+  }
+
+  // --- Stock-tracked products (physical goods) ---
+  const prodRouter = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "Edge Router X100", sku: "HW-RTR-X100", unitPrice: 1_200, currencyCode: "USD", taxRate: 20,
+    trackStock: true, costPrice: 720, reorderLevel: 20, uom: "ea", active: true,
+  });
+  const prodSwitch = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "Access Switch 24p", sku: "HW-SW-24", unitPrice: 650, currencyCode: "USD", taxRate: 20,
+    trackStock: true, costPrice: 410, reorderLevel: 15, uom: "ea", active: true,
+  });
+  const prodCable = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "Cat6 Cable (305m box)", sku: "HW-CBL-CAT6", unitPrice: 120, currencyCode: "USD", taxRate: 20,
+    trackStock: true, costPrice: 65, reorderLevel: 50, uom: "box", active: true,
+  });
+  for (const p of [prodRouter, prodSwitch, prodCable]) await put(p);
+
+  // --- Warehouses ---
+  const whMain = mk("warehouse", DEMO_TENANT, DEMO_ORG, mgr, {
+    code: "WH-MAIN", name: "Main Warehouse", branchId: hq.id, address: "1 Market Street", active: true,
+  });
+  const whEast = mk("warehouse", DEMO_TENANT, DEMO_ORG, mgr, {
+    code: "WH-EAST", name: "East Depot", branchId: branchEast.id, address: "22 East Avenue", active: true,
+  });
+  for (const w of [whMain, whEast]) await put(w);
+
+  // --- Suppliers ---
+  const supNetgear = mk("supplier", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "Netgear Distribution", code: "SUP-NTG", email: "orders@netgear-dist.example",
+    phone: "+1-555-0700", address: "9 Supply Rd", taxNumber: "TX-7781", currencyCode: "USD", active: true,
+  });
+  const supCableco = mk("supplier", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "CableCo Wholesale", code: "SUP-CBL", email: "sales@cableco.example",
+    phone: "+1-555-0701", address: "14 Wire Ave", taxNumber: "TX-9920", currencyCode: "USD", active: true,
+  });
+  for (const s of [supNetgear, supCableco]) await put(s);
+
+  // --- Opening stock (movements; on-hand is derived from these) ---
+  const openings = [
+    { product: prodRouter, warehouse: whMain, qty: 40, cost: 720 },
+    { product: prodRouter, warehouse: whEast, qty: 12, cost: 720 },
+    { product: prodSwitch, warehouse: whMain, qty: 30, cost: 410 },
+    { product: prodCable, warehouse: whMain, qty: 120, cost: 65 },
+    { product: prodCable, warehouse: whEast, qty: 45, cost: 65 },
+  ];
+  let openingStockValue = 0;
+  for (const o of openings) {
+    openingStockValue += o.qty * o.cost;
+    await put(
+      mk("stockMovement", DEMO_TENANT, DEMO_ORG, mgr, {
+        productId: o.product.id, warehouseId: o.warehouse.id, qty: o.qty, type: "receipt",
+        unitCost: o.cost, value: o.qty * o.cost, ref: "OPENING", refType: "opening",
+        branchId: (o.warehouse.branchId as string) ?? null, movedAt: T0,
+        stockKey: `${o.product.id}:${o.warehouse.id}`,
+      }),
+    );
+  }
+
+  // --- Chart of accounts ---
+  const coa = [
+    { code: "1000", name: "Cash & Bank", type: "asset", subtype: "cash", normalBalance: "debit" },
+    { code: "1100", name: "Accounts Receivable", type: "asset", subtype: "accounts_receivable", normalBalance: "debit" },
+    { code: "1200", name: "Inventory", type: "asset", subtype: "inventory", normalBalance: "debit" },
+    { code: "2000", name: "Accounts Payable", type: "liability", subtype: "accounts_payable", normalBalance: "credit" },
+    { code: "2050", name: "GR/IR Clearing", type: "liability", subtype: "gr_ir", normalBalance: "credit" },
+    { code: "2100", name: "Tax Payable", type: "liability", subtype: "tax_payable", normalBalance: "credit" },
+    { code: "3000", name: "Opening Balance Equity", type: "equity", subtype: "retained_earnings", normalBalance: "credit" },
+    { code: "4000", name: "Sales Revenue", type: "revenue", subtype: "sales_revenue", normalBalance: "credit" },
+    { code: "5000", name: "Cost of Goods Sold", type: "expense", subtype: "cogs", normalBalance: "debit" },
+    { code: "6000", name: "Operating Expenses", type: "expense", subtype: "operating_expense", normalBalance: "debit" },
+    { code: "6100", name: "Inventory Adjustments", type: "expense", subtype: "operating_expense", normalBalance: "debit" },
+  ];
+  const acctBySubtype = new Map<string, EntityRecord>();
+  for (const a of coa) {
+    const rec = mk("ledgerAccount", DEMO_TENANT, DEMO_ORG, mgr, { ...a, parentId: null, isPostable: true, active: true });
+    await put(rec);
+    acctBySubtype.set(a.subtype, rec);
+  }
+
+  // --- Fiscal period ---
+  await put(mk("fiscalPeriod", DEMO_TENANT, DEMO_ORG, mgr, { name: "FY2026", startDate: "2026-01-01", endDate: "2026-12-31", status: "open" }));
+
+  // --- Opening balance journal (Inventory vs Opening Equity) — keeps the TB balanced from seed ---
+  const invAcct = acctBySubtype.get("inventory")!;
+  const eqAcct = acctBySubtype.get("retained_earnings")!;
+  const openingJe = mk("journalEntry", DEMO_TENANT, DEMO_ORG, mgr, {
+    number: "JE-1", date: "2026-01-01", memo: "Opening balances", source: "manual", sourceRef: "OPENING",
+    branchId: hq.id, status: "posted", debitTotal: openingStockValue, creditTotal: openingStockValue,
+  });
+  await put(openingJe);
+  await put(mk("journalLine", DEMO_TENANT, DEMO_ORG, mgr, {
+    entryId: openingJe.id, ledgerAccountId: invAcct.id, debit: openingStockValue, credit: 0, description: "Opening inventory", branchId: hq.id, posted: true,
+  }));
+  await put(mk("journalLine", DEMO_TENANT, DEMO_ORG, mgr, {
+    entryId: openingJe.id, ledgerAccountId: eqAcct.id, debit: 0, credit: openingStockValue, description: "Opening equity", branchId: hq.id, posted: true,
+  }));
+
+  // --- Purchasing: a sent PO awaiting goods receipt ---
+  const poLines = [
+    { productId: prodRouter.id, description: "Edge Router X100", qty: 20, unitPrice: 720, taxRate: 20 },
+    { productId: prodSwitch.id, description: "Access Switch 24p", qty: 10, unitPrice: 410, taxRate: 20 },
+  ];
+  let poSub = 0;
+  let poTax = 0;
+  for (const l of poLines) {
+    poSub += l.qty * l.unitPrice;
+    poTax += l.qty * l.unitPrice * (l.taxRate / 100);
+  }
+  const po1 = mk("purchaseOrder", DEMO_TENANT, DEMO_ORG, mgr, {
+    number: "PO-5001", supplierId: supNetgear.id, warehouseId: whMain.id, status: "sent",
+    currencyCode: "USD", orderDate: "2026-01-12", expectedDate: "2026-01-25", branchId: hq.id,
+    subtotal: poSub, taxTotal: poTax, total: poSub + poTax, notes: null,
+  });
+  await put(po1);
+  for (const l of poLines) {
+    const net = l.qty * l.unitPrice;
+    await put(
+      mk("purchaseOrderLine", DEMO_TENANT, DEMO_ORG, mgr, {
+        poId: po1.id, productId: l.productId, description: l.description, qty: l.qty,
+        unitPrice: l.unitPrice, taxRate: l.taxRate, qtyReceived: 0, lineTotal: net + net * (l.taxRate / 100),
+      }),
+    );
   }
 
   // --- Invoices + payments (AR) ---
   const inv1 = mk("invoice", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "INV-1001", accountId: initech.id, quoteId: null, status: "partial", currencyCode: "USD",
+    number: "INV-1001", accountId: initech.id, quoteId: null, branchId: hq.id, dealerId: null, status: "partial", currencyCode: "USD",
     issueDate: "2026-01-05", dueDate: "2026-02-04", subtotal: 12_000, taxTotal: 2_400, total: 14_400,
     amountPaid: 5_000, balance: 9_400, notes: null,
   });
   const inv2 = mk("invoice", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "INV-1002", accountId: umbrella.id, quoteId: null, status: "sent", currencyCode: "USD",
+    number: "INV-1002", accountId: umbrella.id, quoteId: null, branchId: branchEast.id, dealerId: dealerAcme.id, status: "sent", currencyCode: "USD",
     issueDate: "2025-12-10", dueDate: "2026-01-09", subtotal: 60_000, taxTotal: 0, total: 60_000,
     amountPaid: 0, balance: 60_000, notes: null,
   });
   const inv3 = mk("invoice", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "INV-1003", accountId: stark.id, quoteId: null, status: "paid", currencyCode: "USD",
+    number: "INV-1003", accountId: stark.id, quoteId: null, branchId: hq.id, dealerId: dealerVertex.id, status: "paid", currencyCode: "USD",
     issueDate: "2026-01-02", dueDate: "2026-02-01", subtotal: 100_000, taxTotal: 0, total: 100_000,
     amountPaid: 100_000, balance: 0, notes: null,
   });
-  for (const inv of [inv1, inv2, inv3]) await repo.insert(inv);
+  for (const inv of [inv1, inv2, inv3]) await put(inv);
 
-  await repo.insert(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
+  await put(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
     invoiceId: inv1.id, productId: null, description: "Platform License (Annual)", qty: 1, unitPrice: 12_000, taxRate: 20, lineTotal: 14_400,
   }));
-  await repo.insert(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
+  await put(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
     invoiceId: inv2.id, productId: null, description: "Lab Systems Rollout", qty: 1, unitPrice: 60_000, taxRate: 0, lineTotal: 60_000,
   }));
-  await repo.insert(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
+  await put(mk("invoiceLine", DEMO_TENANT, DEMO_ORG, mgr, {
     invoiceId: inv3.id, productId: null, description: "Defense Platform", qty: 1, unitPrice: 100_000, taxRate: 0, lineTotal: 100_000,
   }));
 
-  await repo.insert(mk("payment", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "P-1001", invoiceId: inv1.id, accountId: initech.id, amount: 5_000, method: "bank", paidAt: "2026-01-20", notes: null,
+  await put(mk("payment", DEMO_TENANT, DEMO_ORG, mgr, {
+    number: "P-1001", invoiceId: inv1.id, accountId: initech.id, branchId: hq.id, dealerId: null, amount: 5_000, method: "bank", paidAt: "2026-01-20", notes: null,
   }));
-  await repo.insert(mk("payment", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "P-1002", invoiceId: inv3.id, accountId: stark.id, amount: 100_000, method: "bank", paidAt: "2026-01-15", notes: null,
+  await put(mk("payment", DEMO_TENANT, DEMO_ORG, mgr, {
+    number: "P-1002", invoiceId: inv3.id, accountId: stark.id, branchId: hq.id, dealerId: dealerVertex.id, amount: 100_000, method: "bank", paidAt: "2026-01-15", notes: null,
   }));
 
   // --- Recurring plan (due in the past so the billing run generates one) ---
-  await repo.insert(mk("recurringPlan", DEMO_TENANT, DEMO_ORG, mgr, {
+  await put(mk("recurringPlan", DEMO_TENANT, DEMO_ORG, mgr, {
     name: "Initech — Monthly Platform Fee",
     accountId: initech.id,
     description: "Monthly platform subscription",
@@ -263,7 +425,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     { title: "Umbrella — Lab Integration", accountId: umbrella.id, status: "accepted", amount: 220_000, validUntil: "2026-02-20" },
     { title: "Stark — Security Suite", accountId: stark.id, status: "draft", amount: 510_000, validUntil: "2026-04-30" },
   ]) {
-    await repo.insert(mk("proposal", DEMO_TENANT, DEMO_ORG, rep, p));
+    await put(mk("proposal", DEMO_TENANT, DEMO_ORG, rep, p));
   }
 
   // --- Estimations ---
@@ -271,7 +433,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     { number: "EST-2001", accountId: initech.id, status: "approved", amount: 42_000, expiryDate: "2026-03-01" },
     { number: "EST-2002", accountId: umbrella.id, status: "sent", amount: 96_000, expiryDate: "2026-03-12" },
   ]) {
-    await repo.insert(mk("estimation", DEMO_TENANT, DEMO_ORG, mgr, e));
+    await put(mk("estimation", DEMO_TENANT, DEMO_ORG, mgr, e));
   }
 
   // --- Contracts ---
@@ -280,87 +442,72 @@ export async function seedInto(repo: Repository): Promise<void> {
     { title: "Umbrella SLA", accountId: umbrella.id, status: "active", value: 360_000, startDate: "2025-07-01", endDate: "2026-06-30" },
     { title: "Stark NDA + Build", accountId: stark.id, status: "draft", value: 1_200_000, startDate: "2026-02-01", endDate: "2027-01-31" },
   ]) {
-    await repo.insert(mk("contract", DEMO_TENANT, DEMO_ORG, mgr, c));
+    await put(mk("contract", DEMO_TENANT, DEMO_ORG, mgr, c));
   }
 
   // --- Sales orders ---
   for (const o of [
-    { number: "SO-3001", accountId: initech.id, status: "confirmed", amount: 36_000, orderDate: "2026-01-08" },
-    { number: "SO-3002", accountId: stark.id, status: "completed", amount: 100_000, orderDate: "2026-01-03" },
-    { number: "SO-3003", accountId: umbrella.id, status: "pending", amount: 60_000, orderDate: "2026-01-22" },
+    { number: "SO-3001", accountId: initech.id, branchId: hq.id, dealerId: null, status: "confirmed", amount: 36_000, orderDate: "2026-01-08" },
+    { number: "SO-3002", accountId: stark.id, branchId: hq.id, dealerId: dealerVertex.id, status: "completed", amount: 100_000, orderDate: "2026-01-03" },
+    { number: "SO-3003", accountId: umbrella.id, branchId: branchEast.id, dealerId: dealerAcme.id, status: "pending", amount: 60_000, orderDate: "2026-01-22" },
   ]) {
-    await repo.insert(mk("salesOrder", DEMO_TENANT, DEMO_ORG, rep, o));
-  }
-
-  // --- Projects + milestones + timesheets ---
-  const proj1 = mk("project", DEMO_TENANT, DEMO_ORG, mgr, {
-    name: "Initech CRM Migration", accountId: initech.id, status: "active", priority: "high",
-    budget: 120_000, progress: 65, startDate: "2026-01-05", dueDate: "2026-04-30",
-  });
-  const proj2 = mk("project", DEMO_TENANT, DEMO_ORG, rep, {
-    name: "Umbrella Data Platform", accountId: umbrella.id, status: "planning", priority: "medium",
-    budget: 280_000, progress: 15, startDate: "2026-02-01", dueDate: "2026-08-31",
-  });
-  for (const p of [proj1, proj2]) await repo.insert(p);
-
-  for (const m of [
-    { name: "Discovery & Audit", projectId: proj1.id, status: "done", amount: 20_000, dueDate: "2026-01-31" },
-    { name: "Data Migration", projectId: proj1.id, status: "in_progress", amount: 50_000, dueDate: "2026-03-15" },
-    { name: "Go-Live", projectId: proj1.id, status: "pending", amount: 50_000, dueDate: "2026-04-30" },
-    { name: "Requirements", projectId: proj2.id, status: "in_progress", amount: 40_000, dueDate: "2026-03-01" },
-  ]) {
-    await repo.insert(mk("milestone", DEMO_TENANT, DEMO_ORG, mgr, m));
-  }
-
-  for (const t of [
-    { title: "Schema mapping", projectId: proj1.id, hours: 6, date: "2026-01-20", billable: true, status: "approved" },
-    { title: "ETL scripting", projectId: proj1.id, hours: 8, date: "2026-01-21", billable: true, status: "submitted" },
-    { title: "Kickoff workshop", projectId: proj2.id, hours: 4, date: "2026-02-03", billable: false, status: "draft" },
-  ]) {
-    await repo.insert(mk("timesheet", DEMO_TENANT, DEMO_ORG, rep, t));
-  }
-
-  // --- Marketing campaigns ---
-  for (const c of [
-    { name: "Q1 Product Launch", channel: "email", status: "running", budget: 12_000, sent: 18_400, startDate: "2026-01-10", endDate: "2026-03-31" },
-    { name: "Spring Webinar Series", channel: "social", status: "scheduled", budget: 5_000, sent: 0, startDate: "2026-03-01", endDate: "2026-05-31" },
-    { name: "Renewal Reminders", channel: "sms", status: "completed", budget: 1_500, sent: 920, startDate: "2025-12-01", endDate: "2025-12-31" },
-    { name: "Holiday WhatsApp Blast", channel: "whatsapp", status: "draft", budget: 800, sent: 0, startDate: "2026-04-01", endDate: "2026-04-15" },
-  ]) {
-    await repo.insert(mk("campaign", DEMO_TENANT, DEMO_ORG, mgr, c));
-  }
-
-  // --- Support tickets ---
-  for (const t of [
-    { subject: "Login fails after SSO change", accountId: initech.id, priority: "urgent", status: "open", assignee: "Riley Rep" },
-    { subject: "Export to CSV truncates rows", accountId: umbrella.id, priority: "high", status: "pending", assignee: "Morgan Manager" },
-    { subject: "Request: dark mode for portal", accountId: stark.id, priority: "low", status: "open", assignee: "Riley Rep" },
-    { subject: "Invoice PDF missing logo", accountId: initech.id, priority: "medium", status: "resolved", assignee: "Casey Accountant" },
-  ]) {
-    await repo.insert(mk("ticket", DEMO_TENANT, DEMO_ORG, rep, t));
+    await put(mk("salesOrder", DEMO_TENANT, DEMO_ORG, rep, o));
   }
 
   // --- People: departments + staff ---
   const deptSales = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Sales", head: "Morgan Manager", headcount: 8 });
   const deptEng = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Engineering", head: "Dana Lee", headcount: 14 });
   const deptSupport = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Support", head: "Sam Park", headcount: 5 });
-  for (const d of [deptSales, deptEng, deptSupport]) await repo.insert(d);
+  for (const d of [deptSales, deptEng, deptSupport]) await put(d);
 
-  for (const e of [
-    { firstName: "Morgan", lastName: "Manager", email: "morgan@aula.example", phone: "+1-555-0300", title: "Sales Manager", departmentId: deptSales.id, status: "active" },
-    { firstName: "Riley", lastName: "Rep", email: "riley@aula.example", phone: "+1-555-0301", title: "Account Executive", departmentId: deptSales.id, status: "active" },
-    { firstName: "Dana", lastName: "Lee", email: "dana@aula.example", phone: "+1-555-0302", title: "Eng Lead", departmentId: deptEng.id, status: "active" },
-    { firstName: "Sam", lastName: "Park", email: "sam@aula.example", phone: "+1-555-0303", title: "Support Lead", departmentId: deptSupport.id, status: "on_leave" },
+  // Staff are scoped to a branch (headquarters/branch) or a dealer.
+  const staff: Record<string, string>[] = [
+    { firstName: "Morgan", lastName: "Manager", email: "morgan@aula.example", phone: "+1-555-0300", title: "Sales Manager", departmentId: deptSales.id, branchId: hq.id, status: "active" },
+    { firstName: "Riley", lastName: "Rep", email: "riley@aula.example", phone: "+1-555-0301", title: "Account Executive", departmentId: deptSales.id, branchId: branchEast.id, status: "active" },
+    { firstName: "Dana", lastName: "Lee", email: "dana@aula.example", phone: "+1-555-0302", title: "Eng Lead", departmentId: deptEng.id, branchId: hq.id, status: "active" },
+    { firstName: "Sam", lastName: "Park", email: "sam@aula.example", phone: "+1-555-0303", title: "Support Lead", departmentId: deptSupport.id, branchId: branchEast.id, status: "on_leave" },
+    { firstName: "Cory", lastName: "Channel", email: "cory@aula.example", phone: "+1-555-0304", title: "Dealer Account Manager", departmentId: deptSales.id, dealerId: dealerAcme.id, status: "active" },
+  ];
+  for (const e of staff) {
+    await put(mk("employee", DEMO_TENANT, DEMO_ORG, mgr, e));
+  }
+
+  // --- Calendar events (shared org calendar; admin-managed) ---
+  for (const ev of [
+    { title: "Q1 Sales Review", date: "2026-01-20", type: "meeting", notes: "Quarterly pipeline review with the team." },
+    { title: "INV-1002 payment due", date: "2026-01-09", type: "deadline", notes: null },
+    { title: "Warehouse stock count", date: "2026-01-28", type: "reminder", notes: "Cycle count main + east warehouses." },
   ]) {
-    await repo.insert(mk("employee", DEMO_TENANT, DEMO_ORG, mgr, e));
+    await put(mk("calendarEvent", DEMO_TENANT, DEMO_ORG, mgr, ev));
+  }
+
+  // --- Sample chat conversation (admin id "1" ↔ manager id "2", set by auth-seed) ---
+  for (const m of [
+    { fromUserId: "1", author: "Avery Admin", body: "Merhaba! Soruların için bana buradan yazabilirsin. 👋", at: "2026-01-16T09:00:00.000Z" },
+    { fromUserId: "2", author: "Morgan Manager", body: "Teşekkürler! Q1 satış planını birazdan paylaşacağım.", at: "2026-01-16T09:05:00.000Z" },
+    { fromUserId: "1", author: "Avery Admin", body: "Harika, bekliyorum. 👍", at: "2026-01-16T09:06:00.000Z" },
+  ]) {
+    await put(
+      mk("chatMessage", DEMO_TENANT, DEMO_ORG, mgr, {
+        conversationId: "1-2",
+        participants: ",1,2,",
+        fromUserId: m.fromUserId,
+        author: m.author,
+        body: m.body,
+        attachments: null,
+        createdAt: m.at,
+      }),
+    );
   }
 
   // Keep runtime sequences ahead of seeded document numbers.
   await numberSequence.bump(DEMO_TENANT, "INV", 1003);
   await numberSequence.bump(DEMO_TENANT, "P", 1002);
+  await numberSequence.bump(DEMO_TENANT, "PO", 5001);
+  await numberSequence.bump(DEMO_TENANT, "JE", 1);
 
   // --- Other tenant (must remain invisible to demo tenant) ---
-  await repo.insert(
+  await put(
     mk("account", OTHER_TENANT, OTHER_ORG, OTHER_USER.userId, {
       name: "Globex Internal",
       industry: "finance",

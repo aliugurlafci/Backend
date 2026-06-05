@@ -11,6 +11,8 @@ import { registerSearchIndexing, reindexAll } from "@/lib/search/indexer";
 import { registerCacheInvalidation } from "@/lib/cache/invalidation";
 import { registerWebhookDelivery } from "@/lib/integrations/webhooks";
 import { registerNotifications } from "@/lib/integrations/notifications";
+import { registerAutomationEngine, seedAutomations } from "@/lib/automation";
+import { registerAccountingPostings } from "@/lib/accounting/postings";
 import { seedFeatureFlags } from "@/lib/config/feature-flags";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { deleteBlob } from "@/lib/integrations/file-storage";
@@ -33,6 +35,8 @@ export function ensurePlatform(): void {
   registerCacheInvalidation();
   registerWebhookDelivery();
   registerNotifications();
+  registerAutomationEngine();
+  registerAccountingPostings();
   registerFileCleanup();
 }
 
@@ -40,4 +44,12 @@ export function ensurePlatform(): void {
 export async function bootstrapPlatform(): Promise<void> {
   ensurePlatform();
   await reindexAll();
+  // Seed demo automations once (idempotent — only when the demo tenant is empty).
+  try {
+    await seedAutomations();
+  } catch (error) {
+    // Non-fatal: the console still works, just without seeded demo content.
+    // (Logged by the store/query layer.)
+    void error;
+  }
 }

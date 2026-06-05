@@ -26,23 +26,45 @@ import { proposalEntity } from "./entities/proposal";
 import { estimationEntity } from "./entities/estimation";
 import { contractEntity } from "./entities/contract";
 import { salesOrderEntity } from "./entities/sales-order";
-import { projectEntity } from "./entities/project";
-import { milestoneEntity } from "./entities/milestone";
-import { timesheetEntity } from "./entities/timesheet";
-import { campaignEntity } from "./entities/campaign";
-import { ticketEntity } from "./entities/ticket";
+import { branchEntity } from "./entities/branch";
+import { dealerEntity } from "./entities/dealer";
+import { warehouseEntity } from "./entities/warehouse";
+import { supplierEntity } from "./entities/supplier";
+import { stockMovementEntity } from "./entities/stock-movement";
+import { purchaseOrderEntity } from "./entities/purchase-order";
+import { purchaseOrderLineEntity } from "./entities/purchase-order-line";
+import { goodsReceiptEntity } from "./entities/goods-receipt";
+import { goodsReceiptLineEntity } from "./entities/goods-receipt-line";
+import { ledgerAccountEntity } from "./entities/ledger-account";
+import { fiscalPeriodEntity } from "./entities/fiscal-period";
+import { journalEntryEntity } from "./entities/journal-entry";
+import { journalLineEntity } from "./entities/journal-line";
+import { vendorBillEntity } from "./entities/vendor-bill";
+import { vendorBillLineEntity } from "./entities/vendor-bill-line";
+import { billPaymentEntity } from "./entities/bill-payment";
+import { stockTransferEntity } from "./entities/stock-transfer";
+import { stockAdjustmentEntity } from "./entities/stock-adjustment";
 import { departmentEntity } from "./entities/department";
 import { employeeEntity } from "./entities/employee";
 import { noteEntity } from "./entities/note";
 import { todoEntity } from "./entities/todo";
 import { callEntity } from "./entities/call";
-import { postEntity } from "./entities/post";
 import { fileEntity } from "./entities/file";
 import { chatMessageEntity } from "./entities/chat-message";
 import { emailEntity } from "./entities/email";
+import { calendarEventEntity } from "./entities/calendar-event";
 import { positionEntity } from "./entities/position";
 import { userEntity } from "./entities/user";
 import { userSettingEntity } from "./entities/user-setting";
+import {
+  automationRuleEntity,
+  automationRunEntity,
+  automationQueueEntity,
+  assignmentRuleEntity,
+  automationSettingEntity,
+  automationIntegrationEntity,
+  systemSettingEntity,
+} from "./entities/automation";
 import type { EntityDef } from "./types";
 
 export const crmEntities: EntityDef[] = [
@@ -60,17 +82,30 @@ export const crmEntities: EntityDef[] = [
   quoteLineEntity,
   invoiceEntity,
   invoiceLineEntity,
-  // projects
-  projectEntity,
-  milestoneEntity,
-  timesheetEntity,
-  // marketing
-  campaignEntity,
-  // support
-  ticketEntity,
+  // branches & dealers
+  branchEntity,
+  dealerEntity,
   // people
   departmentEntity,
   employeeEntity,
+  // inventory / purchasing
+  warehouseEntity,
+  supplierEntity,
+  stockMovementEntity,
+  purchaseOrderEntity,
+  purchaseOrderLineEntity,
+  goodsReceiptEntity,
+  goodsReceiptLineEntity,
+  stockTransferEntity,
+  stockAdjustmentEntity,
+  // accounting
+  ledgerAccountEntity,
+  fiscalPeriodEntity,
+  journalEntryEntity,
+  journalLineEntity,
+  vendorBillEntity,
+  vendorBillLineEntity,
+  billPaymentEntity,
   // finance / catalog
   productEntity,
   currencyEntity,
@@ -81,14 +116,22 @@ export const crmEntities: EntityDef[] = [
   noteEntity,
   todoEntity,
   callEntity,
-  postEntity,
   fileEntity,
   chatMessageEntity,
   emailEntity,
+  calendarEventEntity,
   // auth / access control
   positionEntity,
   userEntity,
   userSettingEntity,
+  // automation platform (system entities; admin-gated, off the auto-nav)
+  automationRuleEntity,
+  automationRunEntity,
+  automationQueueEntity,
+  assignmentRuleEntity,
+  automationSettingEntity,
+  automationIntegrationEntity,
+  systemSettingEntity,
 ];
 
 export const metadataRegistry = new MetadataRegistry();
