@@ -17,6 +17,7 @@ export const invoiceEntity: EntityDef = {
     { name: "quoteId", label: "Source Quote", type: "reference", referenceEntity: "quote" },
     branchRef(),
     dealerRef(),
+    { name: "warehouseId", label: "Warehouse", type: "reference", referenceEntity: "warehouse", filterable: true },
     {
       name: "status",
       label: "Status",

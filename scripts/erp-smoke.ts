@@ -12,7 +12,9 @@ import { getPurchasingService } from "@/lib/purchasing/service";
 import { getAccountingService } from "@/lib/accounting/service";
 import { getFinanceService } from "@/lib/finance/service";
 import { getPayablesService } from "@/lib/payables/service";
-import { postInvoiceGL, postStockTransfer, postStockAdjustment } from "@/lib/accounting/postings";
+import { postInvoiceGL, postStockTransfer, postStockAdjustment, registerAccountingPostings } from "@/lib/accounting/postings";
+import { getPosService } from "@/lib/pos/service";
+import { internalEan13, isValidBarcode } from "@/lib/barcode/check-digit";
 
 let failures = 0;
 function assert(cond: boolean, msg: string): void {
@@ -338,7 +340,69 @@ async function main(): Promise<void> {
   assert(chatUsers.some((u) => u.isAdmin), "chat users include an admin (everyone can DM admin)");
   assert(!chatUsers.some((u) => u.id === "3"), "picker excludes self");
 
-  console.log(failures === 0 ? "\n✅ ERP smoke passed (Phase 1–6)\n" : `\n❌ ${failures} assertion(s) failed\n`);
+  // ---- Barcode + POS + labels (new ERP features) ----
+  console.log("\n[barcode] product barcode fields + GTIN check digit:");
+  assert(metadata.getEntity("product").fields.some((f) => f.name === "barcode"), "product.barcode field");
+  assert(metadata.getEntity("product").fields.some((f) => f.name === "barcodeType"), "product.barcodeType field");
+  const ean = internalEan13(1001);
+  assert(isValidBarcode(ean, "ean13"), `generated EAN-13 valid (${ean})`);
+  assert(!isValidBarcode("123", "ean13"), "malformed EAN-13 rejected");
+  const barcoded = (await qe.list(ctx, "product", { filters: [{ field: "barcode", op: "eq", value: ean }], pageSize: 1 })).items[0];
+  assert(!!barcoded && barcoded.sku === "HW-RTR-X100", `seeded router carries barcode ${ean}`);
+
+  console.log("\n[pos] barcode/SKU lookup:");
+  const posSvc = await getPosService();
+  const byBarcode = await posSvc.lookup(ctx, ean);
+  assert(!!byBarcode && byBarcode.sku === "HW-RTR-X100", "lookup by barcode resolves the router");
+  const switchProd = await posSvc.lookup(ctx, "HW-SW-24");
+  assert(!!switchProd, "lookup falls back to SKU");
+  assert((await posSvc.lookup(ctx, "NOPE-404")) === null, "unknown code returns null");
+
+  console.log("\n[pos] open shift → checkout (stock issue + GL) → session totals:");
+  registerAccountingPostings(); // subscribe invoice.send (main.ts does this in prod)
+  const session = await posSvc.openSession(ctx, { branchId: whMain.branchId as string, warehouseId: whMain.id, openingFloat: 100 });
+  assert(session.status === "open", "shift opened");
+  const posBefore = await inventory.onHand(ctx, switchProd!.id, whMain.id);
+  const checkout = await posSvc.checkout(ctx, {
+    branchId: whMain.branchId as string,
+    warehouseId: whMain.id,
+    sessionId: String(session.id),
+    lines: [{ productId: switchProd!.id, description: String(switchProd!.name), qty: 2, unitPrice: 650, taxRate: 20 }],
+    payments: [{ method: "cash", amount: 2000 }],
+  });
+  assert(checkout.total === 1560, `POS total = 1560 (got ${checkout.total})`);
+  assert(checkout.change === 440, `POS change = 440 (got ${checkout.change})`);
+  const posAfter = await inventory.onHand(ctx, switchProd!.id, whMain.id);
+  assert(posAfter === posBefore - 2, `POS issued stock (${posBefore} → ${posAfter})`);
+  assert((await jeCount("invoice", String(checkout.invoice.id))) === 1, "POS invoice posted to GL");
+  bal = await sumTB();
+  assert(bal.dr === bal.cr, `TB balanced after POS sale (${bal.dr}/${bal.cr})`);
+  const sessAfter = await qe.get(ctx, "posSession", String(session.id));
+  assert(Number(sessAfter.salesTotal) === 1560, `session salesTotal accrued (got ${sessAfter.salesTotal})`);
+  assert(Number(sessAfter.cashTotal) === 1560, `session cashTotal = cash kept (got ${sessAfter.cashTotal})`);
+
+  console.log("\n[pos] close shift computes variance:");
+  const closed = await posSvc.closeSession(ctx, String(session.id), 1700);
+  // expectedCash = float(100) + cashTotal(1560) = 1660; counted 1700 → +40
+  assert(closed.status === "closed", "shift closed");
+  assert(Number(closed.variance) === 40, `cash variance = +40 (got ${closed.variance})`);
+
+  console.log("\n[inventory] per-location on-hand join (stock-levels source):");
+  const onHandRows = await inventory.onHandByKey(ctx);
+  assert(onHandRows.length >= 5, `on-hand-by-key rows present (${onHandRows.length})`);
+  assert(onHandRows.every((r) => typeof r.onHand === "number"), "each row carries a numeric on-hand");
+
+  console.log("\n[labels] labelTemplate CRUD + JSON round-trip:");
+  assert(metadata.listEntities().some((e) => e.name === "labelTemplate"), "labelTemplate entity registered");
+  const tpl = await qe.create(ctx, "labelTemplate", {
+    name: "Smoke 50x30", widthMm: 50, heightMm: 30, dpi: 300,
+    elements: JSON.stringify([{ id: "e1", type: "barcode", field: "barcode", x: 4, y: 9, w: 42, h: 13 }]), active: true,
+  });
+  assert(/^\d+$/.test(String(tpl.id)), `label template created (id ${tpl.id})`);
+  const tplBack = await qe.get(ctx, "labelTemplate", String(tpl.id));
+  assert(JSON.parse(String(tplBack.elements)).length === 1, "template elements round-trip JSON");
+
+  console.log(failures === 0 ? "\n✅ ERP smoke passed (Phase 1–6 + barcode/POS/labels)\n" : `\n❌ ${failures} assertion(s) failed\n`);
   process.exit(failures === 0 ? 0 : 1);
 }
 

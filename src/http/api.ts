@@ -23,6 +23,8 @@ import { getFinanceService, type LineInput, type PaymentInput } from "@/lib/fina
 import { getPurchasingService, type GrnLineInput } from "@/lib/purchasing/service";
 import { getAccountingService, type JournalLineInput } from "@/lib/accounting/service";
 import { getPayablesService } from "@/lib/payables/service";
+import { getInventoryService } from "@/lib/inventory/service";
+import { getPosService, type PosCheckoutInput } from "@/lib/pos/service";
 import { postStockTransfer, postStockAdjustment } from "@/lib/accounting/postings";
 import { permissionEngine } from "@/lib/permissions/engine";
 import { metadata } from "@/lib/metadata";
@@ -55,7 +57,7 @@ import { env, isProduction, usingInMemoryBackends } from "@/lib/config/env";
 import { BadRequestError, ForbiddenError, NotFoundError, toAppError } from "@/lib/enforcement/errors";
 import type { Filter, Measure } from "@/lib/data/query";
 import { issuePersonaToken } from "@/lib/security/auth-config";
-import { saveBlob, openBlob, blobExists } from "@/lib/integrations/file-storage";
+import { saveBlob, readBlob } from "@/lib/integrations/file-storage";
 import { listChatUsers, listConversations, listMessages, createMessage as createChatMessage } from "@/lib/chat/service";
 import { sendMail, fetchHeaders, fetchBodiesByUid } from "@/lib/integrations/email-transport";
 import { login, getPosition, parseScreens, findUserById } from "@/lib/security/auth-service";
@@ -925,6 +927,114 @@ export function buildApiRouter(): Router {
     ),
   );
 
+  // ---- inventory: per-location on-hand levels (stock-levels screen) -----
+  // Joins the derived on-hand/value (by product+warehouse) with product,
+  // warehouse and branch names + reorder thresholds. Optional filters:
+  // ?branchId= ?warehouseId= ?lowStock=true.
+  r.get("/inventory/on-hand", runApi(async (rc, req) => {
+    const inventory = await getInventoryService();
+    const domain = await getDomainService();
+    const [rows, products, warehouses, branches] = await Promise.all([
+      inventory.onHandByKey(rc),
+      domain.list(rc, "product", { pageSize: 1000 }),
+      domain.list(rc, "warehouse", { pageSize: 500 }),
+      domain.list(rc, "branch", { pageSize: 500 }),
+    ]);
+    const pById = new Map(products.items.map((p) => [String(p.id), p]));
+    const wById = new Map(warehouses.items.map((w) => [String(w.id), w]));
+    const bById = new Map(branches.items.map((b) => [String(b.id), b]));
+
+    const branchId = typeof req.query.branchId === "string" ? req.query.branchId : undefined;
+    const warehouseId = typeof req.query.warehouseId === "string" ? req.query.warehouseId : undefined;
+    const lowOnly = req.query.lowStock === "true" || req.query.lowStock === "1";
+
+    const out = rows
+      .map((row) => {
+        const product = pById.get(row.productId);
+        const warehouse = wById.get(row.warehouseId);
+        const wBranchId = warehouse ? String(warehouse.branchId ?? "") : "";
+        const reorderLevel = Number(product?.reorderLevel ?? 0);
+        return {
+          productId: row.productId,
+          productName: product ? String(product.name) : row.productId,
+          sku: product ? String(product.sku ?? "") : "",
+          barcode: product ? String(product.barcode ?? "") : "",
+          warehouseId: row.warehouseId,
+          warehouseName: warehouse ? String(warehouse.name) : row.warehouseId,
+          branchId: wBranchId || null,
+          branchName: wBranchId ? String(bById.get(wBranchId)?.name ?? "") : "",
+          onHand: row.onHand,
+          value: row.value,
+          reorderLevel,
+          low: reorderLevel > 0 && row.onHand <= reorderLevel,
+        };
+      })
+      .filter((row) => {
+        if (warehouseId && row.warehouseId !== warehouseId) return false;
+        if (branchId && row.branchId !== branchId) return false;
+        if (lowOnly && !row.low) return false;
+        return true;
+      });
+    return { rows: out };
+  }));
+
+  // ---- point of sale ---------------------------------------------------
+  // Barcode/SKU lookup, till sessions, and the checkout that rings a sale
+  // through the invoice → send → pay pipeline (stock issued from warehouseId).
+  r.get("/pos/lookup", runApi(async (rc, req) => {
+    const code = typeof req.query.code === "string" ? req.query.code : "";
+    if (!code) throw new BadRequestError("code is required");
+    const pos = await getPosService();
+    const product = await pos.lookup(rc, code);
+    if (!product) throw new NotFoundError(`no product for code "${code}"`);
+    return { product };
+  }));
+
+  r.get("/pos/session", runApi(async (rc) => {
+    const pos = await getPosService();
+    return { session: await pos.currentSession(rc) };
+  }));
+
+  r.post(
+    "/pos/session/open",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { branchId?: string | null; warehouseId?: string | null; openingFloat?: number };
+        const pos = await getPosService();
+        return { session: await pos.openSession(rc, body) };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.post(
+    "/pos/session/close",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { sessionId?: string; countedCash?: number };
+        if (!body.sessionId) throw new BadRequestError("sessionId is required");
+        const pos = await getPosService();
+        return { session: await pos.closeSession(rc, body.sessionId, Number(body.countedCash ?? 0)) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/pos/checkout",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "pos", action: "pos:checkout" })) {
+          throw new ForbiddenError("not allowed to check out POS sales");
+        }
+        const body = readJson(req) as PosCheckoutInput;
+        const pos = await getPosService();
+        return pos.checkout(rc, body);
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
   // ---- recurring billing + cron ----------------------------------------
   r.post(
     "/recurring/run",
@@ -1511,43 +1621,59 @@ export function buildApiRouter(): Router {
     "/files/upload",
     runApi(
       async (rc, req) => {
-        const { buffer, filename, folder } = await new Promise<{ buffer: Buffer; filename: string; folder: string }>(
-          (resolve, reject) => {
-            const chunks: Buffer[] = [];
-            let filename = "upload";
-            let folder = "documents";
-            let tooBig = false;
-            const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 100 * 1024 * 1024 } });
-            bb.on("file", (_name, stream, info) => {
-              if (info.filename) filename = info.filename;
-              stream.on("data", (d: Buffer) => chunks.push(d));
-              stream.on("limit", () => {
-                tooBig = true;
-              });
+        const { buffer, filename, folder, mimeType } = await new Promise<{
+          buffer: Buffer;
+          filename: string;
+          folder: string;
+          mimeType: string;
+        }>((resolve, reject) => {
+          const chunks: Buffer[] = [];
+          let filename = "upload";
+          let folder = "documents";
+          let mimeType = "";
+          let tooBig = false;
+          const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 100 * 1024 * 1024 } });
+          bb.on("file", (_name, stream, info) => {
+            if (info.filename) filename = info.filename;
+            if (info.mimeType) mimeType = info.mimeType;
+            stream.on("data", (d: Buffer) => chunks.push(d));
+            stream.on("limit", () => {
+              tooBig = true;
             });
-            bb.on("field", (name, value) => {
-              if (name === "folder" && value) folder = value;
-            });
-            bb.on("close", () =>
-              tooBig
-                ? reject(new BadRequestError("file exceeds the 100 MB limit"))
-                : resolve({ buffer: Buffer.concat(chunks), filename, folder }),
-            );
-            bb.on("error", reject);
-            req.pipe(bb);
-          },
-        );
+          });
+          bb.on("field", (name, value) => {
+            if (name === "folder" && value) folder = value;
+          });
+          bb.on("close", () =>
+            tooBig
+              ? reject(new BadRequestError("file exceeds the 100 MB limit"))
+              : resolve({ buffer: Buffer.concat(chunks), filename, folder, mimeType }),
+          );
+          bb.on("error", reject);
+          req.pipe(bb);
+        });
 
         if (!buffer.length) throw new BadRequestError("no file uploaded");
         const domain = await getDomainService();
+        // Captured content-type → served verbatim on download (no guessing); fall
+        // back to the filename guess so older clients without a type still work.
+        const resolvedMime = mimeType.trim() || guessFileContentType(filename);
         const record = await domain.create(rc, "file", {
           name: filename,
           folder,
           sizeKb: Math.max(1, Math.round(buffer.length / 1024)),
+          mimeType: resolvedMime,
           owner: rc.displayName,
         });
-        await saveBlob(record.id, buffer); // blob keyed by the record id
-        return record;
+        try {
+          await saveBlob(record.id, buffer, resolvedMime); // bytes keyed by the record id (durable store)
+        } catch (e) {
+          // Atomicity: never leave a metadata row whose bytes failed to persist.
+          await domain.remove(rc, "file", record.id).catch(() => {});
+          throw e;
+        }
+        // Make the blob↔record link explicit + portable (was implicit id==filename).
+        return domain.update(rc, "file", record.id, { storageKey: `db:${record.id}` });
       },
       { mutating: true, status: 201 },
     ),
@@ -1556,20 +1682,19 @@ export function buildApiRouter(): Router {
   r.get("/files/:id/download", runApi(async (rc, req, res) => {
     const domain = await getDomainService();
     const record = await domain.get(rc, "file", req.params.id); // enforces read + tenant scope
-    if (!(await blobExists(req.params.id))) throw new NotFoundError("file", req.params.id);
+    const blob = await readBlob(req.params.id);
+    if (!blob) throw new NotFoundError("file", req.params.id);
     const name = String(record.name);
-    // `?inline=1` serves with a guessed content-type + inline disposition so chat
+    // `?inline=1` serves with the real content-type + inline disposition so chat
     // image attachments render in <img>; the default stays a forced download.
+    // Prefer the stored mimeType (row → blob), falling back to a filename guess.
     const inline = req.query.inline === "1" || req.query.inline === "true";
+    const contentType =
+      (typeof record.mimeType === "string" && record.mimeType.trim()) || blob.mimeType || guessFileContentType(name);
     setApiHeaders(res, rc.correlationId);
-    res.setHeader("content-type", inline ? guessFileContentType(name) : "application/octet-stream");
+    res.setHeader("content-type", inline ? contentType : "application/octet-stream");
     res.setHeader("content-disposition", `${inline ? "inline" : "attachment"}; filename="${encodeURIComponent(name)}"`);
-    await new Promise<void>((resolve, reject) => {
-      const stream = openBlob(req.params.id);
-      stream.on("error", reject);
-      res.on("finish", resolve);
-      stream.pipe(res);
-    });
+    res.end(blob.data);
   }));
 
   // ---- chat: user picker + conversations + messages (privacy via chat/service) -

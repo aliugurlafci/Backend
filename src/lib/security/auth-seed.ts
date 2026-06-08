@@ -46,18 +46,23 @@ export async function ensureAuthSeed(repo: Repository): Promise<void> {
     "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
     "proposal", "estimation", "contract", "salesOrder", "quote", "invoice",
     "branch", "dealer", "warehouse", "supplier", "product",
+    "purchaseOrder", "goodsReceipt",
+    "pos", "stock-levels", "label-designer", "labels",
     "reports", "finance", "email", "chat", "calls", "notes", "todo", "file-manager",
   ];
   const repScreens = [
     "home", "sales-dashboard", "leads-dashboard", "deals-dashboard",
     "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
     "quote", "proposal", "dealer",
+    "pos", "stock-levels", "labels",
     "email", "chat", "calls", "notes", "todo", "file-manager",
   ];
   const accountantScreens = [
     "home", "revenue-dashboard", "executive-dashboard", "accounting-dashboard", "branch-dashboard",
     "account", "contact", "activity", "calendar", "branch", "dealer",
     "quote", "invoice", "payment", "product", "recurringPlan", "finance", "reports",
+    "purchaseOrder", "vendorBill", "goodsReceipt", "journalEntry",
+    "stock-levels",
     "notes", "todo", "file-manager", "chat",
   ];
 

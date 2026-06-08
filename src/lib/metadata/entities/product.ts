@@ -13,6 +13,21 @@ export const productEntity: EntityDef = {
   fields: [
     { name: "name", label: "Name", type: "string", required: true, searchable: true, sortable: true, min: 1, max: 160 },
     { name: "sku", label: "SKU", type: "string", unique: true, searchable: true, sortable: true },
+    { name: "barcode", label: "Barcode", type: "string", unique: true, searchable: true, sortable: true, max: 64, helpText: "EAN-13 / UPC-A / Code128 value or QR payload" },
+    {
+      name: "barcodeType",
+      label: "Barcode Type",
+      type: "enum",
+      filterable: true,
+      defaultValue: "code128",
+      options: [
+        { value: "code128", label: "Code 128" },
+        { value: "ean13", label: "EAN-13" },
+        { value: "upc", label: "UPC-A" },
+        { value: "qr", label: "QR Code" },
+      ],
+    },
+    { name: "imageId", label: "Image", type: "reference", referenceEntity: "file" },
     { name: "unitPrice", label: "Unit Price", type: "currency", required: true, sortable: true, min: 0 },
     { name: "currencyCode", label: "Currency", type: "enum", filterable: true, defaultValue: "USD", options: CURRENCY_OPTIONS },
     { name: "taxRate", label: "Tax Rate", type: "percent", defaultValue: 0, min: 0, max: 100 },
@@ -25,6 +40,7 @@ export const productEntity: EntityDef = {
   listColumns: [
     { field: "name", width: 220 },
     { field: "sku", width: 130 },
+    { field: "barcode", width: 150 },
     { field: "unitPrice", width: 120 },
     { field: "costPrice", width: 120 },
     { field: "trackStock", width: 100 },

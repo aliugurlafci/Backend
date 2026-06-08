@@ -57,11 +57,13 @@ async function postInvoiceCOGS(ctx: RequestContext, inv: EntityRecord): Promise<
     pageSize: 200,
   });
 
-  // Resolve a warehouse to issue from: the invoice's branch, else any warehouse.
-  const branchWh = inv.branchId
+  // Resolve a warehouse to issue from: the invoice's explicit warehouse (set by
+  // POS / picking), else the invoice's branch, else any warehouse.
+  const explicitWh = inv.warehouseId ? await qe.get(ctx, "warehouse", String(inv.warehouseId)).catch(() => undefined) : undefined;
+  const branchWh = !explicitWh && inv.branchId
     ? (await qe.list(ctx, "warehouse", { filters: [{ field: "branchId", op: "eq", value: inv.branchId }], pageSize: 1 })).items[0]
     : undefined;
-  const warehouse = branchWh ?? (await qe.list(ctx, "warehouse", { pageSize: 1 })).items[0];
+  const warehouse = explicitWh ?? branchWh ?? (await qe.list(ctx, "warehouse", { pageSize: 1 })).items[0];
   if (!warehouse) return;
 
   let cogsTotal = 0;

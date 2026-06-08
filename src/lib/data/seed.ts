@@ -15,6 +15,7 @@ import {
 } from "@/lib/context/dev";
 import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import { numberSequence } from "@/lib/finance/number-sequence";
+import { internalEan13 } from "@/lib/barcode/check-digit";
 import type { Repository } from "./repository";
 import { getPool } from "./mssql/connection";
 
@@ -97,8 +98,12 @@ export async function seedInto(repo: Repository): Promise<void> {
     annualRevenue: 1_200_000_000,
     employees: 30000,
   });
+  // Default cash-sale customer for POS walk-in sales (resolved by name in PosService).
+  const walkIn = mk("account", DEMO_TENANT, DEMO_ORG, mgr, {
+    name: "Walk-in Customer",
+  });
 
-  for (const a of [initech, umbrella, stark]) await put(a);
+  for (const a of [initech, umbrella, stark, walkIn]) await put(a);
 
   // --- Branches + dealers ---
   const hq = mk("branch", DEMO_TENANT, DEMO_ORG, mgr, {
@@ -251,15 +256,15 @@ export async function seedInto(repo: Repository): Promise<void> {
 
   // --- Stock-tracked products (physical goods) ---
   const prodRouter = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
-    name: "Edge Router X100", sku: "HW-RTR-X100", unitPrice: 1_200, currencyCode: "USD", taxRate: 20,
+    name: "Edge Router X100", sku: "HW-RTR-X100", barcode: internalEan13(1001), barcodeType: "ean13", unitPrice: 1_200, currencyCode: "USD", taxRate: 20,
     trackStock: true, costPrice: 720, reorderLevel: 20, uom: "ea", active: true,
   });
   const prodSwitch = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
-    name: "Access Switch 24p", sku: "HW-SW-24", unitPrice: 650, currencyCode: "USD", taxRate: 20,
+    name: "Access Switch 24p", sku: "HW-SW-24", barcode: internalEan13(1002), barcodeType: "ean13", unitPrice: 650, currencyCode: "USD", taxRate: 20,
     trackStock: true, costPrice: 410, reorderLevel: 15, uom: "ea", active: true,
   });
   const prodCable = mk("product", DEMO_TENANT, DEMO_ORG, mgr, {
-    name: "Cat6 Cable (305m box)", sku: "HW-CBL-CAT6", unitPrice: 120, currencyCode: "USD", taxRate: 20,
+    name: "Cat6 Cable (305m box)", sku: "HW-CBL-CAT6", barcode: internalEan13(1003), barcodeType: "ean13", unitPrice: 120, currencyCode: "USD", taxRate: 20,
     trackStock: true, costPrice: 65, reorderLevel: 50, uom: "box", active: true,
   });
   for (const p of [prodRouter, prodSwitch, prodCable]) await put(p);

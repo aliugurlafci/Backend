@@ -26,6 +26,8 @@ export const fileEntity: EntityDef = {
       ],
     },
     { name: "sizeKb", label: "Size (KB)", type: "number", defaultValue: 0, min: 0, sortable: true },
+    { name: "mimeType", label: "Content Type", type: "string", max: 160, helpText: "MIME type captured at upload; used to serve the file with the correct content-type." },
+    { name: "storageKey", label: "Storage Key", type: "string", max: 200, helpText: "Durable pointer to the stored bytes (e.g. db:<id>). Makes the blob↔record link explicit and portable." },
     { name: "owner", label: "Owner", type: "string", max: 120 },
   ],
   listColumns: [

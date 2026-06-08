@@ -118,6 +118,15 @@ export function supportStatements(): string[] {
       `CREATE TABLE [dbo].[_seq_counter] (\n` +
       `  [tenantId] NVARCHAR(80) NOT NULL,\n  [prefix] NVARCHAR(40) NOT NULL,\n  [value] INT NOT NULL,\n` +
       `  CONSTRAINT [PK__seq_counter] PRIMARY KEY ([tenantId],[prefix])\n);`,
+    // File bytes live in the DB (keyed by the `file` record id) so blobs travel
+    // with the database and stay findable from any backend host/instance — not
+    // on a single machine's local disk. The `file` entity row holds the metadata.
+    `IF OBJECT_ID(N'[dbo].[_file_blob]', N'U') IS NULL\n` +
+      `CREATE TABLE [dbo].[_file_blob] (\n` +
+      `  [id] NVARCHAR(80) NOT NULL,\n  [data] VARBINARY(MAX) NOT NULL,\n` +
+      `  [mimeType] NVARCHAR(160) NULL,\n  [sizeBytes] INT NOT NULL,\n` +
+      `  [sha256] NVARCHAR(64) NULL,\n  [createdAt] NVARCHAR(40) NOT NULL,\n` +
+      `  CONSTRAINT [PK__file_blob] PRIMARY KEY ([id])\n);`,
   ];
 }
 
