@@ -13,7 +13,6 @@ export const dealerEntity: EntityDef = {
     { name: "code", label: "Code", type: "string", required: true, unique: true, searchable: true, sortable: true, filterable: true, max: 40 },
     { name: "name", label: "Name", type: "string", required: true, searchable: true, sortable: true, max: 120 },
     { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
-    { name: "contactId", label: "Contact", type: "reference", referenceEntity: "contact" },
     { name: "email", label: "Email", type: "email", pii: true, searchable: true },
     { name: "phone", label: "Phone", type: "phone", pii: true },
     { name: "creditLimit", label: "Credit Limit", type: "currency", min: 0, defaultValue: 0 },

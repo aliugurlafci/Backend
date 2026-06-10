@@ -18,6 +18,8 @@ export interface JwtClaims {
   orgId?: string;
   /** The user's position id (screen access). */
   positionId?: string;
+  /** Explicit operation grants from the position's permission matrix (authoritative when present). */
+  grants?: string[];
   exp?: number;
   iat?: number;
   iss?: string;
@@ -68,6 +70,7 @@ function principalFromClaims(claims: JwtClaims) {
     tenantId: claims.tenantId,
     orgId: claims.orgId,
     positionId: claims.positionId,
+    grants: claims.grants,
   };
 }
 

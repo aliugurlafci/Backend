@@ -16,6 +16,7 @@ export type ErrorCode =
   | "CONFLICT"
   | "RATE_LIMITED"
   | "BAD_REQUEST"
+  | "ACCOUNTING"
   | "INTERNAL";
 
 export interface ErrorDetail {

@@ -147,6 +147,28 @@ export class InMemoryRepository implements Repository {
     this.collection(entity).delete(id);
   }
 
+  async updateMany(scope: TenantScope, entity: string, ids: string[], patch: Record<string, unknown>): Promise<number> {
+    let changed = 0;
+    for (const id of ids) {
+      const current = await this.get(scope, entity, String(id));
+      if (!current) continue;
+      this.collection(entity).set(current.id, { ...current, ...patch, version: current.version + 1 });
+      changed++;
+    }
+    return changed;
+  }
+
+  async deleteMany(scope: TenantScope, entity: string, ids: string[]): Promise<number> {
+    let removed = 0;
+    for (const id of ids) {
+      const current = await this.get(scope, entity, String(id));
+      if (!current) continue;
+      this.collection(entity).delete(current.id);
+      removed++;
+    }
+    return removed;
+  }
+
   async existsByField(
     scope: TenantScope,
     entity: string,

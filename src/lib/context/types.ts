@@ -14,6 +14,12 @@ export interface Principal {
   roles: string[];
   /** The user's position (drives screen access); absent for dev personas. */
   positionId?: string;
+  /**
+   * Explicit operation grants from the position's permission matrix. When set
+   * (authoritative), these replace the role's default grants; when undefined the
+   * engine falls back to the base role's defaults. Resolved at login.
+   */
+  grants?: string[];
 }
 
 export interface RequestContext {
@@ -25,6 +31,12 @@ export interface RequestContext {
   readonly roles: readonly string[];
   /** The caller's position id (screen access); absent for dev/system actors. */
   readonly positionId?: string;
+  /**
+   * Explicit operation grants (from the position's permission matrix). When
+   * present they are authoritative; when undefined the permission engine falls
+   * back to the base role's default grants.
+   */
+  readonly grants?: readonly string[];
   readonly locale: string;
   readonly featureFlags: Readonly<Record<string, boolean>>;
   readonly correlationId: string;

@@ -3,7 +3,9 @@
  * Throwaway ERP smoke — runs against the in-memory repository through the real
  * QueryEngine. Run: AULA_PERSISTENCE=memory tsx scripts/erp-smoke.ts
  */
-import { getQueryEngine } from "@/lib/data/store";
+import { getQueryEngine, getRepository } from "@/lib/data/store";
+import { seedInto } from "@/lib/data/seed";
+import { ensureDemoUsers } from "@/lib/security/auth-seed";
 import { metadata } from "@/lib/metadata";
 import { systemContext } from "@/lib/context/resolver";
 import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
@@ -14,6 +16,15 @@ import { getFinanceService } from "@/lib/finance/service";
 import { getPayablesService } from "@/lib/payables/service";
 import { postInvoiceGL, postStockTransfer, postStockAdjustment, registerAccountingPostings } from "@/lib/accounting/postings";
 import { getPosService } from "@/lib/pos/service";
+import { getDomainService } from "@/lib/domain";
+import { executeRule, runScheduledAutomations, enqueueScheduled, processQueue, getLiveActivity, evaluateLeaf } from "@/lib/automation/engine";
+import { automationStore } from "@/lib/automation/store";
+import { runAllJobs } from "@/lib/jobs/scheduler";
+import { notifications, registerNotifications, inQuietHours, buildInAppMuteFilter } from "@/lib/integrations/notifications";
+import { permissionEngine } from "@/lib/permissions/engine";
+import { grantsClaimFor, login, recordSecurityEvent } from "@/lib/security/auth-service";
+import { randomBase32Secret, totpNow, totpVerify, encrypt } from "@/lib/security/crypto";
+import type { EntityRecord } from "@/lib/metadata/types";
 import { internalEan13, isValidBarcode } from "@/lib/barcode/check-digit";
 
 let failures = 0;
@@ -28,6 +39,10 @@ function assert(cond: boolean, msg: string): void {
 
 async function main(): Promise<void> {
   const qe = await getQueryEngine();
+  // Server boot only seeds the admin now, so the smoke seeds its own demo data:
+  // business records first (branches), then the demo users (which look up branches).
+  await seedInto(getRepository());
+  await ensureDemoUsers(getRepository());
   const ctx = systemContext(DEMO_TENANT, DEMO_ORG);
 
   console.log("\n[metadata] removed entities are gone:");
@@ -139,12 +154,283 @@ async function main(): Promise<void> {
   const movesAfter = (await qe.list(ctx, "stockMovement", { pageSize: 1 })).total;
   assert(movesBefore === movesAfter, `re-post GRN writes no new movements (${movesBefore} → ${movesAfter})`);
 
+  console.log("\n[accounting] GL self-heals a missing chart of accounts (fresh tenant):");
+  const acctSvc = await getAccountingService();
+  const freshAcctCtx = systemContext("t_fresh_acct", "o_fresh_acct");
+  const invAcctId = await acctSvc.requireAccount(freshAcctCtx, "inventory");
+  assert(!!invAcctId, "requireAccount self-provisions a missing system account (inventory)");
+  assert((await acctSvc.accountBySubtype(freshAcctCtx, "inventory"))?.id === invAcctId, "self-provisioned account is found by subtype");
+  const grIrAcctId = await acctSvc.requireAccount(freshAcctCtx, "gr_ir");
+  assert(grIrAcctId !== invAcctId, "a distinct subtype gets its own account (gr_ir)");
+
   console.log("\n[purchasing] PO received qty + status reconciled:");
   const poLinesAfter = await qe.list(ctx, "purchaseOrderLine", { filters: [{ field: "poId", op: "eq", value: po.id }], pageSize: 10 });
   const routerLine = poLinesAfter.items.find((l) => l.productId === router.id);
   assert(!!routerLine && Number(routerLine.qtyReceived) === 20, `router PO line qtyReceived = 20 (got ${routerLine?.qtyReceived})`);
   const poAfter = await qe.get(ctx, "purchaseOrder", po.id);
   assert(poAfter.status === "partial", `PO status = partial after partial receipt (got ${poAfter.status})`);
+
+  console.log("\n[purchasing] PO approval routing (rep → manager, admin auto) + GRN gating:");
+  registerNotifications(); // subscribe the notification handlers to the event bus
+  // System contexts scoped to specific seeded users (isSystem bypasses RBAC — the
+  // HTTP endpoints enforce that; here we exercise the workflow logic).
+  const poRepCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "3" }); // Riley Rep → manager 2
+  const poMgrCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "2", roles: ["sales_manager"] }); // Morgan Manager
+  const poAdminCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "1", roles: ["admin"] }); // Avery Admin (no manager)
+  const poAcctCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "4", roles: ["accountant"] }); // Casey (not the approver)
+  const supId = String(po.supplierId);
+  const mkPO = (octx: typeof ctx, qty: number) =>
+    purchasing.createPO(
+      octx,
+      { supplierId: supId, warehouseId: whMain.id, currencyCode: "USD", branchId: whMain.branchId as string, status: "draft" },
+      [{ productId: router.id, description: "Edge Router X100", qty, unitPrice: 720, taxRate: 20 }],
+    );
+
+  // Rep creates + submits → routed to the rep's manager (user 2).
+  const repPO = await mkPO(poRepCtx, 5);
+  assert(String(repPO.doc.ownerId) === "3", `PO owned by its creator (got ${repPO.doc.ownerId})`);
+  const submitted = await purchasing.submitPO(poRepCtx, repPO.doc.id);
+  assert(submitted.status === "pending", `submit routes to pending (got ${submitted.status})`);
+  assert(String(submitted.approverId) === "2", `routed to creator's manager (got ${submitted.approverId})`);
+  // Notification: the routed approver (user 2) is told; an uninvolved user (4) is not.
+  const noteEv = (uid: string, ev: string) => notifications.list(DEMO_TENANT, DEMO_ORG, uid).some((n) => n.eventType === ev);
+  assert(noteEv("2", "purchaseOrder.submitted"), "approver notified of pending PO");
+  assert(!noteEv("4", "purchaseOrder.submitted"), "uninvolved user is NOT notified (per-user targeting)");
+
+  // A non-approver (accountant) cannot decide it; the routed manager can.
+  let nonApproverDenied = false;
+  try { await purchasing.decidePO(poAcctCtx, repPO.doc.id, "approve"); } catch { nonApproverDenied = true; }
+  assert(nonApproverDenied, "non-approver cannot approve the PO");
+  const approvedPO = await purchasing.decidePO(poMgrCtx, repPO.doc.id, "approve");
+  assert(approvedPO.status === "approved", `manager approves → approved (got ${approvedPO.status})`);
+  assert(noteEv("3", "purchaseOrder.approved"), "creator notified of approval");
+
+  // Admin has no supervisor → submitting auto-approves; no self-notification.
+  const adminPO = await mkPO(poAdminCtx, 2);
+  const adminSubmitted = await purchasing.submitPO(poAdminCtx, adminPO.doc.id);
+  assert(adminSubmitted.status === "approved", `no supervisor → auto-approved (got ${adminSubmitted.status})`);
+  assert(!noteEv("1", "purchaseOrder.approved"), "self-action does not notify (admin auto-approve)");
+
+  // Reject flow: submit another, manager rejects with a reason → creator notified.
+  const rejPO = await mkPO(poRepCtx, 4);
+  await purchasing.submitPO(poRepCtx, rejPO.doc.id);
+  const rejPoResult = await purchasing.decidePO(poMgrCtx, rejPO.doc.id, "reject", "over budget");
+  assert(rejPoResult.status === "rejected" && rejPoResult.rejectionReason === "over budget", "manager rejects with reason");
+  assert(noteEv("3", "purchaseOrder.rejected"), "creator notified of rejection");
+
+  // Preference gating: muting po_approval suppresses the in-app notification.
+  await qe.update(systemContext(DEMO_TENANT, DEMO_ORG), "user", "2", {
+    notificationPrefs: JSON.stringify({ po_approval: { email: false, push: false, sms: false } }),
+  });
+  const submittedCount = () => notifications.list(DEMO_TENANT, DEMO_ORG, "2").filter((n) => n.eventType === "purchaseOrder.submitted").length;
+  const setPrefs2 = (p: unknown) => qe.update(systemContext(DEMO_TENANT, DEMO_ORG), "user", "2", { notificationPrefs: JSON.stringify(p) });
+  const submitToMgr = async () => { const po = await mkPO(poRepCtx, 2); await purchasing.submitPO(poRepCtx, po.doc.id); };
+  // Legacy flat prefs: all simulated channels off → suppressed.
+  const before2 = submittedCount();
+  await submitToMgr();
+  assert(submittedCount() === before2, "muted preference suppresses the in-app notification");
+  // Structured prefs: explicit in-app off → suppressed.
+  await setPrefs2({ events: { po_approval: { inapp: false, email: true } } });
+  const beforeStruct = submittedCount();
+  await submitToMgr();
+  assert(submittedCount() === beforeStruct, "structured inapp=false suppresses delivery");
+  // Master pause → everything suppressed.
+  await setPrefs2({ paused: true, events: {} });
+  const beforePause = submittedCount();
+  await submitToMgr();
+  assert(submittedCount() === beforePause, "master pause suppresses all notifications");
+  // Re-enabled → delivered again.
+  await setPrefs2({ events: { po_approval: { inapp: true } } });
+  const beforeOn = submittedCount();
+  await submitToMgr();
+  assert(submittedCount() === beforeOn + 1, "re-enabled preference delivers again");
+  // Quiet-hours window logic (pure).
+  assert(inQuietHours("22:00", "07:00", "2026-03-01T23:30:00.000Z", "UTC"), "23:30 is inside the 22:00–07:00 quiet window");
+  assert(!inQuietHours("22:00", "07:00", "2026-03-01T12:00:00.000Z", "UTC"), "12:00 is outside the overnight quiet window");
+  assert(inQuietHours("09:00", "17:00", "2026-03-01T10:00:00.000Z", "UTC"), "10:00 is inside a same-day quiet window");
+
+  // Broadcast notifications (deal_won/quote_sent/invoice_sent) can't be gated at
+  // delivery, so they are filtered at read time by the viewer's category prefs.
+  notifications.add({ tenantId: DEMO_TENANT, orgId: DEMO_ORG, userId: null, at: "2026-03-01T10:00:00.000Z", channel: "system", subject: "Deal won", body: "x", eventType: "deal.win", prefKey: "deal_won" });
+  const dealWon = (uid: string, filter?: (k?: string) => boolean) =>
+    notifications.list(DEMO_TENANT, DEMO_ORG, uid, filter).some((n) => n.eventType === "deal.win");
+  assert(dealWon("4"), "broadcast deal-won is visible by default");
+  await qe.update(systemContext(DEMO_TENANT, DEMO_ORG), "user", "4", { notificationPrefs: JSON.stringify({ events: { deal_won: { inapp: false } } }) });
+  const muted4 = await buildInAppMuteFilter(DEMO_TENANT, DEMO_ORG, "4");
+  assert(!dealWon("4", muted4), "broadcast is hidden when the viewer mutes that category (read-time gating)");
+  const open2 = await buildInAppMuteFilter(DEMO_TENANT, DEMO_ORG, "1");
+  assert(dealWon("1", open2), "the same broadcast still shows for a user who hasn't muted it");
+
+  // GRN gating ---------------------------------------------------------------
+  const otherProduct = (await qe.list(ctx, "product", { filters: [{ field: "sku", op: "eq", value: "HW-SW-24" }], pageSize: 1 })).items[0];
+  const expectReject = async (label: string, fn: () => Promise<unknown>) => {
+    let threw = false;
+    try { await fn(); } catch { threw = true; }
+    assert(threw, label);
+  };
+  await expectReject("GRN without a PO is rejected", () =>
+    purchasing.createGRN(ctx, { warehouseId: whMain.id }, [{ productId: router.id, qty: 1, unitCost: 720 }]));
+  const draftPO = await mkPO(poRepCtx, 3);
+  await expectReject("GRN against an unapproved (draft) PO is rejected", () =>
+    purchasing.createGRN(ctx, { poId: draftPO.doc.id, warehouseId: whMain.id }, [{ productId: router.id, qty: 1, unitCost: 720 }]));
+  await expectReject("over-receiving beyond the ordered qty is rejected", () =>
+    purchasing.createGRN(ctx, { poId: repPO.doc.id, warehouseId: whMain.id }, [{ productId: router.id, qty: 999, unitCost: 720 }]));
+  await expectReject("receiving a product not on the PO is rejected", () =>
+    purchasing.createGRN(ctx, { poId: repPO.doc.id, warehouseId: whMain.id }, [{ productId: otherProduct.id, qty: 1, unitCost: 410 }]));
+
+  // Valid receipt against the approved PO posts + fully receives it.
+  const approvedBefore = await inventory.onHand(ctx, router.id, whMain.id);
+  const okGrn = await purchasing.createGRN(ctx, { poId: repPO.doc.id, warehouseId: whMain.id }, [{ productId: router.id, qty: 5, unitCost: 720 }]);
+  assert(String(okGrn.doc.poId) === String(repPO.doc.id), "valid GRN against approved PO created");
+  await purchasing.postGRN(ctx, okGrn.doc.id);
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === approvedBefore + 5, "approved-PO receipt updates stock");
+  assert((await qe.get(ctx, "purchaseOrder", repPO.doc.id)).status === "received", "fully-received PO → received");
+  assert(noteEv("3", "goodsReceipt.posted"), "PO owner notified when goods received");
+
+  console.log("\n[permissions] explicit grant matrix is authoritative + role fallback:");
+  const permCtx = (grants?: string[], roles = ["sales_rep"]) =>
+    systemContext(DEMO_TENANT, DEMO_ORG, { isSystem: false, roles, grants, userId: "99" });
+  // Authoritative: only the granted operations are allowed.
+  const limited = permCtx(["account:read", "deal:*"]);
+  assert(permissionEngine.can(limited, { entity: "account", action: "account:read" }), "granted account:read allowed");
+  assert(!permissionEngine.can(limited, { entity: "account", action: "account:create" }), "ungranted account:create denied (authoritative)");
+  assert(!permissionEngine.can(limited, { entity: "invoice", action: "invoice:read" }), "ungranted invoice:read denied");
+  assert(permissionEngine.can(limited, { entity: "deal", action: "deal:create" }), "deal:* covers deal:create");
+  assert(permissionEngine.can(limited, { entity: "deal", action: "deal:update", recordOwnerId: "other" }), "deal:* manages others' records (ABAC)");
+  assert(!permissionEngine.can(limited, { entity: "account", action: "account:update", recordOwnerId: "99" }), "account:update not granted → own record still denied");
+  // No grants → fall back to the base role's defaults (sales_rep).
+  const roleOnly = permCtx(undefined, ["sales_rep"]);
+  assert(permissionEngine.can(roleOnly, { entity: "pos", action: "pos:checkout" }), "role fallback: sales_rep keeps pos:checkout");
+  assert(!permissionEngine.can(roleOnly, { entity: "invoice", action: "invoice:create" }), "role fallback: sales_rep cannot create invoices");
+  // Master-detail: a line entity inherits its parent document's grants (lines are
+  // hidden from the matrix and only exist within their parent document).
+  const poGrant = permCtx(["purchaseOrder:*"]);
+  assert(permissionEngine.can(poGrant, { entity: "purchaseOrderLine", action: "purchaseOrderLine:read" }), "line inherits parent grant (purchaseOrder:* → purchaseOrderLine:read)");
+  assert(permissionEngine.can(poGrant, { entity: "purchaseOrderLine", action: "purchaseOrderLine:create" }), "line inherits parent create");
+  // Reference-read inheritance: a PO role may read the entities a PO references.
+  assert(permissionEngine.can(poGrant, { entity: "supplier", action: "supplier:read" }), "reference read: purchaseOrder grant → supplier:read");
+  assert(permissionEngine.can(poGrant, { entity: "product", action: "product:read" }), "reference read: purchaseOrder grant → product:read (via line)");
+  assert(!permissionEngine.can(poGrant, { entity: "supplier", action: "supplier:create" }), "reference inheritance is read-only (no supplier:create)");
+  assert(!permissionEngine.can(poGrant, { entity: "user", action: "user:read" }), "system entities (user) are never exposed via reference inheritance");
+  assert(!permissionEngine.can(limited, { entity: "invoice", action: "invoice:read" }), "reference inheritance does not over-grant (invoice still denied for account/deal reader)");
+  // Token claim computation: admin super, non-admin embeds the matrix, empty inherits.
+  const posLike = (perms: string): EntityRecord => ({ permissions: perms } as unknown as EntityRecord);
+  assert(grantsClaimFor("admin", posLike(JSON.stringify(["account:read"]))) === undefined, "admin is always super (no embedded matrix)");
+  const embedded = grantsClaimFor("sales_rep", posLike(JSON.stringify(["x:y"])));
+  assert(!!embedded && embedded.length === 1 && embedded[0] === "x:y", "non-admin matrix is embedded in the token");
+  assert(grantsClaimFor("sales_rep", posLike("[]")) === undefined, "empty matrix inherits the role");
+
+  console.log("\n[profile] self-service profile fields persist on the user record:");
+  for (const f of ["avatarId", "jobTitle", "location", "bio"]) {
+    assert(metadata.getEntity("user").fields.some((x) => x.name === f), `user.${f} field registered`);
+  }
+  const sysCtx = systemContext(DEMO_TENANT, DEMO_ORG);
+  await qe.update(sysCtx, "user", "3", { jobTitle: "Field Sales Lead", location: "Izmir, TR", bio: "Covers the Aegean region.", avatarId: "file_av1" });
+  const prof = await qe.get(sysCtx, "user", "3");
+  assert(prof.jobTitle === "Field Sales Lead", `jobTitle persisted (got ${prof.jobTitle})`);
+  assert(prof.location === "Izmir, TR" && prof.bio === "Covers the Aegean region.", "location + bio persisted");
+  assert(prof.avatarId === "file_av1", `avatarId persisted (got ${prof.avatarId})`);
+
+  console.log("\n[security] TOTP 2FA enrollment + login enforcement + activity log:");
+  const tfSecret = randomBase32Secret();
+  assert(/^[A-Z2-7]{32}$/.test(tfSecret), `base32 secret generated (${tfSecret.length} chars)`);
+  assert(totpVerify(tfSecret, totpNow(tfSecret)), "TOTP verifies a freshly generated code");
+  assert(!totpVerify(tfSecret, "12345"), "TOTP rejects a malformed code");
+  // Enable 2FA on a seeded user and confirm login enforces it.
+  const riley = (await qe.list(sysCtx, "user", { filters: [{ field: "email", op: "eq", value: "riley@acme.test" }], pageSize: 1 })).items[0];
+  await qe.patchComputed(sysCtx, "user", String(riley.id), { twoFactorEnabled: true, twoFactorSecret: encrypt(tfSecret) });
+  assert((await login("riley@acme.test", "wrong-password")).status === "invalid", "wrong password rejected");
+  assert((await login("riley@acme.test", "Passw0rd!")).status === "2fa_required", "2FA-on login without a code → 2fa_required");
+  assert((await login("riley@acme.test", "Passw0rd!", "12345")).status === "invalid_code", "2FA login with a bad code → invalid_code");
+  assert((await login("riley@acme.test", "Passw0rd!", totpNow(tfSecret))).status === "ok", "2FA login with the valid code → ok");
+  // Activity log persists to the DB.
+  await recordSecurityEvent({ tenantId: DEMO_TENANT, orgId: DEMO_ORG }, String(riley.id), "sign_in", { ip: "127.0.0.1", userAgent: "smoke" });
+  const sec = await qe.list(sysCtx, "securityEvent", { filters: [{ field: "userId", op: "eq", value: String(riley.id) }], pageSize: 10 });
+  assert(sec.total >= 1 && sec.items.some((e) => e.type === "sign_in"), "security event persisted to the database");
+  // Admin 2FA reset (account recovery, Settings → Users): clears enrollment so the user signs in with a password only.
+  await qe.patchComputed(sysCtx, "user", String(riley.id), { twoFactorEnabled: false, twoFactorSecret: null });
+  assert((await login("riley@acme.test", "Passw0rd!")).status === "ok", "after admin 2FA reset, login no longer requires a code");
+
+  console.log("\n[appearance] per-user UI settings persist (userSetting table):");
+  assert(metadata.listEntities().some((e) => e.name === "userSetting"), "userSetting entity registered");
+  const us = await qe.create(sysCtx, "userSetting", { userId: "1", key: "fontSize", value: "lg" });
+  const usBack = await qe.get(sysCtx, "userSetting", String(us.id));
+  assert(usBack.key === "fontSize" && usBack.value === "lg", "appearance setting (fontSize) persisted to the database");
+  await qe.update(sysCtx, "userSetting", String(us.id), { value: "sm" });
+  assert((await qe.get(sysCtx, "userSetting", String(us.id))).value === "sm", "appearance setting update persists");
+
+  console.log("\n[files] avatar folder accepted (profile photo upload fix):");
+  const avatarFile = await qe.create(sysCtx, "file", { name: "me.png", folder: "avatars", sizeKb: 12, mimeType: "image/png", owner: "Smoke" });
+  assert(String(avatarFile.folder) === "avatars", "file with folder=avatars created (was rejected by the enum before)");
+
+  console.log("\n[mail] custom folders, move-to-folder + star (e-posta klasörleri):");
+  assert(metadata.listEntities().some((e) => e.name === "emailFolder"), "emailFolder entity registered");
+  for (const f of ["starred", "folderId"]) {
+    assert(metadata.getEntity("email").fields.some((x) => x.name === f), `email.${f} field registered`);
+  }
+  const mailFolder = await qe.create(sysCtx, "emailFolder", { name: "Projects", color: "#2563eb" });
+  assert(String(mailFolder.name) === "Projects", "custom mail folder created in the database");
+  const mailMsg = await qe.create(sysCtx, "email", { folder: "inbox", sender: "a@b.com", subject: "Hi", body: "Body", unread: true });
+  // Move it into the custom folder (folderId set) and confirm the folder filter finds it.
+  await qe.update(sysCtx, "email", String(mailMsg.id), { folderId: String(mailFolder.id) });
+  const inFolder = await qe.list(sysCtx, "email", { filters: [{ field: "folderId", op: "eq", value: String(mailFolder.id) }], pageSize: 10 });
+  assert(inFolder.items.some((e) => String(e.id) === String(mailMsg.id)), "moved message is listed under its custom folder");
+  // Star it and confirm the Starred view finds it.
+  await qe.update(sysCtx, "email", String(mailMsg.id), { starred: true });
+  const starredList = await qe.list(sysCtx, "email", { filters: [{ field: "starred", op: "eq", value: true }], pageSize: 10 });
+  assert(starredList.items.some((e) => String(e.id) === String(mailMsg.id)), "starred message is listed in the Starred view");
+  // Folder-delete reassignment: clearing folderId returns the message to its base folder.
+  await qe.update(sysCtx, "email", String(mailMsg.id), { folderId: null });
+  const afterClear = await qe.get(sysCtx, "email", String(mailMsg.id));
+  assert(!afterClear.folderId, "clearing folderId returns the message to its base system folder");
+  const backInInbox = await qe.list(sysCtx, "email", { filters: [{ field: "folder", op: "eq", value: "inbox" }], pageSize: 100 });
+  assert(backInInbox.items.some((e) => String(e.id) === String(mailMsg.id)), "reassigned message reappears in its base folder (inbox)");
+  // Trash move + undo (DB side of the bulk /email/trash + /email/restore endpoints).
+  await qe.update(sysCtx, "email", String(mailMsg.id), { folder: "trash", folderId: null });
+  assert((await qe.get(sysCtx, "email", String(mailMsg.id))).folder === "trash", "delete moves a message to the Trash folder");
+  await qe.update(sysCtx, "email", String(mailMsg.id), { folder: "inbox", folderId: null });
+  assert((await qe.get(sysCtx, "email", String(mailMsg.id))).folder === "inbox", "undo restores a trashed message to its original folder");
+  // Bulk move + bulk delete in a single batch (domain.updateMany / removeMany).
+  const mailDom = await getDomainService();
+  const bulkMsgs = [];
+  for (let i = 0; i < 5; i++) {
+    bulkMsgs.push(await qe.create(sysCtx, "email", { folder: "inbox", sender: `b${i}@x.com`, subject: `Bulk ${i}`, body: "x", unread: true }));
+  }
+  const bulkIds = bulkMsgs.map((m) => String(m.id));
+  const movedN = await mailDom.updateMany(sysCtx, "email", bulkIds, { folder: "spam", folderId: null });
+  assert(movedN === 5, `bulk move updates all 5 in one batch (got ${movedN})`);
+  const oneMoved = await qe.get(sysCtx, "email", bulkIds[0]);
+  assert(oneMoved.folder === "spam", "bulk-moved message persisted its new folder");
+  assert(Number(oneMoved.version) === Number(bulkMsgs[0].version) + 1, "bulk update bumps version by exactly one");
+  const removedN = await mailDom.removeMany(sysCtx, "email", bulkIds);
+  assert(removedN === 5, `bulk delete removes all 5 in one batch (got ${removedN})`);
+  const survivors = (await qe.list(sysCtx, "email", { filters: [{ field: "folder", op: "eq", value: "spam" }], pageSize: 50 })).items.filter((e) => bulkIds.includes(String(e.id)));
+  assert(survivors.length === 0, "bulk-deleted messages are gone from the database");
+  await qe.remove(sysCtx, "emailFolder", String(mailFolder.id));
+  const folderGone = await qe.list(sysCtx, "emailFolder", { filters: [{ field: "name", op: "eq", value: "Projects" }], pageSize: 5 });
+  assert(folderGone.items.length === 0, "custom folder removed from the database");
+
+  console.log("\n[reports] Excel export renders a styled workbook:");
+  const { renderReportXlsx } = await import("@/lib/integrations/report-export");
+  const reportBuf = await renderReportXlsx({
+    title: "Sales Report",
+    subtitle: "Won revenue and open pipeline",
+    org: "Aula ERP",
+    meta: [{ label: "Generated", value: "2026-06-09 10:00" }],
+    kpis: [{ label: "Won revenue", value: "$1,000.00" }],
+    sections: [
+      {
+        title: "Performance by stage",
+        columns: [{ label: "Stage" }, { label: "Deals", kind: "number" }, { label: "Value", kind: "currency" }],
+        rows: [["Won", 3, 1000], ["Lost", 1, 0]],
+        total: ["Total", 4, 1000],
+      },
+    ],
+    currency: "USD",
+  });
+  assert(reportBuf.length > 0, `report .xlsx workbook produced (${reportBuf.length} bytes)`);
+  // A real xlsx is a ZIP archive → starts with the "PK" signature.
+  assert(reportBuf[0] === 0x50 && reportBuf[1] === 0x4b, "report buffer is a valid xlsx (PK zip header)");
 
   // ---- Phase 4: accounting ----
   console.log("\n[accounting] entities + seeded chart of accounts:");
@@ -314,32 +600,6 @@ async function main(): Promise<void> {
   }
   assert(repDenied, "viewer (sales_rep) cannot create events");
 
-  // ---- Chat: DM/group create, private read, admin reachable ----
-  console.log("\n[chat] DM create + private read + group + admin reachable:");
-  const chat = await import("@/lib/chat/service");
-  const adminCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "1", displayName: "Avery Admin", isSystem: false, roles: ["admin"] });
-  const repChatCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "3", displayName: "Riley Rep", isSystem: false, roles: ["sales_rep"] });
-  const outsiderCtx = systemContext(DEMO_TENANT, DEMO_ORG, { userId: "4", displayName: "Casey", isSystem: false, roles: ["accountant"] });
-
-  const dm = await chat.createMessage(repChatCtx, { participants: ["1"], body: "Merhaba admin!" });
-  assert(/^\d+$/.test(String(dm.id)) && dm.conversationId === "1-3", `rep→admin DM created (conv ${dm.conversationId})`);
-  const adminMsgs = await chat.listMessages(adminCtx, "1-3");
-  assert(adminMsgs.some((m) => m.body === "Merhaba admin!"), "admin reads the DM (participant)");
-  let chatDenied = false;
-  try {
-    await chat.listMessages(outsiderCtx, "1-3");
-  } catch {
-    chatDenied = true;
-  }
-  assert(chatDenied, "non-participant cannot read the conversation");
-  const repConvs = await chat.listConversations(repChatCtx);
-  assert(repConvs.some((c) => c.conversationId === "1-3"), "conversation appears in rep's list");
-  const grp = await chat.createMessage(repChatCtx, { participants: ["1", "2"], body: "grup selam" });
-  assert(grp.conversationId === "1-2-3", `group conversation key sorted (${grp.conversationId})`);
-  const chatUsers = await chat.listChatUsers(repChatCtx);
-  assert(chatUsers.some((u) => u.isAdmin), "chat users include an admin (everyone can DM admin)");
-  assert(!chatUsers.some((u) => u.id === "3"), "picker excludes self");
-
   // ---- Barcode + POS + labels (new ERP features) ----
   console.log("\n[barcode] product barcode fields + GTIN check digit:");
   assert(metadata.getEntity("product").fields.some((f) => f.name === "barcode"), "product.barcode field");
@@ -392,6 +652,43 @@ async function main(): Promise<void> {
   assert(onHandRows.length >= 5, `on-hand-by-key rows present (${onHandRows.length})`);
   assert(onHandRows.every((r) => typeof r.onHand === "number"), "each row carries a numeric on-hand");
 
+  // Regression: the UI drawer posts via the GENERIC lifecycle transition, not the
+  // dedicated endpoint. Without the transition→side-effect subscription the status
+  // flipped to "posted" but no stock moved ("transferred stock isn't split").
+  console.log("\n[inventory] transfer/adjustment POST via lifecycle transition moves stock:");
+  const domain = await getDomainService();
+  const trMainBefore = await inventory.onHand(ctx, router.id, whMain.id);
+  const trEastBefore = await inventory.onHand(ctx, router.id, whEast.id);
+  const trTotalBefore = await inventory.onHand(ctx, router.id);
+  const trf2 = await domain.create(ctx, "stockTransfer", {
+    fromWarehouseId: whMain.id, toWarehouseId: whEast.id, productId: router.id,
+    qty: 4, unitCost: 720, transferDate: "2026-03-01", branchId: whMain.branchId as string,
+  });
+  assert(/^TRF-\d+$/.test(String(trf2.number)), `generic create auto-numbers transfer (got ${trf2.number})`);
+  const trPosted = await domain.transition(ctx, "stockTransfer", trf2.id, "post");
+  assert(trPosted.status === "posted", "transition flips transfer to posted");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === trMainBefore - 4, `transition moved −4 out of main (${trMainBefore})`);
+  assert((await inventory.onHand(ctx, router.id, whEast.id)) === trEastBefore + 4, `transition moved +4 into east (${trEastBefore})`);
+  assert((await inventory.onHand(ctx, router.id)) === trTotalBefore, "transition transfer keeps total on-hand");
+  // Void reverses the movements (idempotent).
+  await domain.transition(ctx, "stockTransfer", trf2.id, "void");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === trMainBefore, `void restored main on-hand (${trMainBefore})`);
+  assert((await inventory.onHand(ctx, router.id, whEast.id)) === trEastBefore, `void restored east on-hand (${trEastBefore})`);
+
+  const adjMainBefore = await inventory.onHand(ctx, router.id, whMain.id);
+  const adj2 = await domain.create(ctx, "stockAdjustment", {
+    warehouseId: whMain.id, productId: router.id, qtyDelta: 6, unitCost: 720,
+    reason: "Found", adjustedAt: "2026-03-02", branchId: whMain.branchId as string,
+  });
+  assert(/^ADJ-\d+$/.test(String(adj2.number)), `generic create auto-numbers adjustment (got ${adj2.number})`);
+  await domain.transition(ctx, "stockAdjustment", adj2.id, "post");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === adjMainBefore + 6, `transition adjustment applied +6 (${adjMainBefore})`);
+  assert((await jeCount("adjustment", adj2.id)) === 1, "transition adjustment posted GL");
+  await domain.transition(ctx, "stockAdjustment", adj2.id, "void");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === adjMainBefore, `void restored adjustment on-hand (${adjMainBefore})`);
+  bal = await sumTB();
+  assert(bal.dr === bal.cr, `TB balanced after transition post/void (${bal.dr}/${bal.cr})`);
+
   console.log("\n[labels] labelTemplate CRUD + JSON round-trip:");
   assert(metadata.listEntities().some((e) => e.name === "labelTemplate"), "labelTemplate entity registered");
   const tpl = await qe.create(ctx, "labelTemplate", {
@@ -402,7 +699,181 @@ async function main(): Promise<void> {
   const tplBack = await qe.get(ctx, "labelTemplate", String(tpl.id));
   assert(JSON.parse(String(tplBack.elements)).length === 1, "template elements round-trip JSON");
 
-  console.log(failures === 0 ? "\n✅ ERP smoke passed (Phase 1–6 + barcode/POS/labels)\n" : `\n❌ ${failures} assertion(s) failed\n`);
+  console.log("\n[sales] cart checkout (→ invoice/stock issue) + sales return restock:");
+  const finSvc = await getFinanceService();
+  const posForCart = await getPosService();
+  // Cart: persist a basket, then ring it through the POS pipeline.
+  const cartHdr = await finSvc.createDocument(ctx, "cart", "CART", {
+    accountId: account.id, branchId: whMain.branchId as string, warehouseId: whMain.id, currencyCode: "USD", status: "open",
+  });
+  await finSvc.replaceLines(ctx, "cart", "cartLine", "cartId", cartHdr.id, [
+    { productId: router.id, description: "Edge Router X100", qty: 3, unitPrice: 1200, taxRate: 20 },
+  ]);
+  const cartDoc = await finSvc.getDocument(ctx, "cart", "cartLine", "cartId", cartHdr.id);
+  assert(Number(cartDoc.doc.total) === 4320, `cart total = 4320 (got ${cartDoc.doc.total})`);
+  const beforeCart = await inventory.onHand(ctx, router.id, whMain.id);
+  const cartSale = await posForCart.checkout(ctx, {
+    branchId: whMain.branchId as string, warehouseId: whMain.id, accountId: account.id, currencyCode: "USD",
+    lines: cartDoc.lines.map((l) => ({ productId: String(l.productId), description: String(l.description), qty: Number(l.qty), unitPrice: Number(l.unitPrice), taxRate: Number(l.taxRate) })),
+    payments: [],
+  });
+  const afterCart = await inventory.onHand(ctx, router.id, whMain.id);
+  assert(afterCart === beforeCart - 3, `cart checkout issued stock (${beforeCart} → ${afterCart})`);
+  assert(Number(cartSale.total) === 4320, `cart invoice total = 4320 (got ${cartSale.total})`);
+  await qe.update(ctx, "cart", cartHdr.id, { status: "converted", convertedInvoiceId: cartSale.invoice.id });
+  assert((await qe.get(ctx, "cart", cartHdr.id)).status === "converted", "cart marked converted");
+
+  // Sales return: restock 2 units (receipt movement, refType salesReturn).
+  const retHdr = await finSvc.createDocument(ctx, "salesReturn", "RET", {
+    accountId: account.id, warehouseId: whMain.id, branchId: whMain.branchId as string, currencyCode: "USD", returnDate: "2026-02-01", status: "draft",
+  });
+  await finSvc.replaceLines(ctx, "salesReturn", "salesReturnLine", "salesReturnId", retHdr.id, [
+    { productId: router.id, description: "Edge Router X100", qty: 2, unitPrice: 1200, taxRate: 20 },
+  ]);
+  const retDoc = await finSvc.getDocument(ctx, "salesReturn", "salesReturnLine", "salesReturnId", retHdr.id);
+  assert(Number(retDoc.doc.total) === 2880, `return total = 2880 (got ${retDoc.doc.total})`);
+  const beforeRet = await inventory.onHand(ctx, router.id, whMain.id);
+  for (const l of retDoc.lines) {
+    await inventory.writeMovement(ctx, { productId: String(l.productId), warehouseId: whMain.id, qty: Number(l.qty), type: "receipt", unitCost: Number(l.unitPrice), ref: retHdr.id, refType: "salesReturn", branchId: whMain.branchId as string });
+  }
+  await qe.update(ctx, "salesReturn", retHdr.id, { status: "posted" });
+  const afterRet = await inventory.onHand(ctx, router.id, whMain.id);
+  assert(afterRet === beforeRet + 2, `return restocked (${beforeRet} → ${afterRet})`);
+  assert((await qe.get(ctx, "salesReturn", retHdr.id)).status === "posted", "return marked posted");
+
+  console.log("\n[metadata] lead & contact removed:");
+  assert(!metadata.listEntities().some((e) => e.name === "lead"), "lead entity removed");
+  assert(!metadata.listEntities().some((e) => e.name === "contact"), "contact entity removed");
+  assert(metadata.listEntities().some((e) => e.name === "cart"), "cart entity registered");
+  assert(metadata.listEntities().some((e) => e.name === "salesReturn"), "salesReturn entity registered");
+
+  console.log("\n[recurring] billing run catches a plan up (one invoice per missed period):");
+  const rbFin = await getFinanceService();
+  const RB_TODAY = "2026-06-09";
+  // Drain any already-due seeded plans so the count below reflects only our plan.
+  await rbFin.generateDueInvoices(ctx, RB_TODAY);
+  const rbAccount = (await qe.list(ctx, "account", { pageSize: 1 })).items[0];
+  const rbPlan = await qe.create(ctx, "recurringPlan", {
+    name: "Smoke Subscription",
+    accountId: rbAccount.id,
+    description: "Smoke monthly fee",
+    amount: 500,
+    taxRate: 0,
+    currencyCode: "USD",
+    frequency: "monthly",
+    nextRun: "2026-03-01", // Mar/Apr/May/Jun → 4 cycles due by 2026-06-09
+    active: true,
+  });
+  const rbGen = await rbFin.generateDueInvoices(ctx, RB_TODAY);
+  assert(rbGen.length === 4, `catch-up generates one invoice per missed month (got ${rbGen.length})`);
+  const rbPlanAfter = await qe.get(ctx, "recurringPlan", String(rbPlan.id));
+  assert(String(rbPlanAfter.nextRun) === "2026-07-01", `nextRun rolls forward past today (got ${rbPlanAfter.nextRun})`);
+  const rbGen2 = await rbFin.generateDueInvoices(ctx, RB_TODAY);
+  assert(rbGen2.length === 0, "re-running the same day generates nothing (idempotent until the next period)");
+
+  console.log("\n[automation] send_email action drives the mail path + schedule cadence:");
+  // Exercise the engine → sendMail wiring with SMTP turned off, so sendMail returns
+  // null (no network, no real message) and the action falls back to an in-app
+  // notification. Real delivery is covered by configuring Email under Integrations
+  // (or SMTP_* env) on a running server.
+  await automationStore.upsertIntegration(DEMO_TENANT, DEMO_ORG, "email", { enabled: false });
+  const emailRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG,
+    name: "Smoke welcome email", status: "active",
+    trigger: { kind: "event", entity: "account", event: "created" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "se1", type: "send_email", to: "{{record.email}}", subject: "Hi {{record.name}}", body: "Welcome aboard!" }],
+    by: "system",
+  });
+  const emailRun = await executeRule(
+    emailRule, ctx, { id: "acc_smoke", name: "Smoke Co", email: "smoke@example.test" }, { test: false, trigger: "account.created" },
+  );
+  assert(emailRun.status === "success", `email automation run succeeds (got ${emailRun.status})`);
+  assert(Number(emailRun.output.emails) === 1, `send_email bumps the emails counter (got ${emailRun.output.emails})`);
+  const sendStep = emailRun.steps.find((s) => s.type === "send_email");
+  // No SMTP configured in the smoke → graceful in-app fallback (still ok), recipient resolved from {{record.email}}.
+  assert(!!sendStep && sendStep.status === "ok", `send_email step ok (got ${sendStep?.status})`);
+  assert(!!sendStep && /smoke@example\.test/.test(String(sendStep.output)), `send_email resolved recipient (got ${sendStep?.output})`);
+  const noRecipientRun = await executeRule(
+    emailRule, ctx, { id: "acc_smoke2", name: "No Email Co" }, { test: false, trigger: "account.created" },
+  );
+  const noRcptStep = noRecipientRun.steps.find((s) => s.type === "send_email");
+  assert(!!noRcptStep && noRcptStep.status === "skipped", `send_email without a recipient is skipped, not failed (got ${noRcptStep?.status})`);
+
+  const dailyRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG,
+    name: "Smoke daily digest", status: "active",
+    trigger: { kind: "schedule", schedule: "daily" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "n1", type: "notify", subject: "Daily digest", body: "summary" }],
+    by: "system",
+  });
+  const tick1 = await runScheduledAutomations(ctx);
+  assert(tick1.some((r) => r.ruleId === dailyRule.id), "scheduled rule fires on the first cadence tick (never run)");
+  const tick2 = await runScheduledAutomations(ctx);
+  assert(!tick2.some((r) => r.ruleId === dailyRule.id), "scheduled rule is skipped within its daily cadence window");
+  const tickForced = await runScheduledAutomations(ctx, { force: true });
+  assert(tickForced.some((r) => r.ruleId === dailyRule.id), "force re-runs the scheduled rule (manual 'Run now')");
+  // The job registry (what the in-process scheduler + /cron/tick drive) runs end-to-end.
+  const jobResults = await runAllJobs(ctx);
+  assert(jobResults.length === 2, `job registry runs billing + overdue jobs (got ${jobResults.length})`);
+  assert(jobResults.every((r) => !r.summary.startsWith("failed")), "no job failed");
+
+  // Queue: enqueue active scheduled rules, then drain the queue to completion.
+  const queuedIds = await enqueueScheduled(ctx, { force: true });
+  assert(queuedIds.includes(dailyRule.id), "enqueueScheduled queues an active scheduled rule");
+  const drain = await processQueue(ctx);
+  assert(drain.processed >= 1 && drain.remaining === 0, `processQueue drains the queue to completion (processed ${drain.processed}, remaining ${drain.remaining})`);
+  // Live activity: completed runs are recorded so the UI can show "what ran".
+  const liveAct = getLiveActivity(DEMO_TENANT, DEMO_ORG);
+  assert(liveAct.recent.some((p) => p.ruleId === dailyRule.id), "live activity records recent runs");
+
+  // Concurrency cap: at most `maxConcurrent` run at once; further due rules queue.
+  await automationStore.setStatus(DEMO_TENANT, DEMO_ORG, dailyRule.id, "paused", "system");
+  await automationStore.updateSettings(DEMO_TENANT, DEMO_ORG, { maxConcurrent: 2 });
+  for (let k = 0; k < 3; k++) {
+    await automationStore.createRule({
+      tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: `Smoke conc ${k}`, status: "active",
+      trigger: { kind: "schedule", schedule: "minutely" },
+      conditions: { type: "group", logic: "AND", children: [] },
+      actions: [{ id: `c${k}`, type: "notify", subject: "tick", body: "x" }],
+      by: "system",
+    });
+  }
+  const ranNow = await runScheduledAutomations(ctx, { force: true });
+  assert(ranNow.length === 2, `runs at most maxConcurrent (2) at once (got ${ranNow.length})`);
+  const qAfter = await automationStore.listQueue(DEMO_TENANT, DEMO_ORG);
+  assert(qAfter.filter((q) => q.state === "pending").length === 1, `the overflow due automation is queued (got ${qAfter.filter((q) => q.state === "pending").length})`);
+  const drain2 = await processQueue(ctx);
+  assert(drain2.remaining === 0, `the queue drains the overflow to completion (remaining ${drain2.remaining})`);
+
+  // Date-aware conditions: "after / before" compare as real dates (not parseFloat).
+  assert(evaluateLeaf({ type: "condition", field: "d", op: "gt", value: "2026-01-01" }, { d: "2026-06-01" }), "date 'after' condition matches a later date");
+  assert(!evaluateLeaf({ type: "condition", field: "d", op: "lt", value: "2026-01-01" }, { d: "2026-06-01" }), "date 'before' condition rejects a later date");
+
+  // create_record: multiple field assignments satisfy required fields.
+  const crOkRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Smoke create ok", status: "active",
+    trigger: { kind: "event", entity: "account", event: "created" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "cr1", type: "create_record", entity: "account", assignments: [{ field: "name", value: "{{record.name}}" }] }],
+    by: "system",
+  });
+  const crOk = await executeRule(crOkRule, ctx, { id: "x", name: "Automation Made Co" }, { test: false, trigger: "account.created" });
+  assert(crOk.status === "success", `create_record with required fields succeeds (got ${crOk.status})`);
+  // Missing a required field → failed run whose error names the field (not just "Validation failed").
+  const crFailRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Smoke create fail", status: "active",
+    trigger: { kind: "event", entity: "account", event: "created" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "cr2", type: "create_record", entity: "account", assignments: [] }],
+    by: "system",
+  });
+  const crFail = await executeRule(crFailRule, ctx, { id: "y" }, { test: false, trigger: "account.created" });
+  assert(crFail.status === "failed", `create_record missing required field fails (got ${crFail.status})`);
+  assert(/name/i.test(String(crFail.error ?? "")), `failed run error names the missing field (got "${crFail.error}")`);
+
+  console.log(failures === 0 ? "\n✅ ERP smoke passed (Phase 1–6 + barcode/POS/labels + cart/returns + automation)\n" : `\n❌ ${failures} assertion(s) failed\n`);
   process.exit(failures === 0 ? 0 : 1);
 }
 

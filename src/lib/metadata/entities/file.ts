@@ -22,6 +22,7 @@ export const fileEntity: EntityDef = {
         { value: "contracts", label: "Contracts" },
         { value: "invoices", label: "Invoices" },
         { value: "media", label: "Media" },
+        { value: "avatars", label: "Avatars" },
         { value: "other", label: "Other" },
       ],
     },

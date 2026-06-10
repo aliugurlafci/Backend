@@ -17,9 +17,7 @@ export const ROLES: Record<string, RoleDef> = {
     name: "sales_manager",
     label: "Sales Manager",
     grants: [
-      "lead:*",
       "account:*",
-      "contact:*",
       "deal:*",
       "task:*",
       "calendarEvent:read",
@@ -32,10 +30,11 @@ export const ROLES: Record<string, RoleDef> = {
       "invoiceLine:*",
       "payment:*",
       "recurringPlan:*",
-      "proposal:*",
-      "estimation:*",
-      "contract:*",
       "salesOrder:*",
+      "cart:*",
+      "cartLine:*",
+      "salesReturn:*",
+      "salesReturnLine:*",
       "branch:*",
       "dealer:*",
       "warehouse:*",
@@ -54,9 +53,9 @@ export const ROLES: Record<string, RoleDef> = {
       "employee:*",
       "note:*",
       "todo:*",
-      "call:*",
       "file:*",
       "email:*",
+      "emailFolder:*",
       "pii:read",
     ],
   },
@@ -64,14 +63,7 @@ export const ROLES: Record<string, RoleDef> = {
     name: "sales_rep",
     label: "Sales Rep",
     grants: [
-      "lead:read",
-      "lead:create",
-      "lead:update",
-      "lead:convert",
       "account:read",
-      "contact:read",
-      "contact:create",
-      "contact:update",
       "deal:read",
       "deal:create",
       "deal:update", // covers qualify/propose/negotiate/lose transitions
@@ -84,14 +76,16 @@ export const ROLES: Record<string, RoleDef> = {
       "quote:read",
       "quoteLine:read",
       // New modules: rep can work proposals/projects/tickets, read the rest.
-      "proposal:read",
-      "proposal:create",
-      "proposal:update",
-      "estimation:read",
-      "contract:read",
       "salesOrder:read",
       "salesOrder:create",
       "salesOrder:update",
+      "cart:*",
+      "cartLine:*",
+      "salesReturn:read",
+      "salesReturn:create",
+      "salesReturn:update",
+      "salesReturn:post",
+      "salesReturnLine:*",
       "branch:read",
       "dealer:read",
       "dealer:create",
@@ -105,18 +99,16 @@ export const ROLES: Record<string, RoleDef> = {
       "employee:read",
       "note:*",
       "todo:*",
-      "call:*",
       "file:*",
       "email:*",
+      "emailFolder:*",
     ],
   },
   accountant: {
     name: "accountant",
     label: "Accountant",
     grants: [
-      "lead:read",
       "account:read",
-      "contact:read",
       "deal:read",
       "task:read",
       "calendarEvent:read",
@@ -129,10 +121,9 @@ export const ROLES: Record<string, RoleDef> = {
       "invoiceLine:*",
       "payment:*",
       "recurringPlan:*",
-      "proposal:read",
-      "estimation:read",
-      "contract:read",
       "salesOrder:read",
+      "salesReturn:read",
+      "salesReturnLine:read",
       "branch:read",
       "dealer:read",
       "warehouse:read",
@@ -154,9 +145,9 @@ export const ROLES: Record<string, RoleDef> = {
       "employee:read",
       "note:*",
       "todo:*",
-      "call:*",
       "file:*",
       "email:*",
+      "emailFolder:*",
       "pii:read",
     ],
   },
@@ -180,9 +171,9 @@ export const ROLES: Record<string, RoleDef> = {
       "account:read",
       "note:*",
       "todo:*",
-      "call:*",
       "file:*",
       "email:*",
+      "emailFolder:*",
     ],
   },
   system: {
@@ -194,6 +185,11 @@ export const ROLES: Record<string, RoleDef> = {
 
 /** Verbs that mutate a record and therefore trigger record-level ABAC. */
 export const MUTATING_VERBS = new Set(["update", "delete", "win", "lose", "convert"]);
+
+/** The default grant list for a single role (used to pre-fill the permission matrix). */
+export function roleGrants(role: string): string[] {
+  return [...(ROLES[role]?.grants ?? [])];
+}
 
 /** Resolve the union of grants for a set of role names. */
 export function grantsFor(roles: readonly string[]): Set<string> {

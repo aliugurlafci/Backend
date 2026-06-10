@@ -22,6 +22,8 @@ export interface AuditEntry {
   summary: string;
   from?: string;
   to?: string;
+  /** Display name of the actor (attached by the activity API from `actorId`). */
+  actorName?: string;
 }
 
 export class AuditLog {

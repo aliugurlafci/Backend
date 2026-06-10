@@ -9,10 +9,8 @@ import { systemClock } from "@/lib/core/clock";
 import { MetadataRegistry } from "./registry";
 import { MetadataResolver } from "./resolver";
 import { accountEntity } from "./entities/account";
-import { contactEntity } from "./entities/contact";
 import { dealEntity } from "./entities/deal";
 import { taskEntity } from "./entities/task";
-import { leadEntity } from "./entities/lead";
 import { productEntity } from "./entities/product";
 import { currencyEntity } from "./entities/currency";
 import { taxRateEntity } from "./entities/tax-rate";
@@ -22,10 +20,11 @@ import { invoiceEntity } from "./entities/invoice";
 import { invoiceLineEntity } from "./entities/invoice-line";
 import { paymentEntity } from "./entities/payment";
 import { recurringPlanEntity } from "./entities/recurring-plan";
-import { proposalEntity } from "./entities/proposal";
-import { estimationEntity } from "./entities/estimation";
-import { contractEntity } from "./entities/contract";
 import { salesOrderEntity } from "./entities/sales-order";
+import { cartEntity } from "./entities/cart";
+import { cartLineEntity } from "./entities/cart-line";
+import { salesReturnEntity } from "./entities/sales-return";
+import { salesReturnLineEntity } from "./entities/sales-return-line";
 import { branchEntity } from "./entities/branch";
 import { dealerEntity } from "./entities/dealer";
 import { warehouseEntity } from "./entities/warehouse";
@@ -50,14 +49,14 @@ import { departmentEntity } from "./entities/department";
 import { employeeEntity } from "./entities/employee";
 import { noteEntity } from "./entities/note";
 import { todoEntity } from "./entities/todo";
-import { callEntity } from "./entities/call";
 import { fileEntity } from "./entities/file";
-import { chatMessageEntity } from "./entities/chat-message";
 import { emailEntity } from "./entities/email";
+import { emailFolderEntity } from "./entities/email-folder";
 import { calendarEventEntity } from "./entities/calendar-event";
 import { positionEntity } from "./entities/position";
 import { userEntity } from "./entities/user";
 import { userSettingEntity } from "./entities/user-setting";
+import { securityEventEntity } from "./entities/security-event";
 import {
   automationRuleEntity,
   automationRunEntity,
@@ -70,16 +69,15 @@ import {
 import type { EntityDef } from "./types";
 
 export const crmEntities: EntityDef[] = [
-  leadEntity,
   accountEntity,
-  contactEntity,
   dealEntity,
   taskEntity,
   // sales
-  proposalEntity,
-  estimationEntity,
-  contractEntity,
   salesOrderEntity,
+  cartEntity,
+  cartLineEntity,
+  salesReturnEntity,
+  salesReturnLineEntity,
   quoteEntity,
   quoteLineEntity,
   invoiceEntity,
@@ -120,15 +118,15 @@ export const crmEntities: EntityDef[] = [
   // productivity + comms (bespoke screens; system → hidden from auto-nav)
   noteEntity,
   todoEntity,
-  callEntity,
   fileEntity,
-  chatMessageEntity,
   emailEntity,
+  emailFolderEntity,
   calendarEventEntity,
   // auth / access control
   positionEntity,
   userEntity,
   userSettingEntity,
+  securityEventEntity,
   // automation platform (system entities; admin-gated, off the auto-nav)
   automationRuleEntity,
   automationRunEntity,

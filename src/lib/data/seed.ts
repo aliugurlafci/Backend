@@ -117,36 +117,14 @@ export async function seedInto(repo: Repository): Promise<void> {
   for (const b of [hq, branchEast]) await put(b);
 
   const dealerAcme = mk("dealer", DEMO_TENANT, DEMO_ORG, rep, {
-    code: "DLR-1", name: "Acme Reseller", branchId: branchEast.id, contactId: null,
+    code: "DLR-1", name: "Acme Reseller", branchId: branchEast.id,
     email: "sales@acme-reseller.example", phone: "+1-555-0500", creditLimit: 50_000, balance: 0, active: true,
   });
   const dealerVertex = mk("dealer", DEMO_TENANT, DEMO_ORG, mgr, {
-    code: "DLR-2", name: "Vertex Distribution", branchId: hq.id, contactId: null,
+    code: "DLR-2", name: "Vertex Distribution", branchId: hq.id,
     email: "ops@vertex.example", phone: "+1-555-0501", creditLimit: 120_000, balance: 0, active: true,
   });
   for (const d of [dealerAcme, dealerVertex]) await put(d);
-
-  // --- Contacts ---
-  await put(
-    mk("contact", DEMO_TENANT, DEMO_ORG, mgr, {
-      firstName: "Bill",
-      lastName: "Lumbergh",
-      email: "bill@initech.example",
-      phone: "+1-555-0101",
-      title: "VP",
-      accountId: initech.id,
-    }),
-  );
-  await put(
-    mk("contact", DEMO_TENANT, DEMO_ORG, rep, {
-      firstName: "Alice",
-      lastName: "Wesker",
-      email: "alice@umbrella.example",
-      phone: "+1-555-0145",
-      title: "Procurement Lead",
-      accountId: umbrella.id,
-    }),
-  );
 
   // --- Deals across stages and owners (for ABAC) ---
   await put(
@@ -198,30 +176,6 @@ export async function seedInto(repo: Repository): Promise<void> {
       dueDate: "2026-02-01",
       notes: "Send revised quote.",
       dealId: null,
-    }),
-  );
-
-  // --- Leads ---
-  await put(
-    mk("lead", DEMO_TENANT, DEMO_ORG, rep, {
-      name: "Dana Scully",
-      company: "Wayne Enterprises",
-      email: "dana@wayne.example",
-      phone: "+1-555-0200",
-      source: "web",
-      estimatedValue: 120_000,
-      status: "working",
-    }),
-  );
-  await put(
-    mk("lead", DEMO_TENANT, DEMO_ORG, mgr, {
-      name: "Frank Castle",
-      company: "Cyberdyne",
-      email: "frank@cyberdyne.example",
-      phone: "+1-555-0201",
-      source: "referral",
-      estimatedValue: 60_000,
-      status: "new",
     }),
   );
 
@@ -349,7 +303,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     entryId: openingJe.id, ledgerAccountId: eqAcct.id, debit: 0, credit: openingStockValue, description: "Opening equity", branchId: hq.id, posted: true,
   }));
 
-  // --- Purchasing: a sent PO awaiting goods receipt ---
+  // --- Purchasing: an approved PO awaiting goods receipt ---
   const poLines = [
     { productId: prodRouter.id, description: "Edge Router X100", qty: 20, unitPrice: 720, taxRate: 20 },
     { productId: prodSwitch.id, description: "Access Switch 24p", qty: 10, unitPrice: 410, taxRate: 20 },
@@ -361,7 +315,7 @@ export async function seedInto(repo: Repository): Promise<void> {
     poTax += l.qty * l.unitPrice * (l.taxRate / 100);
   }
   const po1 = mk("purchaseOrder", DEMO_TENANT, DEMO_ORG, mgr, {
-    number: "PO-5001", supplierId: supNetgear.id, warehouseId: whMain.id, status: "sent",
+    number: "PO-5001", supplierId: supNetgear.id, warehouseId: whMain.id, status: "approved",
     currencyCode: "USD", orderDate: "2026-01-12", expectedDate: "2026-01-25", branchId: hq.id,
     subtotal: poSub, taxTotal: poTax, total: poSub + poTax, notes: null,
   });
@@ -424,32 +378,6 @@ export async function seedInto(repo: Repository): Promise<void> {
     active: true,
   }));
 
-  // --- Proposals ---
-  for (const p of [
-    { title: "Initech — Platform Rollout", accountId: initech.id, status: "sent", amount: 84_000, validUntil: "2026-03-15" },
-    { title: "Umbrella — Lab Integration", accountId: umbrella.id, status: "accepted", amount: 220_000, validUntil: "2026-02-20" },
-    { title: "Stark — Security Suite", accountId: stark.id, status: "draft", amount: 510_000, validUntil: "2026-04-30" },
-  ]) {
-    await put(mk("proposal", DEMO_TENANT, DEMO_ORG, rep, p));
-  }
-
-  // --- Estimations ---
-  for (const e of [
-    { number: "EST-2001", accountId: initech.id, status: "approved", amount: 42_000, expiryDate: "2026-03-01" },
-    { number: "EST-2002", accountId: umbrella.id, status: "sent", amount: 96_000, expiryDate: "2026-03-12" },
-  ]) {
-    await put(mk("estimation", DEMO_TENANT, DEMO_ORG, mgr, e));
-  }
-
-  // --- Contracts ---
-  for (const c of [
-    { title: "Initech MSA", accountId: initech.id, status: "active", value: 144_000, startDate: "2026-01-01", endDate: "2026-12-31" },
-    { title: "Umbrella SLA", accountId: umbrella.id, status: "active", value: 360_000, startDate: "2025-07-01", endDate: "2026-06-30" },
-    { title: "Stark NDA + Build", accountId: stark.id, status: "draft", value: 1_200_000, startDate: "2026-02-01", endDate: "2027-01-31" },
-  ]) {
-    await put(mk("contract", DEMO_TENANT, DEMO_ORG, mgr, c));
-  }
-
   // --- Sales orders ---
   for (const o of [
     { number: "SO-3001", accountId: initech.id, branchId: hq.id, dealerId: null, status: "confirmed", amount: 36_000, orderDate: "2026-01-08" },
@@ -484,25 +412,6 @@ export async function seedInto(repo: Repository): Promise<void> {
     { title: "Warehouse stock count", date: "2026-01-28", type: "reminder", notes: "Cycle count main + east warehouses." },
   ]) {
     await put(mk("calendarEvent", DEMO_TENANT, DEMO_ORG, mgr, ev));
-  }
-
-  // --- Sample chat conversation (admin id "1" ↔ manager id "2", set by auth-seed) ---
-  for (const m of [
-    { fromUserId: "1", author: "Avery Admin", body: "Merhaba! Soruların için bana buradan yazabilirsin. 👋", at: "2026-01-16T09:00:00.000Z" },
-    { fromUserId: "2", author: "Morgan Manager", body: "Teşekkürler! Q1 satış planını birazdan paylaşacağım.", at: "2026-01-16T09:05:00.000Z" },
-    { fromUserId: "1", author: "Avery Admin", body: "Harika, bekliyorum. 👍", at: "2026-01-16T09:06:00.000Z" },
-  ]) {
-    await put(
-      mk("chatMessage", DEMO_TENANT, DEMO_ORG, mgr, {
-        conversationId: "1-2",
-        participants: ",1,2,",
-        fromUserId: m.fromUserId,
-        author: m.author,
-        body: m.body,
-        attachments: null,
-        createdAt: m.at,
-      }),
-    );
   }
 
   // Keep runtime sequences ahead of seeded document numbers.

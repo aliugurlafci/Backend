@@ -29,6 +29,9 @@ export const emailEntity: EntityDef = {
     { name: "subject", label: "Subject", type: "string", searchable: true, sortable: true, max: 200 },
     { name: "body", label: "Body", type: "text", searchable: true },
     { name: "unread", label: "Unread", type: "boolean", filterable: true, defaultValue: true },
+    { name: "starred", label: "Starred", type: "boolean", filterable: true, defaultValue: false },
+    // Custom-folder membership (→ emailFolder). Empty = lives in its base `folder`.
+    { name: "folderId", label: "Folder", type: "reference", referenceEntity: "emailFolder", filterable: true },
     // RFC Message-ID — used to dedupe synced mail precisely (one row per real email).
     { name: "messageId", label: "Message ID", type: "text" },
   ],

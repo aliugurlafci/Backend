@@ -30,8 +30,10 @@ export interface AutomationTrigger {
   entity?: string;
   /** Normalised event for `kind: "event"`. */
   event?: TriggerEvent;
-  /** Human label for `kind: "schedule"` (daily / hourly / cron string). */
+  /** Cadence for `kind: "schedule"` (minutely / hourly / daily / weekly). */
   schedule?: string;
+  /** For `schedule: "minutely"` — run every N minutes (default 1). */
+  everyMinutes?: number;
   /** Days of no activity before firing, for `kind: "inactivity"`. */
   inactivityDays?: number;
   /** External event name for `kind: "webhook"`. */
@@ -105,6 +107,8 @@ export interface AutomationAction {
   entity?: string;
   field?: string;
   value?: string;
+  /** create_record — multiple field assignments for the new record. */
+  assignments?: { field: string; value: string }[];
   /** update_stage — lifecycle action name to invoke. */
   stage?: string;
   /** webhook. */
@@ -264,6 +268,8 @@ export interface AutomationSettings {
   /** Queue. */
   maxRetries: number;
   rateLimitPerMin: number;
+  /** Max automations allowed to run at once; due rules beyond this are queued. */
+  maxConcurrent: number;
   /** AI-powered automation toggles. */
   aiLeadScoring: boolean;
   aiNextBestAction: boolean;

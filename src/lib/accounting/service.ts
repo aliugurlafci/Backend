@@ -14,10 +14,36 @@ import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
 import { numberSequence, NumberSequence } from "@/lib/finance/number-sequence";
+import { AppError } from "@/lib/enforcement/errors";
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
-export class AccountingError extends Error {}
+/** Accounting failures are data/config errors (422) with a client-safe message —
+ *  not opaque 500s — so the cause (e.g. "no ledger account…") is actually shown. */
+export class AccountingError extends AppError {
+  constructor(message: string) {
+    super("ACCOUNTING", 422, message);
+  }
+}
+
+/**
+ * The standard system chart-of-accounts, keyed by the subtype the posting code
+ * resolves (`requireAccount`). Used to **self-provision** a required account on
+ * first use, so GL posting (goods receipts, invoices, payments…) works on a fresh
+ * tenant that hasn't had the demo chart of accounts seeded — rather than failing.
+ */
+const STANDARD_ACCOUNTS: Record<string, { code: string; name: string; type: string; normalBalance: string }> = {
+  cash: { code: "1000", name: "Cash & Bank", type: "asset", normalBalance: "debit" },
+  accounts_receivable: { code: "1100", name: "Accounts Receivable", type: "asset", normalBalance: "debit" },
+  inventory: { code: "1200", name: "Inventory", type: "asset", normalBalance: "debit" },
+  accounts_payable: { code: "2000", name: "Accounts Payable", type: "liability", normalBalance: "credit" },
+  gr_ir: { code: "2050", name: "GR/IR Clearing", type: "liability", normalBalance: "credit" },
+  tax_payable: { code: "2100", name: "Tax Payable", type: "liability", normalBalance: "credit" },
+  retained_earnings: { code: "3000", name: "Opening Balance Equity", type: "equity", normalBalance: "credit" },
+  sales_revenue: { code: "4000", name: "Sales Revenue", type: "revenue", normalBalance: "credit" },
+  cogs: { code: "5000", name: "Cost of Goods Sold", type: "expense", normalBalance: "debit" },
+  operating_expense: { code: "6000", name: "Operating Expenses", type: "expense", normalBalance: "debit" },
+};
 
 export interface JournalLineInput {
   ledgerAccountId: string;
@@ -97,8 +123,23 @@ export class AccountingService {
 
   async requireAccount(ctx: RequestContext, subtype: string): Promise<string> {
     const acc = await this.accountBySubtype(ctx, subtype);
-    if (!acc) throw new AccountingError(`no ledger account configured for subtype "${subtype}"`);
-    return acc.id;
+    if (acc) return acc.id;
+    // Self-heal: provision the standard account for this subtype on first use, so
+    // a fresh tenant (no seeded chart of accounts) can still post the GL instead
+    // of failing with "no ledger account configured".
+    const def = STANDARD_ACCOUNTS[subtype];
+    if (!def) throw new AccountingError(`no ledger account configured for subtype "${subtype}"`);
+    const created = await this.qe.create(this.sys(ctx), "ledgerAccount", {
+      code: def.code,
+      name: def.name,
+      type: def.type,
+      subtype,
+      normalBalance: def.normalBalance,
+      parentId: null,
+      isPostable: true,
+      active: true,
+    });
+    return String(created.id);
   }
 
   /** Create a draft journal entry with balanced lines. */

@@ -7,10 +7,11 @@
  */
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
+import { systemClock } from "@/lib/core/clock";
 import type { EntityRecord } from "@/lib/metadata/types";
 import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
 import { env, jwtSecret } from "@/lib/config/env";
-import { verifyPassword } from "./crypto";
+import { decrypt, totpVerify, verifyPassword } from "./crypto";
 import { signJwt } from "./auth";
 
 /** A privileged context for auth lookups (bypasses RBAC for self-resolution). */
@@ -55,6 +56,29 @@ export function parseScreens(position: EntityRecord | null): string[] {
   }
 }
 
+/** Parse a position's `permissions` JSON field into a list of operation grants. */
+export function parsePermissions(position: EntityRecord | null): string[] {
+  if (!position?.permissions) return [];
+  try {
+    const parsed = JSON.parse(String(position.permissions));
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The explicit grant list to embed in a session token, or undefined to let the
+ * engine fall back to the base role's defaults. Admins are always super-users
+ * (no embedded matrix), and an empty matrix inherits the role — so only a
+ * customised non-admin position carries an authoritative grant list.
+ */
+export function grantsClaimFor(role: string, position: EntityRecord | null): string[] | undefined {
+  if (role === "admin") return undefined;
+  const explicit = parsePermissions(position);
+  return explicit.length ? explicit : undefined;
+}
+
 export interface LoginResult {
   token: string;
   expiresIn: number;
@@ -63,15 +87,35 @@ export interface LoginResult {
   screens: string[];
 }
 
-/** Verify credentials and return a signed session token + the user's access. */
-export async function login(email: string, password: string): Promise<LoginResult | null> {
+/** Result of a login attempt: success, an extra 2FA step, a bad code, or bad creds. */
+export type LoginOutcome =
+  | { status: "ok"; userId: string; tenantId: string; orgId: string; result: LoginResult }
+  | { status: "2fa_required" }
+  | { status: "invalid_code" }
+  | { status: "invalid" };
+
+/** Verify credentials (+ a TOTP code when 2FA is on) and mint a session token. */
+export async function login(email: string, password: string, code?: string): Promise<LoginOutcome> {
   const user = await findUserByEmail(email);
-  if (!user || user.active === false) return null;
-  if (!verifyPassword(password, String(user.passwordHash ?? ""))) return null;
+  if (!user || user.active === false) return { status: "invalid" };
+  if (!verifyPassword(password, String(user.passwordHash ?? ""))) return { status: "invalid" };
+
+  // Second factor (TOTP) when enabled.
+  if (user.twoFactorEnabled) {
+    if (!code) return { status: "2fa_required" };
+    let secret = "";
+    try {
+      secret = user.twoFactorSecret ? decrypt(String(user.twoFactorSecret)) : "";
+    } catch {
+      secret = "";
+    }
+    if (!secret || !totpVerify(secret, code)) return { status: "invalid_code" };
+  }
 
   const position = user.positionId ? await getPosition(String(user.positionId)) : null;
   const role = position ? String(position.role) : "sales_rep";
   const screens = parseScreens(position);
+  const grants = grantsClaimFor(role, position);
 
   const token = signJwt(
     {
@@ -82,22 +126,50 @@ export async function login(email: string, password: string): Promise<LoginResul
       tenantId: user.tenantId,
       orgId: user.orgId,
       positionId: position ? position.id : undefined,
+      grants,
     },
     jwtSecret,
     env.AULA_JWT_TTL,
   );
 
   return {
-    token,
-    expiresIn: env.AULA_JWT_TTL,
-    user: {
-      id: user.id,
-      email: String(user.email),
-      displayName: String(user.displayName ?? ""),
-      roles: [role],
-      positionId: position ? position.id : null,
+    status: "ok",
+    userId: String(user.id),
+    tenantId: String(user.tenantId),
+    orgId: String(user.orgId),
+    result: {
+      token,
+      expiresIn: env.AULA_JWT_TTL,
+      user: {
+        id: user.id,
+        email: String(user.email),
+        displayName: String(user.displayName ?? ""),
+        roles: [role],
+        positionId: position ? position.id : null,
+      },
+      position: position ? { id: position.id, name: String(position.name), role } : null,
+      screens,
     },
-    position: position ? { id: position.id, name: String(position.name), role } : null,
-    screens,
   };
+}
+
+/** Append a security-activity record (never throws — auth must not fail on logging). */
+export async function recordSecurityEvent(
+  scope: { tenantId: string; orgId: string },
+  userId: string,
+  type: "sign_in" | "password_changed" | "twofactor_enabled" | "twofactor_disabled",
+  meta?: { ip?: string | null; userAgent?: string | null },
+): Promise<void> {
+  try {
+    const qe = await getQueryEngine();
+    await qe.create(systemContext(scope.tenantId, scope.orgId), "securityEvent", {
+      userId,
+      type,
+      ip: meta?.ip ?? null,
+      userAgent: (meta?.userAgent ?? "").slice(0, 400) || null,
+      at: systemClock.isoNow(),
+    });
+  } catch {
+    /* logging is best-effort */
+  }
 }

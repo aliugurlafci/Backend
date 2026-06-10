@@ -13,7 +13,7 @@ import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
 
 export type StockMovementType = "receipt" | "issue" | "transfer_out" | "transfer_in" | "adjustment";
-export type StockRefType = "opening" | "goodsReceipt" | "invoice" | "salesOrder" | "stockTransfer" | "adjustment";
+export type StockRefType = "opening" | "goodsReceipt" | "invoice" | "salesOrder" | "salesReturn" | "stockTransfer" | "adjustment";
 
 export interface MovementInput {
   productId: string;

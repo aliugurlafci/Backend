@@ -271,6 +271,37 @@ export class MssqlRepository implements Repository {
     }
   }
 
+  async updateMany(scope: TenantScope, entity: string, ids: string[], patch: Record<string, unknown>): Promise<number> {
+    if (ids.length === 0) return 0;
+    const colMap = this.colMap(entity);
+    const p = new Params();
+    const sets: string[] = [];
+    for (const [field, value] of Object.entries(patch)) {
+      const col = colMap.get(field);
+      if (!col || col.name === "id" || col.name === "version") continue;
+      sets.push(`${ident(col.name)} = ${p.col(col, value)}`);
+    }
+    if (sets.length === 0) return 0;
+    sets.push(`${ident("version")} = ${ident("version")} + 1`);
+    const idCol = this.idCol(entity);
+    const inList = ids.map((id) => p.col(idCol, id)).join(", ");
+    const where = `${ident("id")} IN (${inList}) AND ${this.scopeClause(scope, p)}`;
+    const text = `UPDATE ${tableName(entity)} SET ${sets.join(", ")} WHERE ${where}`;
+    const result = await p.apply(await this.request()).query(text);
+    return result.rowsAffected[0] ?? 0;
+  }
+
+  async deleteMany(scope: TenantScope, entity: string, ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const p = new Params();
+    const idCol = this.idCol(entity);
+    const inList = ids.map((id) => p.col(idCol, id)).join(", ");
+    const where = `${ident("id")} IN (${inList}) AND ${this.scopeClause(scope, p)}`;
+    const text = `DELETE FROM ${tableName(entity)} WHERE ${where}`;
+    const result = await p.apply(await this.request()).query(text);
+    return result.rowsAffected[0] ?? 0;
+  }
+
   async existsByField(
     scope: TenantScope,
     entity: string,

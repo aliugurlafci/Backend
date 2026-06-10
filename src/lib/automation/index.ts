@@ -12,9 +12,13 @@ export {
   registerAutomationEngine,
   executeRule,
   runScheduledAutomations,
+  enqueueScheduled,
+  processQueue,
+  getLiveActivity,
   evaluateGroup,
   evaluateLeaf,
 } from "./engine";
+export type { LivePulse, QueueDrainResult } from "./engine";
 export { buildCatalog } from "./catalog";
 export type { AutomationCatalog, CatalogEntity, CatalogField } from "./catalog";
 export {

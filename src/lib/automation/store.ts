@@ -102,6 +102,7 @@ function defaultSettings(): Omit<AutomationSettings, "tenantId" | "orgId"> {
     timezone: "UTC",
     maxRetries: 3,
     rateLimitPerMin: 120,
+    maxConcurrent: 3,
     aiLeadScoring: true,
     aiNextBestAction: true,
     aiSmartAssignment: false,
@@ -559,6 +560,7 @@ export class AutomationStore {
       timezone: str("timezone", d.timezone),
       maxRetries: num("maxRetries", d.maxRetries),
       rateLimitPerMin: num("rateLimitPerMin", d.rateLimitPerMin),
+      maxConcurrent: num("maxConcurrent", d.maxConcurrent),
       aiLeadScoring: bool("aiLeadScoring", d.aiLeadScoring),
       aiNextBestAction: bool("aiNextBestAction", d.aiNextBestAction),
       aiSmartAssignment: bool("aiSmartAssignment", d.aiSmartAssignment),
@@ -709,15 +711,15 @@ export class AutomationStore {
     const welcome = await this.createRule({
       tenantId,
       orgId,
-      name: "Welcome new leads",
-      description: "Email new leads and create a first-touch task for the owner.",
+      name: "Welcome new accounts",
+      description: "Email new accounts and create a first-touch task for the owner.",
       status: "active",
-      trigger: { kind: "event", entity: "lead", event: "created" },
+      trigger: { kind: "event", entity: "account", event: "created" },
       conditions: grp([]),
       actions: [
         { id: aid(1), type: "send_email", to: "{{record.email}}", subject: "Welcome to Aula", body: "Thanks for your interest — we'll be in touch shortly." },
-        { id: aid(2), type: "create_task", taskSubject: "First-touch call with new lead" },
-        { id: aid(3), type: "ai_score", model: "lead-propensity", field: "score" },
+        { id: aid(2), type: "create_task", taskSubject: "First-touch call with new account" },
+        { id: aid(3), type: "ai_score", model: "account-propensity", field: "score" },
       ],
       tags: ["sales", "onboarding"],
       by: "system",
@@ -835,7 +837,7 @@ export class AutomationStore {
 
     // Assignment rules.
     await this.upsertAssignment({
-      tenantId, orgId, name: "Inbound lead rotation", entity: "lead", strategy: "round_robin",
+      tenantId, orgId, name: "Inbound account rotation", entity: "account", strategy: "round_robin",
       pool: [DEMO_USERS.manager.userId, DEMO_USERS.rep.userId], enabled: true,
     });
     await this.upsertAssignment({

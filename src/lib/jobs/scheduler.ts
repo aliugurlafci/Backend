@@ -6,7 +6,10 @@
  * its summary so the Automation screen can show last-run status.
  */
 import type { RequestContext } from "@/lib/context/types";
+import { systemContext } from "@/lib/context/resolver";
+import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
 import { getFinanceService } from "@/lib/finance/service";
+import { runScheduledAutomations, processQueue } from "@/lib/automation/engine";
 import { logger } from "@/lib/observability/logger";
 
 export interface JobResult {
@@ -77,4 +80,43 @@ export async function runAllJobs(ctx: RequestContext): Promise<JobResult[]> {
 
 export function jobsStatus(): { name: string; label: string; schedule: string; last?: JobResult }[] {
   return JOBS.map((j) => ({ name: j.name, label: j.label, schedule: j.schedule, last: jobLog.get(j.name) }));
+}
+
+// ---- in-process scheduler ---------------------------------------------------
+
+let schedulerTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start an in-process scheduler so the recurring jobs **and** active
+ * schedule-triggered automations run automatically for the demo tenant, with no
+ * external cron. The billing/overdue jobs are idempotent and each automation
+ * respects its own cadence (hourly/daily/weekly), so frequent ticks are safe.
+ *
+ * Opt out with `AULA_SCHEDULER=off`; tune the period with `AULA_SCHEDULER_SECONDS`
+ * (default 60, min 15). Idempotent; the timer is `unref`'d so it never blocks
+ * shutdown. For multi-tenant deployments, keep driving `POST /cron/tick` per
+ * tenant from an external scheduler — this in-process loop covers the demo tenant.
+ */
+export function startScheduler(): void {
+  if (schedulerTimer) return;
+  if (String(process.env.AULA_SCHEDULER ?? "").toLowerCase() === "off") {
+    logger.info("in-process scheduler disabled (AULA_SCHEDULER=off)");
+    return;
+  }
+  const seconds = Math.max(15, Number(process.env.AULA_SCHEDULER_SECONDS ?? 60) || 60);
+
+  const tick = async (): Promise<void> => {
+    try {
+      const ctx = systemContext(DEMO_TENANT, DEMO_ORG);
+      await runAllJobs(ctx);
+      await runScheduledAutomations(ctx); // cadence-aware (no force)
+      await processQueue(ctx); // drain pending + due-retry items to completion
+    } catch (e) {
+      logger.error("scheduler tick failed", { error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  schedulerTimer = setInterval(() => void tick(), seconds * 1000);
+  schedulerTimer.unref?.();
+  logger.info("in-process scheduler started", { everySeconds: seconds });
 }

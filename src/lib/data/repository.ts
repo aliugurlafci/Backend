@@ -30,6 +30,14 @@ export interface Repository {
     expectedVersion?: number,
   ): Promise<EntityRecord>;
   delete(scope: TenantScope, entity: string, id: string, expectedVersion?: number): Promise<void>;
+  /**
+   * Apply a partial column patch to many records in a single round-trip
+   * (`UPDATE … WHERE id IN (…)`). Bumps `version` per row. Returns the count
+   * actually changed. Used for bulk operations (e.g. mailbox move/trash).
+   */
+  updateMany(scope: TenantScope, entity: string, ids: string[], patch: Record<string, unknown>): Promise<number>;
+  /** Delete many records by id in a single round-trip. Returns the count deleted. */
+  deleteMany(scope: TenantScope, entity: string, ids: string[]): Promise<number>;
   /** Whether a value already exists for a unique field (within the scope). */
   existsByField(scope: TenantScope, entity: string, field: string, value: unknown, exceptId?: string): Promise<boolean>;
   /** Grouped aggregation over scoped records (reports, dashboards). */

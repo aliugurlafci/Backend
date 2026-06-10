@@ -76,6 +76,7 @@ export function resolveContext(headers: Headers): RequestContext {
     email: principal.email,
     roles: Object.freeze([...principal.roles]),
     positionId: principal.positionId,
+    grants: principal.grants ? Object.freeze([...principal.grants]) : undefined,
     locale: pickLocale(headers),
     featureFlags: Object.freeze(configStore.featureFlags(scopeKeys)),
     correlationId: headers.get("x-correlation-id") ?? newCorrelationId(),

@@ -32,6 +32,7 @@ export const positionEntity: EntityDef = {
       ],
     },
     { name: "screens", label: "Screens", type: "text", helpText: "JSON array of screen keys this position can access." },
+    { name: "permissions", label: "Permissions", type: "text", helpText: "JSON array of operation grants (entity:action). Empty = inherit the base role's defaults." },
     { name: "description", label: "Description", type: "string", max: 240 },
   ],
   listColumns: [

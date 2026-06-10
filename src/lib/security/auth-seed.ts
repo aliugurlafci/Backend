@@ -1,10 +1,11 @@
 /**
- * Idempotent auth seed: positions + login users.
+ * Auth seed.
  *
- * Runs on store init (after the demo seed) and only inserts when the `position`
- * table is empty, so it's safe on an already-populated database. Records are
- * written directly through the repository (trusted) with stable ids that match
- * the demo ownership ids. Default password for every seeded user: `Passw0rd!`.
+ * `ensureAdminSeed` is the ONLY seed that runs on server startup: it provisions
+ * the Administrator position + the single admin login user, idempotently. Demo
+ * users (manager/rep/accountant) and demo business data are NOT seeded on boot —
+ * they live in `ensureDemoUsers` here + `seedInto` (data/seed.ts) and are opt-in
+ * via `npm run seed` (and the test harness). Default password: `Passw0rd!`.
  */
 import { metadata } from "@/lib/metadata";
 import { screenCatalog } from "@/lib/config/screens";
@@ -16,6 +17,7 @@ import { hashPassword } from "./crypto";
 
 const T0 = "2026-01-15T09:00:00.000Z";
 export const DEFAULT_PASSWORD = "Passw0rd!";
+export const ADMIN_EMAIL = "avery@acme.test";
 
 function rec(id: string, fields: Record<string, FieldValue>): EntityRecord {
   return {
@@ -32,72 +34,108 @@ function rec(id: string, fields: Record<string, FieldValue>): EntityRecord {
   };
 }
 
-export async function ensureAuthSeed(repo: Repository): Promise<void> {
+async function listPositions(repo: Repository) {
+  return repo.list({ tenantId: DEMO_TENANT, orgId: DEMO_ORG }, "position", { filters: [], sort: [], page: 1, pageSize: 50 });
+}
+
+/**
+ * The single seed that runs on every boot: ensures the Administrator position +
+ * admin login user exist so the app is usable on a fresh database. Idempotent —
+ * a no-op once an admin-role position is present.
+ */
+export async function ensureAdminSeed(repo: Repository): Promise<void> {
+  const positions = await listPositions(repo);
+  if (positions.items.some((p) => String(p.role) === "admin")) return; // already provisioned
+
+  const allScreens = screenCatalog(metadata).map((s) => s.key);
+  await repo.insert("position", rec("1", { name: "Administrator", role: "admin", screens: JSON.stringify(allScreens), description: null }));
+  await repo.insert(
+    "user",
+    rec("1", {
+      email: ADMIN_EMAIL,
+      displayName: "Avery Admin",
+      passwordHash: hashPassword(DEFAULT_PASSWORD),
+      positionId: "1",
+      active: true,
+      branchId: null,
+      dealerId: null,
+      managerId: null,
+    }),
+  );
+  logger.info("admin seed complete", { email: ADMIN_EMAIL });
+}
+
+/**
+ * Opt-in demo users (Sales Manager / Sales Rep / Accountant) with a supervisor
+ * chain for PO-approval routing. NOT run on boot — invoked by `npm run seed` and
+ * the test harness, after the demo business data (so branch lookups resolve).
+ * Idempotent — a no-op once a sales_manager position exists.
+ */
+export async function ensureDemoUsers(repo: Repository): Promise<void> {
   const scope = { tenantId: DEMO_TENANT, orgId: DEMO_ORG };
-  const existing = await repo.list(scope, "position", { filters: [], sort: [], page: 1, pageSize: 1 });
-  if (existing.total > 0) return; // already provisioned
+  const positions = await listPositions(repo);
+  if (positions.items.some((p) => String(p.role) === "sales_manager")) return; // already provisioned
 
   const all = screenCatalog(metadata).map((s) => s.key);
   const has = (...keys: string[]) => all.filter((k) => keys.includes(k));
 
   const managerScreens = [
-    "home", "sales-dashboard", "leads-dashboard", "deals-dashboard", "executive-dashboard",
+    "home", "sales-dashboard", "deals-dashboard", "executive-dashboard",
     "growth-dashboard", "revenue-dashboard", "branch-dashboard", "inventory-dashboard", "accounting-dashboard",
-    "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
-    "proposal", "estimation", "contract", "salesOrder", "quote", "invoice",
+    "account", "deal", "task", "pipeline", "activity", "calendar",
+    "cart", "salesOrder", "salesReturn",
+    "quote", "invoice",
     "branch", "dealer", "warehouse", "supplier", "product",
     "purchaseOrder", "goodsReceipt",
     "pos", "stock-levels", "label-designer", "labels",
-    "reports", "finance", "email", "chat", "calls", "notes", "todo", "file-manager",
+    "reports", "finance", "email", "notes", "todo", "file-manager",
   ];
   const repScreens = [
-    "home", "sales-dashboard", "leads-dashboard", "deals-dashboard",
-    "lead", "account", "contact", "deal", "task", "pipeline", "activity", "calendar",
-    "quote", "proposal", "dealer",
+    "home", "sales-dashboard", "deals-dashboard",
+    "account", "deal", "task", "pipeline", "activity", "calendar",
+    "cart", "salesOrder", "salesReturn",
+    "quote", "dealer",
     "pos", "stock-levels", "labels",
-    "email", "chat", "calls", "notes", "todo", "file-manager",
+    "email", "notes", "todo", "file-manager",
   ];
   const accountantScreens = [
     "home", "revenue-dashboard", "executive-dashboard", "accounting-dashboard", "branch-dashboard",
-    "account", "contact", "activity", "calendar", "branch", "dealer",
+    "account", "activity", "calendar", "branch", "dealer",
+    "salesOrder", "salesReturn",
     "quote", "invoice", "payment", "product", "recurringPlan", "finance", "reports",
     "purchaseOrder", "vendorBill", "goodsReceipt", "journalEntry",
     "stock-levels",
-    "notes", "todo", "file-manager", "chat",
+    "notes", "todo", "file-manager",
   ];
 
-  // Explicit sequential int ids (as strings) for each table, matching the
-  // DEMO_USERS ids the demo seed uses as record owners (see context/dev.ts).
-  const positions = [
-    { id: "1", name: "Administrator", role: "admin", screens: all },
+  const demoPositions = [
     { id: "2", name: "Sales Manager", role: "sales_manager", screens: has(...managerScreens) },
     { id: "3", name: "Sales Rep", role: "sales_rep", screens: has(...repScreens) },
     { id: "4", name: "Accountant", role: "accountant", screens: has(...accountantScreens) },
   ];
-  for (const p of positions) {
+  for (const p of demoPositions) {
     await repo.insert("position", rec(p.id, { name: p.name, role: p.role, screens: JSON.stringify(p.screens), description: null }));
   }
 
-  // Place each login user under a branch (merkez/şube) so the chat picker groups
-  // them. Runs after the demo seed, so branches exist; look them up by code.
+  // Look up branches (seeded by the demo business data) for chat grouping.
   const branchPage = await repo.list(scope, "branch", { filters: [], sort: [], page: 1, pageSize: 50 });
   const branchByCode = new Map(branchPage.items.map((b) => [String(b.code), String(b.id)]));
   const hqId = branchByCode.get("HQ") ?? null;
   const eastId = branchByCode.get("BR-E") ?? null;
 
   const passwordHash = hashPassword(DEFAULT_PASSWORD);
+  // Supervisor chain (managerId): rep + accountant → manager → admin (id "1").
   const users = [
-    { id: "1", email: "avery@acme.test", displayName: "Avery Admin", positionId: "1", branchId: hqId },
-    { id: "2", email: "morgan@acme.test", displayName: "Morgan Manager", positionId: "2", branchId: hqId },
-    { id: "3", email: "riley@acme.test", displayName: "Riley Rep", positionId: "3", branchId: eastId },
-    { id: "4", email: "casey@acme.test", displayName: "Casey Accountant", positionId: "4", branchId: hqId },
+    { id: "2", email: "morgan@acme.test", displayName: "Morgan Manager", positionId: "2", branchId: hqId, managerId: "1" },
+    { id: "3", email: "riley@acme.test", displayName: "Riley Rep", positionId: "3", branchId: eastId, managerId: "2" },
+    { id: "4", email: "casey@acme.test", displayName: "Casey Accountant", positionId: "4", branchId: hqId, managerId: "2" },
   ];
   for (const u of users) {
     await repo.insert(
       "user",
-      rec(u.id, { email: u.email, displayName: u.displayName, passwordHash, positionId: u.positionId, active: true, branchId: u.branchId, dealerId: null }),
+      rec(u.id, { email: u.email, displayName: u.displayName, passwordHash, positionId: u.positionId, active: true, branchId: u.branchId, dealerId: null, managerId: u.managerId }),
     );
   }
 
-  logger.info("auth seed complete", { positions: positions.length, users: users.length });
+  logger.info("demo users seed complete", { positions: demoPositions.length, users: users.length });
 }

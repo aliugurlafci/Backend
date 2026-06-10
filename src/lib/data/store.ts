@@ -3,11 +3,11 @@
  *
  * Builds the repository + query engine once per process (pinned to `globalThis`
  * so tsx watch reloads don't duplicate them). On first access it connects the
- * pool, ensures the schema (when AULA_AUTO_MIGRATE) and seeds demo data once
- * (when AULA_AUTO_SEED and the database is empty).
+ * pool and provisions the schema once (when AULA_AUTO_MIGRATE). The ONLY data
+ * seeded on boot is the admin user (`ensureAdminSeed`); demo business data + the
+ * other users are opt-in via `npm run seed`.
  */
 import { env, usingInMemoryBackends } from "@/lib/config/env";
-import { logger } from "@/lib/observability/logger";
 import { metadata } from "@/lib/metadata";
 import { permissionEngine } from "@/lib/permissions/engine";
 import { QueryEngine } from "./query-engine";
@@ -15,8 +15,7 @@ import { InMemoryRepository } from "./memory-repository";
 import { MssqlRepository } from "./mssql/mssql-repository";
 import { getPool } from "./mssql/connection";
 import { runMigrations } from "./mssql/migrate";
-import { isSeeded, seedInto } from "./seed";
-import { ensureAuthSeed } from "@/lib/security/auth-seed";
+import { ensureAdminSeed } from "@/lib/security/auth-seed";
 
 type StoreRepository = MssqlRepository | InMemoryRepository;
 
@@ -39,30 +38,20 @@ function create(): Singletons {
 const singletons: Singletons = (globalRef.__aulaStore ??= create());
 
 async function init(): Promise<void> {
-  // In-memory mode: no DB to migrate; seed once into the process-local store.
+  // In-memory mode: nothing to migrate. Seed only the admin user.
   if (usingInMemoryBackends) {
-    if (env.AULA_AUTO_SEED) {
-      await seedInto(singletons.repo);
-      logger.info("seed complete (in-memory persistence)");
-    }
-    await ensureAuthSeed(singletons.repo); // login users + positions (idempotent)
+    await ensureAdminSeed(singletons.repo);
     return;
   }
 
   if (env.AULA_AUTO_MIGRATE) {
-    await runMigrations(); // ensures the database exists, then provisions the schema
+    await runMigrations(); // first boot: provision the whole schema once (then never again)
   } else {
     await getPool(); // assume the database + schema already exist
   }
-  if (env.AULA_AUTO_SEED) {
-    if (await isSeeded()) {
-      logger.info("seed skipped — database already populated");
-    } else {
-      await seedInto(singletons.repo);
-      logger.info("seed complete");
-    }
-  }
-  await ensureAuthSeed(singletons.repo); // login users + positions (idempotent)
+  // The only data seeded on boot is the admin login user (idempotent). Demo data
+  // is opt-in: `npm run seed`.
+  await ensureAdminSeed(singletons.repo);
 }
 
 /** Resolve the query engine, ensuring the store is connected, migrated & seeded. */

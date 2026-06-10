@@ -13,6 +13,7 @@ import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { metadata } from "@/lib/metadata";
 import { notifications } from "@/lib/integrations/notifications";
+import { sendMail } from "@/lib/integrations/email-transport";
 import { logger } from "@/lib/observability/logger";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { automationStore } from "./store";
@@ -30,9 +31,19 @@ type Rec = Record<string, unknown>;
 
 // ---- condition evaluation ---------------------------------------------------
 
-function asNumber(v: unknown): number {
-  const n = typeof v === "number" ? v : parseFloat(String(v ?? ""));
-  return Number.isFinite(n) ? n : NaN;
+/**
+ * Coerce a value to a comparable number: plain numbers stay as-is; date strings
+ * (ISO etc.) become a timestamp; everything else is NaN. So `>` / `<` work for
+ * both numeric and date fields (e.g. "closeDate after 2026-01-01").
+ */
+function toComparable(v: unknown): number {
+  if (typeof v === "number") return v;
+  const s = String(v ?? "").trim();
+  if (s === "") return NaN;
+  const n = Number(s);
+  if (Number.isFinite(n)) return n;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : NaN;
 }
 
 export function evaluateLeaf(leaf: ConditionLeaf, record: Rec): boolean {
@@ -44,13 +55,13 @@ export function evaluateLeaf(leaf: ConditionLeaf, record: Rec): boolean {
     case "ne":
       return String(actual ?? "") !== String(expected ?? "");
     case "gt":
-      return asNumber(actual) > asNumber(expected);
+      return toComparable(actual) > toComparable(expected);
     case "gte":
-      return asNumber(actual) >= asNumber(expected);
+      return toComparable(actual) >= toComparable(expected);
     case "lt":
-      return asNumber(actual) < asNumber(expected);
+      return toComparable(actual) < toComparable(expected);
     case "lte":
-      return asNumber(actual) <= asNumber(expected);
+      return toComparable(actual) <= toComparable(expected);
     case "contains":
       return String(actual ?? "").toLowerCase().includes(String(expected ?? "").toLowerCase());
     case "not_contains":
@@ -109,6 +120,23 @@ function bump(out: Record<string, number>, key: string, by = 1): void {
   out[key] = (out[key] ?? 0) + by;
 }
 
+/**
+ * Build a human error message that includes a ValidationError's per-field detail
+ * (e.g. "Validation failed: subject — Required") so a failed run says *why* it
+ * failed rather than just "Validation failed".
+ */
+function describeError(e: unknown): string {
+  if (e instanceof Error) {
+    const details = (e as { details?: { field?: string; message?: string }[] }).details;
+    if (Array.isArray(details) && details.length > 0) {
+      const parts = details.map((d) => (d.field ? `${d.field} — ${d.message ?? ""}` : d.message ?? "")).filter(Boolean);
+      if (parts.length > 0) return `${e.message}: ${parts.join("; ")}`;
+    }
+    return e.message;
+  }
+  return String(e);
+}
+
 /** Deterministic pseudo lead/deal score (no external model needed for the demo). */
 function pseudoScore(record: Rec): number {
   const str = JSON.stringify(record);
@@ -123,11 +151,44 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
   try {
     const id = ec.record.id ? String(ec.record.id) : null;
     switch (action.type) {
-      case "send_email":
+      case "send_email": {
+        const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
+        const to = interpolate(action.to, ec.record).trim();
+        const text = interpolate(action.body, ec.record) || "Sent by automation.";
+        if (!to) {
+          step.status = "skipped";
+          step.output = "no recipient — set a 'To' address or a {{field}} reference";
+          break;
+        }
+        if (!ec.dry) {
+          // Send a real message over the tenant's configured SMTP connection.
+          const messageId = await sendMail({ to, subject, text }, { tenantId: ec.ctx.tenantId, orgId: ec.ctx.orgId });
+          if (messageId) {
+            step.output = `Email → ${to} (sent)`;
+          } else {
+            // SMTP is not configured — fall back to an in-app notification so the
+            // action still has a visible effect (configure Email under Integrations
+            // or set SMTP_* env vars to send real mail).
+            notifications.add({
+              at: ec.ctx.at,
+              tenantId: ec.ctx.tenantId,
+              orgId: ec.ctx.orgId,
+              channel: "email",
+              subject,
+              body: text,
+              eventType: "automation.send_email",
+            });
+            step.output = `Email → ${to} (SMTP not configured — in-app notification)`;
+          }
+        } else {
+          step.output = `would email ${to}`;
+        }
+        bump(ec.output, "emails");
+        break;
+      }
       case "send_sms":
       case "send_whatsapp":
       case "notify": {
-        const channel = action.type === "send_email" ? "email" : "system";
         const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
         const to = interpolate(action.to, ec.record);
         if (!ec.dry) {
@@ -135,13 +196,13 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
             at: ec.ctx.at,
             tenantId: ec.ctx.tenantId,
             orgId: ec.ctx.orgId,
-            channel,
+            channel: "system",
             subject,
             body: interpolate(action.body, ec.record) || `${action.type} via automation`,
             eventType: `automation.${action.type}`,
           });
         }
-        bump(ec.output, action.type === "send_email" ? "emails" : "notifications");
+        bump(ec.output, "notifications");
         step.output = to ? `${prettyChannel(action.type)} → ${to}` : `${prettyChannel(action.type)} sent`;
         break;
       }
@@ -239,13 +300,19 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
           step.output = "no target entity";
           break;
         }
-        const data = action.field ? { [action.field]: interpolate(action.value, ec.record) } : {};
+        // Build the new record from the field assignments (interpolating record
+        // tokens). Falls back to the legacy single field/value for old rules.
+        const data: Record<string, unknown> = {};
+        const assignments = action.assignments ?? (action.field ? [{ field: action.field, value: action.value ?? "" }] : []);
+        for (const a of assignments) {
+          if (a.field) data[a.field] = interpolate(a.value, ec.record);
+        }
         if (!ec.dry) {
           const qe = await getQueryEngine();
           const rec = await qe.create(ec.ctx, entity, data);
           step.output = `created ${entity} ${rec.id}`;
         } else {
-          step.output = `would create ${entity}`;
+          step.output = `would create ${entity} (${Object.keys(data).length} field(s))`;
         }
         bump(ec.output, "created");
         break;
@@ -312,7 +379,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
     }
   } catch (e) {
     step.status = "failed";
-    step.error = e instanceof Error ? e.message : String(e);
+    step.error = describeError(e);
     ec.steps.push({ ...step, ms: Date.now() - t0 });
     throw e;
   }
@@ -355,6 +422,64 @@ function labelFor(action: AutomationAction): string {
   return map[action.type] ?? action.type;
 }
 
+// ---- live run activity (in-memory, powers the "what's running now" UI) ------
+
+export interface LivePulse {
+  tenantId: string;
+  orgId: string;
+  ruleId: string;
+  ruleName: string;
+  status: RunStatus;
+  at: string;
+  durationMs: number;
+  test: boolean;
+}
+
+const liveRunning = new Map<string, number>(); // `${tenant}|${org}|${ruleId}` → in-flight count
+const livePulses: LivePulse[] = []; // newest-first ring buffer of completed runs
+const PULSE_CAP = 60;
+const lkey = (t: string, o: string, id: string): string => `${t}|${o}|${id}`;
+
+function markStart(ctx: RequestContext, ruleId: string): void {
+  const k = lkey(ctx.tenantId, ctx.orgId, ruleId);
+  liveRunning.set(k, (liveRunning.get(k) ?? 0) + 1);
+}
+function markEnd(ctx: RequestContext, ruleId: string): void {
+  const k = lkey(ctx.tenantId, ctx.orgId, ruleId);
+  const n = (liveRunning.get(k) ?? 1) - 1;
+  if (n <= 0) liveRunning.delete(k);
+  else liveRunning.set(k, n);
+}
+function markPulse(run: AutomationRun): void {
+  livePulses.unshift({
+    tenantId: run.tenantId, orgId: run.orgId, ruleId: run.ruleId, ruleName: run.ruleName,
+    status: run.status, at: run.finishedAt, durationMs: run.durationMs, test: run.test,
+  });
+  if (livePulses.length > PULSE_CAP) livePulses.length = PULSE_CAP;
+}
+
+/** Currently-running rule ids + the most recent completed runs (this tenant). */
+export function getLiveActivity(
+  tenantId: string,
+  orgId: string,
+  recent = 12,
+): { running: string[]; recent: LivePulse[] } {
+  const prefix = `${tenantId}|${orgId}|`;
+  const running = [...liveRunning.entries()]
+    .filter(([k, n]) => n > 0 && k.startsWith(prefix))
+    .map(([k]) => k.slice(prefix.length));
+  const recentList = livePulses.filter((p) => p.tenantId === tenantId && p.orgId === orgId).slice(0, recent);
+  return { running, recent: recentList };
+}
+
+/** Total automations currently executing for a tenant (across all rules). */
+export function runningCount(tenantId: string, orgId: string): number {
+  const prefix = `${tenantId}|${orgId}|`;
+  let n = 0;
+  for (const [k, c] of liveRunning) if (k.startsWith(prefix)) n += c;
+  return n;
+}
+
 /**
  * Run one rule against a record. `test` runs are dry (no writes / messages) and
  * excluded from live stats; live runs perform real side effects.
@@ -363,10 +488,12 @@ export async function executeRule(
   rule: AutomationRule,
   ctx: RequestContext,
   record: Rec,
-  opts: { test: boolean; trigger: string },
+  opts: { test: boolean; trigger: string; fromQueue?: boolean },
 ): Promise<AutomationRun> {
   const startedAt = ctx.at;
   const t0 = Date.now();
+  markStart(ctx, rule.id);
+  try {
   const ec: ExecContext = {
     ctx,
     entity: rule.trigger.entity,
@@ -404,7 +531,7 @@ export async function executeRule(
       await runActions(rule.actions, ec);
     } catch (e) {
       status = "failed";
-      error = e instanceof Error ? e.message : String(e);
+      error = describeError(e);
     }
   }
 
@@ -427,9 +554,12 @@ export async function executeRule(
     test: opts.test,
   };
   const saved = await automationStore.recordRun(run);
+  markPulse(saved);
 
-  // Failure handling for live runs: enqueue to retry, alert if configured.
-  if (!opts.test && status === "failed") {
+  // Failure handling for live runs: enqueue to retry, alert if configured. When
+  // the run *is* a queue item being processed, the queue processor owns its
+  // lifecycle (attempts/backoff/dead), so we don't enqueue a duplicate here.
+  if (!opts.test && !opts.fromQueue && status === "failed") {
     const settings = await automationStore.getSettings(ctx.tenantId, ctx.orgId);
     await automationStore.enqueue({
       tenantId: ctx.tenantId,
@@ -458,6 +588,9 @@ export async function executeRule(
     }
   }
   return saved;
+  } finally {
+    markEnd(ctx, rule.id);
+  }
 }
 
 // ---- event-bus integration --------------------------------------------------
@@ -512,14 +645,181 @@ export function registerAutomationEngine(): void {
   logger.info("automation engine registered");
 }
 
-/** Run all active schedule-triggered rules (called from the cron tick). */
-export async function runScheduledAutomations(ctx: RequestContext): Promise<{ ruleId: string; status: RunStatus }[]> {
-  const all = await automationStore.listRules(ctx.tenantId, ctx.orgId);
-  const rules = all.filter((r) => r.status === "active" && r.trigger.kind === "schedule");
-  const out: { ruleId: string; status: RunStatus }[] = [];
-  for (const rule of rules) {
-    const run = await executeRule(rule, ctx, { scheduledAt: ctx.at }, { test: false, trigger: "schedule" });
-    out.push({ ruleId: rule.id, status: run.status });
+/** Cadence (ms) for a schedule trigger; unknown values fall back to daily. */
+function cadenceMs(trigger: AutomationRule["trigger"]): number {
+  switch (trigger.schedule) {
+    case "minutely":
+      return Math.max(1, Math.floor(trigger.everyMinutes ?? 1)) * 60_000;
+    case "hourly":
+      return 60 * 60_000;
+    case "weekly":
+      return 7 * 24 * 60 * 60_000;
+    default:
+      return 24 * 60 * 60_000; // daily
   }
-  return out;
+}
+
+/** Whether a schedule rule is due since its last run (1-min slack absorbs drift). */
+function scheduleDue(rule: AutomationRule, nowMs: number): boolean {
+  const last = rule.stats.lastRunAt ? Date.parse(rule.stats.lastRunAt) : 0;
+  if (!last) return true; // never run → run now
+  return nowMs - last >= cadenceMs(rule.trigger) - 60_000;
+}
+
+/** Enqueue a set of rules as pending queue items, skipping any that already have
+ *  a live (pending/retry) item so the queue doesn't pile up. Returns queued ids. */
+async function enqueueRules(ctx: RequestContext, rules: AutomationRule[]): Promise<string[]> {
+  if (rules.length === 0) return [];
+  const queue = await automationStore.listQueue(ctx.tenantId, ctx.orgId);
+  const liveQueued = new Set(queue.filter((q) => q.state !== "dead").map((q) => q.ruleId));
+  const settings = await automationStore.getSettings(ctx.tenantId, ctx.orgId);
+  const toQueue = rules.filter((r) => !liveQueued.has(r.id));
+  for (const rule of toQueue) {
+    await automationStore.enqueue({
+      tenantId: ctx.tenantId,
+      orgId: ctx.orgId,
+      ruleId: rule.id,
+      ruleName: rule.name,
+      state: "pending",
+      attempts: 0,
+      maxAttempts: settings.maxRetries,
+      nextAttemptAt: null,
+      enqueuedAt: ctx.at,
+      input: { scheduledAt: ctx.at },
+    });
+  }
+  return toQueue.map((r) => r.id);
+}
+
+/** Free execution slots right now = max concurrency − automations already running. */
+async function freeSlots(ctx: RequestContext): Promise<number> {
+  const settings = await automationStore.getSettings(ctx.tenantId, ctx.orgId);
+  const concurrency = Math.max(1, settings.maxConcurrent || 1);
+  return Math.max(0, concurrency - runningCount(ctx.tenantId, ctx.orgId));
+}
+
+/**
+ * Run active schedule-triggered rules, honouring the **max-concurrency** limit:
+ * up to `maxConcurrent` rules run at once; any further due rules are pushed to the
+ * processing queue (and drained later as slots free up). Returns the rules that
+ * ran now (the queued overflow is reflected in the queue).
+ *
+ * The cron tick (manual "Run now" / external scheduler) passes `force: true` to
+ * treat every active schedule rule as due; the in-process scheduler omits it, so
+ * each rule only runs once its cadence (minutely/hourly/daily/weekly) has elapsed.
+ */
+export async function runScheduledAutomations(
+  ctx: RequestContext,
+  opts: { force?: boolean } = {},
+): Promise<{ ruleId: string; status: RunStatus }[]> {
+  const all = await automationStore.listRules(ctx.tenantId, ctx.orgId);
+  const nowMs = Date.parse(ctx.at) || Date.now();
+  const due = all.filter(
+    (r) => r.status === "active" && r.trigger.kind === "schedule" && (opts.force || scheduleDue(r, nowMs)),
+  );
+  if (due.length === 0) return [];
+
+  const slots = await freeSlots(ctx);
+  const runNow = due.slice(0, slots);
+  const overflow = due.slice(slots);
+  // Anything over the concurrency limit waits in the queue.
+  if (overflow.length) await enqueueRules(ctx, overflow);
+
+  const settled = await Promise.allSettled(
+    runNow.map((rule) => executeRule(rule, ctx, { scheduledAt: ctx.at }, { test: false, trigger: "schedule" })),
+  );
+  return runNow.map((rule, i) => {
+    const s = settled[i];
+    const status: RunStatus = s.status === "fulfilled" ? s.value.status : "failed";
+    return { ruleId: rule.id, status };
+  });
+}
+
+/**
+ * Enqueue active schedule-triggered rules onto the processing queue so they run
+ * through the queue (drained by `processQueue`). `force` ignores per-rule cadence;
+ * otherwise only due rules are queued. Returns the queued rule ids.
+ */
+export async function enqueueScheduled(ctx: RequestContext, opts: { force?: boolean } = {}): Promise<string[]> {
+  const all = await automationStore.listRules(ctx.tenantId, ctx.orgId);
+  const nowMs = Date.parse(ctx.at) || Date.now();
+  const rules = all.filter(
+    (r) => r.status === "active" && r.trigger.kind === "schedule" && (opts.force || scheduleDue(r, nowMs)),
+  );
+  return enqueueRules(ctx, rules);
+}
+
+export interface QueueDrainResult {
+  processed: number;
+  succeeded: number;
+  failed: number;
+  dead: number;
+  remaining: number;
+}
+
+/**
+ * Drain the processing queue to completion: repeatedly take the next processable
+ * item (a `pending` item, or a `retry` whose backoff has elapsed), re-run its
+ * rule, and remove it on success/skip — or advance its attempts (→ `retry` with
+ * backoff, then `dead` once max attempts are hit) on failure. Loops until nothing
+ * is immediately processable (capped by `max`). This is what keeps queued work
+ * "running until the queue is complete" — driven by the in-process scheduler and
+ * the manual "Run now" / "Process queue" actions.
+ */
+export async function processQueue(ctx: RequestContext, opts: { max?: number } = {}): Promise<QueueDrainResult> {
+  const max = opts.max ?? 200;
+  const settings = await automationStore.getSettings(ctx.tenantId, ctx.orgId);
+  let processed = 0;
+  let succeeded = 0;
+  let failed = 0;
+  let dead = 0;
+
+  // Drain in waves: each wave runs up to `freeSlots` items concurrently (so we
+  // never exceed the max-concurrency limit), then loops until nothing is
+  // immediately processable. `processed` caps total work as a backstop.
+  for (let guard = 0; guard < max; guard++) {
+    const items = await automationStore.listQueue(ctx.tenantId, ctx.orgId);
+    const nowMs = Date.now();
+    const processable = items.filter(
+      (it) => it.state === "pending" || (it.state === "retry" && (!it.nextAttemptAt || Date.parse(it.nextAttemptAt) <= nowMs)),
+    );
+    if (processable.length === 0) break;
+    const slots = await freeSlots(ctx);
+    if (slots === 0) break; // at capacity (other runs in flight) — leave for the next tick
+    const wave = processable.slice(0, slots);
+
+    await Promise.all(
+      wave.map(async (item) => {
+        const rule = await automationStore.getRule(ctx.tenantId, ctx.orgId, item.ruleId);
+        if (!rule) {
+          await automationStore.removeQueueItem(ctx.tenantId, ctx.orgId, item.id);
+          return; // rule was deleted — drop the orphaned item
+        }
+        const run = await executeRule(rule, ctx, item.input, { test: false, trigger: "queue", fromQueue: true });
+        processed += 1;
+        if (run.status === "success" || run.status === "skipped") {
+          await automationStore.removeQueueItem(ctx.tenantId, ctx.orgId, item.id);
+          succeeded += 1;
+        } else {
+          const attempts = item.attempts + 1;
+          const maxAttempts = item.maxAttempts || settings.maxRetries;
+          if (attempts >= maxAttempts) {
+            await automationStore.updateQueueItem(ctx.tenantId, ctx.orgId, item.id, { state: "dead", attempts, lastError: run.error, nextAttemptAt: null });
+            dead += 1;
+          } else {
+            await automationStore.updateQueueItem(ctx.tenantId, ctx.orgId, item.id, {
+              state: "retry",
+              attempts,
+              lastError: run.error,
+              nextAttemptAt: new Date(Date.now() + attempts * 60_000).toISOString(),
+            });
+            failed += 1;
+          }
+        }
+      }),
+    );
+  }
+
+  const remaining = (await automationStore.listQueue(ctx.tenantId, ctx.orgId)).filter((it) => it.state !== "dead").length;
+  return { processed, succeeded, failed, dead, remaining };
 }

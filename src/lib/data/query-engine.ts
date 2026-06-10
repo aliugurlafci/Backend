@@ -223,6 +223,37 @@ export class QueryEngine {
     await this.repo.delete(scopeOf(ctx), entityName, id, expectedVersion);
   }
 
+  /**
+   * Bulk-apply a validated partial patch to many records in one round-trip.
+   * Requires a manage-any update grant (no per-record ownership check), so it is
+   * meant for entities the caller can manage broadly (e.g. their mailbox).
+   */
+  async updateMany(ctx: RequestContext, entityName: string, ids: string[], patch: unknown): Promise<number> {
+    if (ids.length === 0) return 0;
+    const entity = this.metadata.getEntity(entityName);
+    assertAllowed(this.permissions.evaluate(ctx, { action: `${entityName}:update`, entity: entityName }));
+    const outcome = validateRecord(buildUpdateSchema(entity), patch ?? {});
+    assertValid(outcome);
+    const changes = outcome.data ?? {};
+    if (entity.lifecycle && entity.lifecycle.field in changes) {
+      throw new ConflictError(`"${entity.lifecycle.field}" is lifecycle-managed; use a transition action`);
+    }
+    const full: Record<string, FieldValue> = {
+      ...(changes as Record<string, FieldValue>),
+      updatedAt: this.clock.isoNow(),
+      updatedBy: ctx.userId,
+    };
+    return this.repo.updateMany(scopeOf(ctx), entityName, ids.map(String), full);
+  }
+
+  /** Bulk-delete many records by id in one round-trip (manage-any delete grant). */
+  async removeMany(ctx: RequestContext, entityName: string, ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    this.metadata.getEntity(entityName); // assert the entity exists
+    assertAllowed(this.permissions.evaluate(ctx, { action: `${entityName}:delete`, entity: entityName }));
+    return this.repo.deleteMany(scopeOf(ctx), entityName, ids.map(String));
+  }
+
   // ---- helpers -----------------------------------------------------------
 
   private toRepoQuery(entity: EntityDef, query: Query): RepoQuery {

@@ -10,8 +10,8 @@ import { configureAuth } from "@/lib/security/auth-config";
 import { getQueryEngine } from "@/lib/data/store";
 import { closePool } from "@/lib/data/mssql/connection";
 import { bootstrapPlatform } from "@/lib/bootstrap";
+import { startScheduler } from "@/lib/jobs/scheduler";
 import { createApp } from "@/http/server";
-import { attachChatWs } from "@/lib/realtime/chat-ws";
 
 async function main(): Promise<void> {
   configureAuth();
@@ -20,6 +20,8 @@ async function main(): Promise<void> {
   await getQueryEngine();
   // Register event subscribers + rebuild the search index from the repository.
   await bootstrapPlatform();
+  // Start the in-process scheduler (recurring jobs + schedule-triggered automations).
+  startScheduler();
 
   const app = createApp();
   const server = app.listen(env.PORT, () => {
@@ -29,9 +31,6 @@ async function main(): Promise<void> {
       devAuth: env.AULA_DEV_AUTH,
     });
   });
-
-  // Real-time chat: WebSocket server on the same HTTP server (/ws/chat).
-  attachChatWs(server);
 
   const shutdown = (signal: string) => {
     logger.info("shutting down", { signal });

@@ -224,35 +224,47 @@ export class FinanceService {
   }
 
   /** Generate draft invoices for every active recurring plan due on/before `today`. */
+  // One run catches a plan fully up: it emits one invoice per missed period
+  // (each dated at that period) and advances `nextRun` until it passes today —
+  // so a plan overdue by N cycles yields N invoices in a single run. A per-plan
+  // cap guards against runaway generation from a very stale `nextRun`.
   async generateDueInvoices(ctx: RequestContext, today = ctx.at.slice(0, 10)): Promise<string[]> {
+    const MAX_CATCHUP = 60; // safety cap per plan per run
     const plans = await this.qe.list(ctx, "recurringPlan", {
       filters: [{ field: "active", op: "eq", value: true }],
       pageSize: 200,
     });
     const generated: string[] = [];
     for (const plan of plans.items) {
-      const nextRun = String(plan.nextRun ?? "");
-      if (!nextRun || nextRun > today) continue;
-
-      const invoice = await this.createDocument(ctx, "invoice", "INV", {
-        accountId: plan.accountId,
-        currencyCode: plan.currencyCode,
-        issueDate: today,
-        dueDate: addDays(today, 30),
-        status: "draft",
-        notes: `Recurring: ${String(plan.name)}`,
-      });
-      await this.replaceLines(ctx, "invoice", "invoiceLine", "invoiceId", invoice.id, [
-        {
-          productId: null,
-          description: String(plan.description),
-          qty: 1,
-          unitPrice: Number(plan.amount),
-          taxRate: Number(plan.taxRate),
-        },
-      ]);
-      await this.qe.update(ctx, "recurringPlan", plan.id, { nextRun: advance(nextRun, String(plan.frequency)) });
-      generated.push(invoice.id);
+      const startNextRun = String(plan.nextRun ?? "");
+      let cursor = startNextRun;
+      let cycles = 0;
+      while (cursor && cursor <= today && cycles < MAX_CATCHUP) {
+        const invoice = await this.createDocument(ctx, "invoice", "INV", {
+          accountId: plan.accountId,
+          currencyCode: plan.currencyCode,
+          issueDate: cursor,
+          dueDate: addDays(cursor, 30),
+          status: "draft",
+          notes: `Recurring: ${String(plan.name)} (${cursor})`,
+        });
+        await this.replaceLines(ctx, "invoice", "invoiceLine", "invoiceId", invoice.id, [
+          {
+            productId: null,
+            description: String(plan.description),
+            qty: 1,
+            unitPrice: Number(plan.amount),
+            taxRate: Number(plan.taxRate),
+          },
+        ]);
+        generated.push(invoice.id);
+        cursor = advance(cursor, String(plan.frequency));
+        cycles++;
+      }
+      // Persist the rolled-forward nextRun once (only if it actually moved).
+      if (cursor && cursor !== startNextRun) {
+        await this.qe.update(ctx, "recurringPlan", plan.id, { nextRun: cursor });
+      }
     }
     return generated;
   }

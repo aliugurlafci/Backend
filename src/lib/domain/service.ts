@@ -11,8 +11,9 @@ import { BadRequestError, ConflictError, assertAllowed } from "@/lib/enforcement
 import { scopeOf } from "@/lib/context/isolation";
 import type { RequestContext } from "@/lib/context/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
-import type { EntityRecord } from "@/lib/metadata/types";
+import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import type { PermissionEngine } from "@/lib/permissions/engine";
+import { numberSequence } from "@/lib/finance/number-sequence";
 import type { QueryEngine } from "@/lib/data/query-engine";
 import type { AggregateQuery, AggregateRow, Query, Page } from "@/lib/data/query";
 import { type DomainEvent, type EventBus } from "@/lib/workflow/event-bus";
@@ -49,8 +50,23 @@ export class DomainService {
     return this.qe.aggregate(ctx, entity, query);
   }
 
+  /**
+   * Documents created through the generic `/entities` endpoint that need a
+   * human-readable, sequential number. Service-created documents (invoice, quote,
+   * PO, …) number themselves; these bespoke-screen entities go through the
+   * generic create path where the `number` field is read-only and would
+   * otherwise be left blank.
+   */
+  private static readonly NUMBER_PREFIXES: Record<string, string> = {
+    stockTransfer: "TRF",
+    stockAdjustment: "ADJ",
+  };
+
   async create(ctx: RequestContext, entity: string, input: unknown): Promise<EntityRecord> {
-    const record = await this.qe.create(ctx, entity, input);
+    const computed = await this.autoNumber(ctx, entity, input);
+    const record = computed
+      ? await this.qe.createWithComputed(ctx, entity, input, computed)
+      : await this.qe.create(ctx, entity, input);
     this.audit.append(ctx, {
       entity,
       recordId: record.id,
@@ -59,6 +75,20 @@ export class DomainService {
     });
     await this.dispatch(this.event(ctx, `${entity}.created`, { id: record.id, record }));
     return record;
+  }
+
+  /** Assign a sequential document number for bespoke entities that need one and
+   *  weren't given one by the caller (the field is read-only in the create form). */
+  private async autoNumber(
+    ctx: RequestContext,
+    entity: string,
+    input: unknown,
+  ): Promise<Record<string, FieldValue> | null> {
+    const prefix = DomainService.NUMBER_PREFIXES[entity];
+    if (!prefix) return null;
+    const provided = input && typeof input === "object" ? (input as Record<string, unknown>).number : undefined;
+    if (provided) return null;
+    return { number: await numberSequence.next(ctx.tenantId, prefix) };
   }
 
   async update(
@@ -88,6 +118,24 @@ export class DomainService {
       summary: `deleted ${entity}`,
     });
     await this.dispatch(this.event(ctx, `${entity}.deleted`, { id }));
+  }
+
+  /** Bulk-update many records with one patch (single round-trip). Returns the count changed. */
+  async updateMany(ctx: RequestContext, entity: string, ids: string[], patch: unknown): Promise<number> {
+    const changed = await this.qe.updateMany(ctx, entity, ids, patch);
+    if (changed > 0) {
+      this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "update", summary: `bulk updated ${changed} ${entity}` });
+    }
+    return changed;
+  }
+
+  /** Bulk-delete many records by id (single round-trip). Returns the count deleted. */
+  async removeMany(ctx: RequestContext, entity: string, ids: string[]): Promise<number> {
+    const removed = await this.qe.removeMany(ctx, entity, ids);
+    if (removed > 0) {
+      this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "delete", summary: `bulk deleted ${removed} ${entity}` });
+    }
+    return removed;
   }
 
   /** Run a lifecycle transition by action name. */
@@ -168,52 +216,6 @@ export class DomainService {
           this.permissions.can(ctx, { action: t.requires, entity, recordOwnerId: current.ownerId }),
       )
       .map((t) => ({ action: t.action, to: t.to }));
-  }
-
-  /** Convert a lead into an Account + Contact + Deal, marking it converted. */
-  async convertLead(ctx: RequestContext, leadId: string): Promise<{ accountId: string; contactId: string; dealId: string }> {
-    const lead = await this.qe.get(ctx, "lead", leadId);
-    assertAllowed(
-      this.permissions.evaluate(ctx, { action: "lead:convert", entity: "lead", recordOwnerId: lead.ownerId }),
-    );
-    if (lead.status === "converted") throw new ConflictError("lead already converted");
-    if (!lead.email) throw new BadRequestError("lead needs an email before it can be converted");
-
-    const company = String(lead.company || lead.name);
-    const existing = await this.qe.list(ctx, "account", {
-      filters: [{ field: "name", op: "eq", value: company }],
-      pageSize: 1,
-    });
-    const accountId = existing.items[0]?.id ?? (await this.create(ctx, "account", { name: company })).id;
-
-    const [firstName, ...rest] = String(lead.name).trim().split(/\s+/);
-    const lastName = rest.join(" ") || firstName;
-    const contact = await this.create(ctx, "contact", {
-      firstName,
-      lastName,
-      email: lead.email,
-      phone: lead.phone ?? null,
-      accountId,
-    });
-    const deal = await this.create(ctx, "deal", {
-      name: `${company} Opportunity`,
-      stage: "lead",
-      amount: lead.estimatedValue ?? null,
-      accountId,
-    });
-
-    await this.qe.update(ctx, "lead", leadId, { status: "converted" }, { allowLifecycleField: true });
-    this.audit.append(ctx, {
-      entity: "lead",
-      recordId: leadId,
-      action: "transition",
-      from: String(lead.status),
-      to: "converted",
-      summary: "converted to account, contact & deal",
-    });
-    await this.dispatch(this.event(ctx, "lead.converted", { id: leadId, accountId, contactId: contact.id, dealId: deal.id }));
-
-    return { accountId, contactId: contact.id, dealId: deal.id };
   }
 
   // ---- helpers -----------------------------------------------------------

@@ -27,20 +27,25 @@ import { getInventoryService } from "@/lib/inventory/service";
 import { getPosService, type PosCheckoutInput } from "@/lib/pos/service";
 import { postStockTransfer, postStockAdjustment } from "@/lib/accounting/postings";
 import { permissionEngine } from "@/lib/permissions/engine";
+import { grantsFor, roleGrants } from "@/lib/permissions/policies";
 import { metadata } from "@/lib/metadata";
 import { search } from "@/lib/search/service";
 import { cache } from "@/lib/cache/cache";
 import { statsKey } from "@/lib/cache/invalidation";
-import { notifications } from "@/lib/integrations/notifications";
+import { notifications, notifyUser, buildInAppMuteFilter } from "@/lib/integrations/notifications";
 import { webhookRegistry, testWebhook } from "@/lib/integrations/webhooks";
 import { exportCsv, importCsv } from "@/lib/integrations/import-export";
 import { exportXlsx, exportPdf } from "@/lib/integrations/export-formats";
+import { renderReportXlsx, type ReportPayload } from "@/lib/integrations/report-export";
 import { runAllJobs, jobsStatus } from "@/lib/jobs/scheduler";
 import {
   automationStore,
   buildCatalog,
   executeRule,
   runScheduledAutomations,
+  enqueueScheduled,
+  processQueue,
+  getLiveActivity,
   INTEGRATION_PROVIDERS,
   SYSTEM_SETTINGS,
   type AssignmentRule,
@@ -58,11 +63,10 @@ import { BadRequestError, ForbiddenError, NotFoundError, toAppError } from "@/li
 import type { Filter, Measure } from "@/lib/data/query";
 import { issuePersonaToken } from "@/lib/security/auth-config";
 import { saveBlob, readBlob } from "@/lib/integrations/file-storage";
-import { listChatUsers, listConversations, listMessages, createMessage as createChatMessage } from "@/lib/chat/service";
-import { sendMail, fetchHeaders, fetchBodiesByUid } from "@/lib/integrations/email-transport";
-import { login, getPosition, parseScreens, findUserById } from "@/lib/security/auth-service";
+import { sendMail, fetchHeaders, fetchBodiesByUid, deleteOnServer, restoreOnServer } from "@/lib/integrations/email-transport";
+import { login, getPosition, parseScreens, findUserById, recordSecurityEvent } from "@/lib/security/auth-service";
+import { randomBase32Secret, totpUri, totpVerify, encrypt, decrypt, hashPassword, verifyPassword } from "@/lib/security/crypto";
 import { SESSION_COOKIE } from "@/lib/security/auth";
-import { hashPassword, verifyPassword } from "@/lib/security/crypto";
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { screenCatalog } from "@/lib/config/screens";
@@ -87,11 +91,19 @@ function guessFileContentType(name: string): string {
   }
 }
 
-/** Drop the password hash before returning a user record to a client. */
+/** Drop the password hash + 2FA secret before returning a user record to a client. */
 function stripHash(user: EntityRecord): Record<string, unknown> {
   const rest: Record<string, unknown> = { ...user };
   delete rest.passwordHash;
+  delete rest.twoFactorSecret;
   return rest;
+}
+
+/** Best-effort client IP for the security activity log. */
+function clientIp(req: Request): string | null {
+  const fwd = req.headers["x-forwarded-for"];
+  const first = Array.isArray(fwd) ? fwd[0] : (fwd ?? "").split(",")[0];
+  return (first || req.ip || req.socket?.remoteAddress || "").trim() || null;
 }
 
 export function buildApiRouter(): Router {
@@ -102,16 +114,30 @@ export function buildApiRouter(): Router {
   // Dev-only fallback: `{ actor }` mints a persona token when AULA_DEV_AUTH.
   r.post("/auth/login", async (req: Request, res: Response) => {
     try {
-      const body = (req.body ?? {}) as { email?: string; password?: string; actor?: string };
+      const body = (req.body ?? {}) as { email?: string; password?: string; code?: string; actor?: string };
       if (body.email && body.password) {
-        const result = await login(body.email, body.password);
-        if (!result) {
+        const outcome = await login(body.email, body.password, body.code);
+        if (outcome.status === "2fa_required") {
+          // Password was correct — ask the client for the authenticator code.
+          setApiHeaders(res);
+          res.json({ twoFactorRequired: true });
+          return;
+        }
+        if (outcome.status === "invalid_code") {
+          res.status(401).json({ error: { code: "UNAUTHENTICATED", message: "invalid authentication code" } });
+          return;
+        }
+        if (outcome.status === "invalid") {
           res.status(401).json({ error: { code: "UNAUTHENTICATED", message: "invalid email or password" } });
           return;
         }
-        res.cookie(SESSION_COOKIE, result.token, sessionCookieOpts(result.expiresIn));
+        await recordSecurityEvent({ tenantId: outcome.tenantId, orgId: outcome.orgId }, outcome.userId, "sign_in", {
+          ip: clientIp(req),
+          userAgent: req.headers["user-agent"] ?? null,
+        });
+        res.cookie(SESSION_COOKIE, outcome.result.token, sessionCookieOpts(outcome.result.expiresIn));
         setApiHeaders(res);
-        res.json({ user: result.user, position: result.position, screens: result.screens });
+        res.json({ user: outcome.result.user, position: outcome.result.position, screens: outcome.result.screens });
         return;
       }
       if (env.AULA_DEV_AUTH && body.actor) {
@@ -175,8 +201,15 @@ export function buildApiRouter(): Router {
       positionId: rc.positionId ?? null,
       position: position ? { id: position.id, name: String(position.name), role: String(position.role) } : null,
       screens,
+      // The caller's effective operation grants (matrix-authoritative, else role defaults).
+      grants: rc.grants ? [...rc.grants] : [...grantsFor(rc.roles)],
       phone: (userRec?.phone as string | null) ?? null,
       timezone: (userRec?.timezone as string | null) ?? null,
+      avatarId: (userRec?.avatarId as string | null) ?? null,
+      jobTitle: (userRec?.jobTitle as string | null) ?? null,
+      location: (userRec?.location as string | null) ?? null,
+      bio: (userRec?.bio as string | null) ?? null,
+      twoFactorEnabled: Boolean(userRec?.twoFactorEnabled),
       notificationPrefs,
       settings,
     };
@@ -192,6 +225,10 @@ export function buildApiRouter(): Router {
           email?: string;
           phone?: string;
           timezone?: string;
+          avatarId?: string | null;
+          jobTitle?: string | null;
+          location?: string | null;
+          bio?: string | null;
           notificationPrefs?: unknown;
         };
         const user = await findUserById(rc.userId);
@@ -201,6 +238,10 @@ export function buildApiRouter(): Router {
         if (body.email !== undefined) patch.email = String(body.email).toLowerCase();
         if (body.phone !== undefined) patch.phone = body.phone;
         if (body.timezone !== undefined) patch.timezone = body.timezone;
+        if (body.avatarId !== undefined) patch.avatarId = body.avatarId || null;
+        if (body.jobTitle !== undefined) patch.jobTitle = body.jobTitle || null;
+        if (body.location !== undefined) patch.location = body.location || null;
+        if (body.bio !== undefined) patch.bio = body.bio || null;
         if (body.notificationPrefs !== undefined) patch.notificationPrefs = JSON.stringify(body.notificationPrefs);
         const domain = await getDomainService();
         const updated = await domain.update(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, patch);
@@ -262,14 +303,127 @@ export function buildApiRouter(): Router {
         await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, {
           passwordHash: hashPassword(body.newPassword),
         });
+        await recordSecurityEvent({ tenantId: rc.tenantId, orgId: rc.orgId }, rc.userId, "password_changed", {
+          ip: clientIp(req),
+          userAgent: req.headers["user-agent"] ?? null,
+        });
         return { ok: true };
       },
       { mutating: true },
     ),
   );
 
+  // ---- two-factor authentication (TOTP) --------------------------------
+  // Begin enrollment: generate a fresh secret (stored encrypted, not yet enabled)
+  // and return the otpauth URI + manual key for the authenticator app.
+  r.post(
+    "/auth/2fa/setup",
+    runApi(async (rc) => {
+      const user = await findUserById(rc.userId);
+      if (!user) throw new BadRequestError("no editable profile for this account");
+      const secret = randomBase32Secret();
+      const qe = await getQueryEngine();
+      await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, {
+        twoFactorSecret: encrypt(secret),
+        twoFactorEnabled: false,
+      });
+      return { secret, otpauth: totpUri(secret, String(user.email ?? rc.email ?? rc.userId)) };
+    }, { mutating: true }),
+  );
+
+  // Confirm enrollment: verify a code against the pending secret, then enable 2FA.
+  r.post(
+    "/auth/2fa/enable",
+    runApi(async (rc, req) => {
+      const body = readJson(req) as { code?: string };
+      const user = await findUserById(rc.userId);
+      if (!user?.twoFactorSecret) throw new BadRequestError("start 2FA setup first");
+      let secret = "";
+      try { secret = decrypt(String(user.twoFactorSecret)); } catch { secret = ""; }
+      if (!secret || !totpVerify(secret, String(body.code ?? ""))) {
+        throw new ForbiddenError("invalid authentication code");
+      }
+      const qe = await getQueryEngine();
+      await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, { twoFactorEnabled: true });
+      await recordSecurityEvent({ tenantId: rc.tenantId, orgId: rc.orgId }, rc.userId, "twofactor_enabled", {
+        ip: clientIp(req),
+        userAgent: req.headers["user-agent"] ?? null,
+      });
+      return { twoFactorEnabled: true };
+    }, { mutating: true }),
+  );
+
+  // Disable 2FA — requires the account password to confirm.
+  r.post(
+    "/auth/2fa/disable",
+    runApi(async (rc, req) => {
+      const body = readJson(req) as { password?: string };
+      const user = await findUserById(rc.userId);
+      if (!user) throw new BadRequestError("no editable profile for this account");
+      if (!body.password || !verifyPassword(body.password, String(user.passwordHash ?? ""))) {
+        throw new ForbiddenError("password is incorrect");
+      }
+      const qe = await getQueryEngine();
+      await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, {
+        twoFactorEnabled: false,
+        twoFactorSecret: null,
+      });
+      await recordSecurityEvent({ tenantId: rc.tenantId, orgId: rc.orgId }, rc.userId, "twofactor_disabled", {
+        ip: clientIp(req),
+        userAgent: req.headers["user-agent"] ?? null,
+      });
+      return { twoFactorEnabled: false };
+    }, { mutating: true }),
+  );
+
+  // Recent security activity for the signed-in user (sign-ins + security changes).
+  r.get("/auth/security/activity", runApi(async (rc) => {
+    const qe = await getQueryEngine();
+    const page = await qe.list(systemContext(rc.tenantId, rc.orgId), "securityEvent", {
+      filters: [{ field: "userId", op: "eq", value: rc.userId }],
+      sort: [{ field: "at", dir: "desc" }],
+      pageSize: 20,
+    });
+    return {
+      events: page.items.map((e) => ({
+        id: String(e.id),
+        type: String(e.type),
+        ip: (e.ip as string | null) ?? null,
+        userAgent: (e.userAgent as string | null) ?? null,
+        at: String(e.at ?? ""),
+      })),
+    };
+  }));
+
   // Screen catalog (for nav + the admin position editor).
   r.get("/screens", runApi(async () => ({ screens: screenCatalog(metadata) })));
+
+  // Permission catalog (admin only) — every entity's grantable operations + the
+  // special (non-entity) grants + each base role's default grants (matrix presets).
+  r.get("/permissions/catalog", runApi(async (rc) => {
+    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    const CRUD = ["read", "create", "update", "delete"];
+    const entities = metadata
+      .listEntities()
+      .filter((e) => !e.system)
+      .map((e) => {
+        // Operations = CRUD + the entity's own lifecycle actions (post/approve/win…).
+        const extra = new Set<string>();
+        for (const tr of e.lifecycle?.transitions ?? []) {
+          if (!tr.requires) continue;
+          const [ent, verb] = tr.requires.split(":");
+          if (ent === e.name && verb && !CRUD.includes(verb)) extra.add(verb);
+        }
+        return { name: e.name, group: e.group ?? "crm", actions: [...CRUD, ...extra] };
+      });
+    // Non-entity grants that gate bespoke operations.
+    const special = ["pos:checkout", "pii:read"];
+    const roles = ["admin", "sales_manager", "sales_rep", "accountant", "warehouse_manager"].map((role) => ({
+      value: role,
+      grants: roleGrants(role),
+    }));
+    return { entities, special, roles };
+  }));
 
   // ---- user administration (admin only) --------------------------------
   r.get("/admin/users", runApi(async (rc) => {
@@ -284,7 +438,10 @@ export function buildApiRouter(): Router {
     runApi(
       async (rc, req) => {
         if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
-        const body = readJson(req) as { email?: string; displayName?: string; password?: string; positionId?: string; active?: boolean };
+        const body = readJson(req) as {
+          email?: string; displayName?: string; password?: string; positionId?: string; active?: boolean;
+          managerId?: string | null; phone?: string | null; jobTitle?: string | null;
+        };
         if (!body.email || !body.password || !body.positionId) {
           throw new BadRequestError("email, password and positionId are required");
         }
@@ -297,6 +454,9 @@ export function buildApiRouter(): Router {
             displayName: body.displayName || body.email,
             positionId: body.positionId,
             active: body.active ?? true,
+            managerId: body.managerId || null,
+            phone: body.phone || null,
+            jobTitle: body.jobTitle || null,
           },
           { passwordHash: hashPassword(body.password) },
         );
@@ -311,18 +471,34 @@ export function buildApiRouter(): Router {
     runApi(
       async (rc, req) => {
         if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
-        const body = readJson(req) as { displayName?: string; positionId?: string; active?: boolean; password?: string };
+        const body = readJson(req) as {
+          displayName?: string; positionId?: string; active?: boolean; password?: string;
+          email?: string; managerId?: string | null; phone?: string | null; jobTitle?: string | null;
+          resetTwoFactor?: boolean;
+        };
+        // A manager can't be their own supervisor.
+        if (body.managerId && String(body.managerId) === req.params.id) {
+          throw new BadRequestError("a user cannot be their own manager");
+        }
         const domain = await getDomainService();
         const patch: Record<string, unknown> = {};
         if (body.displayName !== undefined) patch.displayName = body.displayName;
+        if (body.email !== undefined) patch.email = String(body.email).toLowerCase();
         if (body.positionId !== undefined) patch.positionId = body.positionId;
         if (body.active !== undefined) patch.active = body.active;
+        if (body.managerId !== undefined) patch.managerId = body.managerId || null;
+        if (body.phone !== undefined) patch.phone = body.phone || null;
+        if (body.jobTitle !== undefined) patch.jobTitle = body.jobTitle || null;
         let record = Object.keys(patch).length
           ? await domain.update(rc, "user", req.params.id, patch)
           : await domain.get(rc, "user", req.params.id);
+        const qe = await getQueryEngine();
         if (body.password) {
-          const qe = await getQueryEngine();
           record = await qe.patchComputed(rc, "user", req.params.id, { passwordHash: hashPassword(body.password) });
+        }
+        // Admin recovery: clear a user's two-factor enrollment (e.g. lost device).
+        if (body.resetTwoFactor) {
+          record = await qe.patchComputed(rc, "user", req.params.id, { twoFactorEnabled: false, twoFactorSecret: null });
         }
         return stripHash(record);
       },
@@ -434,9 +610,8 @@ export function buildApiRouter(): Router {
   r.get("/stats", runApi(async (rc) => {
     return cache.wrap(statsKey(rc.tenantId, rc.orgId), 30_000, async () => {
       const domain = await getDomainService();
-      const [accounts, contacts, deals, tasks] = await Promise.all([
+      const [accounts, deals, tasks] = await Promise.all([
         domain.list(rc, "account", { pageSize: 1 }),
-        domain.list(rc, "contact", { pageSize: 1 }),
         domain.list(rc, "deal", { pageSize: 1000 }),
         domain.list(rc, "task", { pageSize: 1 }),
       ]);
@@ -455,7 +630,7 @@ export function buildApiRouter(): Router {
       }
 
       return {
-        counts: { account: accounts.total, contact: contacts.total, deal: deals.total, task: tasks.total },
+        counts: { account: accounts.total, deal: deals.total, task: tasks.total },
         pipelineByStage,
         openPipeline,
         wonValue: won,
@@ -468,7 +643,21 @@ export function buildApiRouter(): Router {
     const raw = Number(req.query.limit);
     const limit = Number.isFinite(raw) ? Math.min(500, Math.max(1, Math.floor(raw))) : 12;
     const domain = await getDomainService();
-    return { entries: domain.recentActivity(rc, limit) };
+    const entries = domain.recentActivity(rc, limit);
+    // Resolve actor ids → display names. The user table is admin-scoped, so read
+    // it through a system context; "system" is the platform/automation actor.
+    const nameById = new Map<string, string>();
+    try {
+      const users = await domain.list(systemContext(rc.tenantId, rc.orgId), "user", { pageSize: 500 });
+      for (const u of users.items) nameById.set(String(u.id), String(u.displayName ?? u.email ?? u.id));
+    } catch {
+      /* user read unavailable — fall back to raw id */
+    }
+    const enriched = entries.map((e) => ({
+      ...e,
+      actorName: e.actorId === "system" ? "System" : nameById.get(String(e.actorId)) ?? String(e.actorId),
+    }));
+    return { entries: enriched };
   }));
 
   r.get("/search", runApi(async (rc, req) => {
@@ -510,6 +699,22 @@ export function buildApiRouter(): Router {
     res.status(200).send(csv);
   }));
 
+  // Render a report (sent pre-localized by the client) to a styled Excel workbook.
+  // PDF export is the browser's print-to-PDF on the client (full Unicode + theme).
+  r.post(
+    "/reports/export",
+    runApi(async (rc, req, res) => {
+      const body = readJson(req) as { payload?: ReportPayload; fileName?: string };
+      if (!body.payload || !Array.isArray(body.payload.sections)) throw new BadRequestError("payload is required");
+      const fileName = String(body.fileName || "report").replace(/[^a-z0-9_-]+/gi, "_").slice(0, 60) || "report";
+      const buf = await renderReportXlsx(body.payload);
+      setApiHeaders(res, rc.correlationId);
+      res.setHeader("content-type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("content-disposition", `attachment; filename="${fileName}.xlsx"`);
+      res.status(200).send(buf);
+    }),
+  );
+
   r.post(
     "/import/:entity",
     runApi(
@@ -518,18 +723,6 @@ export function buildApiRouter(): Router {
         const body = readJson(req) as { csv?: string };
         const domain = await getDomainService();
         return importCsv(rc, req.params.entity, body.csv ?? "", metadata, domain);
-      },
-      { mutating: true },
-    ),
-  );
-
-  // ---- leads ------------------------------------------------------------
-  r.post(
-    "/leads/:id/convert",
-    runApi(
-      async (rc, req) => {
-        const domain = await getDomainService();
-        return domain.convertLead(rc, req.params.id);
       },
       { mutating: true },
     ),
@@ -703,7 +896,19 @@ export function buildApiRouter(): Router {
 
   r.get("/purchase-orders/:id", runApi(async (rc, req) => {
     const pur = await getPurchasingService();
-    return pur.getPO(rc, req.params.id);
+    const res = await pur.getPO(rc, req.params.id);
+    // Resolve the approver's name server-side (the user table isn't readable by
+    // non-admins, but the approver/manager must see who a PO is routed to).
+    let approverName: string | null = null;
+    if (res.doc.approverId) {
+      try {
+        const u = await (await getDomainService()).get(systemContext(rc.tenantId, rc.orgId), "user", String(res.doc.approverId));
+        approverName = String(u.displayName ?? u.email ?? res.doc.approverId);
+      } catch {
+        approverName = null;
+      }
+    }
+    return { ...res, approverName };
   }));
 
   r.put(
@@ -713,6 +918,47 @@ export function buildApiRouter(): Router {
         const body = readJson(req) as { header?: Record<string, unknown>; lines?: LineInput[] };
         const pur = await getPurchasingService();
         return pur.savePO(rc, req.params.id, body.header, body.lines ?? []);
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Submit a PO for approval (routes to the creator's supervisor; auto-approves
+  // when the creator has none). Needs update rights on the PO.
+  r.post(
+    "/purchase-orders/:id/submit",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "purchaseOrder", action: "purchaseOrder:update" })) {
+          throw new ForbiddenError("not allowed to submit purchase orders");
+        }
+        const pur = await getPurchasingService();
+        return { purchaseOrder: await pur.submitPO(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Approve / reject a pending PO — the service enforces that only the routed
+  // approver (or an admin) may decide.
+  r.post(
+    "/purchase-orders/:id/approve",
+    runApi(
+      async (rc, req) => {
+        const pur = await getPurchasingService();
+        return { purchaseOrder: await pur.decidePO(rc, req.params.id, "approve") };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/purchase-orders/:id/reject",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { reason?: string | null };
+        const pur = await getPurchasingService();
+        return { purchaseOrder: await pur.decidePO(rc, req.params.id, "reject", body.reason ?? null) };
       },
       { mutating: true },
     ),
@@ -1035,6 +1281,198 @@ export function buildApiRouter(): Router {
     ),
   );
 
+  // ---- sales cart (Sepet) ----------------------------------------------
+  // A persisted basket (cart + cartLine). Checkout rings it through the POS
+  // pipeline (invoice → send: posts AR/Revenue/COGS + issues stock), so the cart
+  // never duplicates GL/stock logic. Drafts can be saved and resumed.
+  r.get("/carts", runApi(async (rc) => {
+    const domain = await getDomainService();
+    const page = await domain.list(rc, "cart", {
+      filters: [{ field: "status", op: "eq", value: "open" }],
+      sort: [{ field: "createdAt", dir: "desc" }],
+      pageSize: 50,
+    });
+    return { items: page.items };
+  }));
+
+  r.get("/carts/:id", runApi(async (rc, req) => {
+    const fin = await getFinanceService();
+    return fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
+  }));
+
+  r.post(
+    "/carts",
+    runApi(
+      async (rc, req) => {
+        const fin = await getFinanceService();
+        const body = readJson(req) as {
+          accountId?: string | null;
+          branchId?: string | null;
+          warehouseId?: string | null;
+          currencyCode?: string;
+          notes?: string | null;
+          lines?: LineInput[];
+        };
+        const doc = await fin.createDocument(rc, "cart", "CART", {
+          accountId: body.accountId ?? null,
+          branchId: body.branchId ?? null,
+          warehouseId: body.warehouseId ?? null,
+          currencyCode: body.currencyCode ?? "USD",
+          status: "open",
+          notes: body.notes ?? null,
+        });
+        if (body.lines?.length) await fin.replaceLines(rc, "cart", "cartLine", "cartId", doc.id, body.lines);
+        return fin.getDocument(rc, "cart", "cartLine", "cartId", doc.id);
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.put(
+    "/carts/:id",
+    runApi(
+      async (rc, req) => {
+        const fin = await getFinanceService();
+        const body = readJson(req) as { header?: Record<string, unknown>; lines?: LineInput[] };
+        return fin.saveDocument(rc, "cart", "cartLine", "cartId", req.params.id, body.header, body.lines ?? []);
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.delete(
+    "/carts/:id",
+    runApi(
+      async (rc, req) => {
+        const fin = await getFinanceService();
+        const domain = await getDomainService();
+        const { lines } = await fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
+        for (const l of lines) await domain.remove(rc, "cartLine", String(l.id));
+        await domain.remove(rc, "cart", req.params.id);
+        return { ok: true };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/carts/:id/checkout",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "pos", action: "pos:checkout" })) {
+          throw new ForbiddenError("not allowed to check out sales");
+        }
+        const fin = await getFinanceService();
+        const pos = await getPosService();
+        const domain = await getDomainService();
+        const body = readJson(req) as { payments?: { method: string; amount: number }[] };
+        const { doc: cart, lines } = await fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
+        if (cart.status === "converted") throw new BadRequestError("cart already checked out");
+        if (!lines.length) throw new BadRequestError("cart is empty");
+        const result = await pos.checkout(rc, {
+          branchId: (cart.branchId as string) ?? null,
+          warehouseId: (cart.warehouseId as string) ?? null,
+          accountId: (cart.accountId as string) ?? null,
+          currencyCode: String(cart.currencyCode ?? "USD"),
+          lines: lines.map((l) => ({
+            productId: (l.productId as string) ?? null,
+            description: String(l.description ?? ""),
+            qty: Number(l.qty ?? 0),
+            unitPrice: Number(l.unitPrice ?? 0),
+            taxRate: Number(l.taxRate ?? 0),
+          })),
+          payments: body.payments ?? [],
+        });
+        await domain.update(rc, "cart", req.params.id, { status: "converted", convertedInvoiceId: result.invoice.id });
+        return { invoice: result.invoice, total: result.total, change: result.change };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  // ---- sales returns (İadeler) -----------------------------------------
+  // A return document (salesReturn + salesReturnLine). Posting restocks the
+  // returned goods (a receipt movement per line, refType `salesReturn`).
+  r.get("/sales-returns", runApi(async (rc) => {
+    const domain = await getDomainService();
+    const page = await domain.list(rc, "salesReturn", { sort: [{ field: "createdAt", dir: "desc" }], pageSize: 100 });
+    return { items: page.items };
+  }));
+
+  r.get("/sales-returns/:id", runApi(async (rc, req) => {
+    const fin = await getFinanceService();
+    return fin.getDocument(rc, "salesReturn", "salesReturnLine", "salesReturnId", req.params.id);
+  }));
+
+  r.post(
+    "/sales-returns",
+    runApi(
+      async (rc, req) => {
+        const fin = await getFinanceService();
+        const body = readJson(req) as {
+          accountId?: string | null;
+          invoiceId?: string | null;
+          warehouseId?: string | null;
+          branchId?: string | null;
+          currencyCode?: string;
+          returnDate?: string | null;
+          reason?: string | null;
+          notes?: string | null;
+          lines?: LineInput[];
+        };
+        const doc = await fin.createDocument(rc, "salesReturn", "RET", {
+          accountId: body.accountId ?? null,
+          invoiceId: body.invoiceId ?? null,
+          warehouseId: body.warehouseId ?? null,
+          branchId: body.branchId ?? null,
+          currencyCode: body.currencyCode ?? "USD",
+          returnDate: body.returnDate ?? rc.at.slice(0, 10),
+          reason: body.reason ?? null,
+          status: "draft",
+          notes: body.notes ?? null,
+        });
+        if (body.lines?.length) await fin.replaceLines(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id, body.lines);
+        return fin.getDocument(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id);
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.post(
+    "/sales-returns/:id/post",
+    runApi(
+      async (rc, req) => {
+        if (!permissionEngine.can(rc, { entity: "salesReturn", action: "salesReturn:post" })) {
+          throw new ForbiddenError("not allowed to post sales returns");
+        }
+        const fin = await getFinanceService();
+        const inventory = await getInventoryService();
+        const domain = await getDomainService();
+        const { doc, lines } = await fin.getDocument(rc, "salesReturn", "salesReturnLine", "salesReturnId", req.params.id);
+        if (doc.status === "posted") return { salesReturn: doc };
+        const warehouseId = (doc.warehouseId as string) ?? null;
+        if (!warehouseId) throw new BadRequestError("a warehouse is required to restock a return");
+        for (const l of lines) {
+          const qty = Number(l.qty ?? 0);
+          if (!l.productId || qty <= 0) continue;
+          await inventory.writeMovement(rc, {
+            productId: String(l.productId),
+            warehouseId,
+            qty,
+            type: "receipt",
+            unitCost: Number(l.unitPrice ?? 0),
+            ref: req.params.id,
+            refType: "salesReturn",
+            branchId: (doc.branchId as string) ?? null,
+          });
+        }
+        const updated = await domain.update(rc, "salesReturn", req.params.id, { status: "posted" });
+        return { salesReturn: updated };
+      },
+      { mutating: true },
+    ),
+  );
+
   // ---- recurring billing + cron ----------------------------------------
   r.post(
     "/recurring/run",
@@ -1054,8 +1492,9 @@ export function buildApiRouter(): Router {
       async (rc) => {
         if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
         const results = await runAllJobs(rc);
-        // Also fire any active schedule-triggered automations.
-        const automations = await runScheduledAutomations(systemContext(rc.tenantId, rc.orgId));
+        // Also fire any active schedule-triggered automations (force: a manual /
+        // external tick runs them all now, regardless of per-rule cadence).
+        const automations = await runScheduledAutomations(systemContext(rc.tenantId, rc.orgId), { force: true });
         if (automations.length) {
           const ok = automations.filter((a) => a.status === "success").length;
           results.push({ name: "automations", at: rc.at, summary: `${ok}/${automations.length} scheduled automation(s) ran` });
@@ -1308,11 +1747,46 @@ export function buildApiRouter(): Router {
     ),
   );
 
+  // Live activity: which rules are running right now + the most recent completed
+  // runs — polled by the Automations screen for "what's running" indicators.
+  r.get("/automation/live", runApi(async (rc) => {
+    adminOnly(rc);
+    return getLiveActivity(rc.tenantId, rc.orgId);
+  }));
+
+  // Run now: queue every active schedule-triggered automation, then drain the
+  // whole queue to completion (so multiple automations are processed in order).
+  r.post(
+    "/automation/run-now",
+    runApi(
+      async (rc) => {
+        adminOnly(rc);
+        const ctx = systemContext(rc.tenantId, rc.orgId);
+        const queued = await enqueueScheduled(ctx, { force: true });
+        const result = await processQueue(ctx);
+        return { queued: queued.length, ...result };
+      },
+      { mutating: true },
+    ),
+  );
+
   // Processing queue (pending / retry / dead-letter).
   r.get("/automation/queue", runApi(async (rc) => {
     adminOnly(rc);
     return { items: await automationStore.listQueue(rc.tenantId, rc.orgId) };
   }));
+
+  // Drain the queue to completion (pending + due-retry items run until clear).
+  r.post(
+    "/automation/queue/process",
+    runApi(
+      async (rc) => {
+        adminOnly(rc);
+        return processQueue(systemContext(rc.tenantId, rc.orgId));
+      },
+      { mutating: true },
+    ),
+  );
 
   r.post(
     "/automation/queue/:id/retry",
@@ -1326,8 +1800,9 @@ export function buildApiRouter(): Router {
         const run = await executeRule(rule, systemContext(rc.tenantId, rc.orgId), item.input, {
           test: false,
           trigger: "queue retry",
+          fromQueue: true,
         });
-        if (run.status === "success") {
+        if (run.status === "success" || run.status === "skipped") {
           await automationStore.removeQueueItem(rc.tenantId, rc.orgId, item.id);
         } else {
           item.attempts += 1;
@@ -1568,17 +2043,21 @@ export function buildApiRouter(): Router {
     res.json({ received: true, signature: req.get("x-aula-signature") ?? "" });
   });
 
-  // ---- notifications ----------------------------------------------------
-  r.get("/notifications", runApi(async (rc) => ({
-    items: notifications.list(rc.tenantId, rc.orgId),
-    unread: notifications.unreadCount(rc.tenantId, rc.orgId),
-  })));
+  // ---- notifications (per-user inbox) -----------------------------------
+  r.get("/notifications", runApi(async (rc) => {
+    // Hide categories the user muted (also covers broadcasts, which can't be gated at delivery).
+    const isMuted = await buildInAppMuteFilter(rc.tenantId, rc.orgId, rc.userId);
+    return {
+      items: notifications.list(rc.tenantId, rc.orgId, rc.userId, isMuted),
+      unread: notifications.unreadCount(rc.tenantId, rc.orgId, rc.userId, isMuted),
+    };
+  }));
 
   r.post(
     "/notifications",
     runApi(
       async (rc) => {
-        notifications.markAllRead(rc.tenantId, rc.orgId);
+        notifications.markAllRead(rc.tenantId, rc.orgId, rc.userId);
         return { ok: true };
       },
       { mutating: true },
@@ -1592,7 +2071,7 @@ export function buildApiRouter(): Router {
       async (rc, req) => {
         const body = (req.body ?? {}) as { ids?: unknown };
         const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
-        const removed = notifications.remove(rc.tenantId, rc.orgId, ids);
+        const removed = notifications.remove(rc.tenantId, rc.orgId, rc.userId, ids);
         return { removed };
       },
       { mutating: true },
@@ -1697,29 +2176,6 @@ export function buildApiRouter(): Router {
     res.end(blob.data);
   }));
 
-  // ---- chat: user picker + conversations + messages (privacy via chat/service) -
-  r.get("/chat/users", runApi(async (rc) => ({ users: await listChatUsers(rc) })));
-  r.get("/chat/conversations", runApi(async (rc) => ({ conversations: await listConversations(rc) })));
-  r.get(
-    "/chat/messages",
-    runApi(async (rc, req) => ({ items: await listMessages(rc, String(req.query.conversationId ?? "")) })),
-  );
-  r.post(
-    "/chat/messages",
-    runApi(
-      async (rc, req) => {
-        const body = readJson(req) as {
-          participants?: Array<string | number>;
-          conversationId?: string;
-          body?: string | null;
-          attachments?: { fileId: string; name: string; kind: "image" | "file"; sizeKb?: number }[] | null;
-        };
-        return createChatMessage(rc, body);
-      },
-      { mutating: true, status: 201 },
-    ),
-  );
-
   // ---- email: SMTP send + IMAP sync (env-driven; DB-only when unconfigured) -
   r.post(
     "/email/send",
@@ -1803,14 +2259,17 @@ export function buildApiRouter(): Router {
             unread: true,
             messageId: m.messageId,
           });
-          notifications.add({
+          // A synced mailbox is personal to its owner; honour the `new_email` pref.
+          await notifyUser({
             at: new Date().toISOString(),
             tenantId: rc.tenantId,
             orgId: rc.orgId,
+            userId: rc.userId,
             channel: "email",
             subject: m.subject || "(no subject)",
             body: `New email from ${m.sender}`,
             eventType: "email.received",
+            prefKey: "new_email",
             // Deep link straight to this message so the bell opens it in the mailbox.
             href: `/email?open=${encodeURIComponent(String(created.id))}`,
           });
@@ -1834,6 +2293,10 @@ export function buildApiRouter(): Router {
       const items = res.items.map((e) => ({
         id: e.id,
         folder: e.folder,
+        folderId: e.folderId ?? null,
+        starred: Boolean(e.starred),
+        // Needed so the client can target IMAP deletes for synced inbox messages.
+        messageId: e.messageId ?? "",
         sender: e.sender,
         subject: e.subject,
         preview: String(e.body ?? "").replace(/\s+/g, " ").trim().slice(0, 140),
@@ -1843,6 +2306,134 @@ export function buildApiRouter(): Router {
       }));
       return { items, total: res.total, page: res.page, pageSize: res.pageSize, pageCount: res.pageCount };
     }),
+  );
+
+  // Delete a custom mail folder. Its messages are first reassigned back to their
+  // base system folder (folderId cleared) so nothing is orphaned, then the folder
+  // row is removed. (Folder create/rename/list use generic /entities/emailFolder.)
+  r.delete(
+    "/email/folders/:id",
+    runApi(
+      async (rc, req) => {
+        const id = String(req.params.id);
+        const domain = await getDomainService();
+        let reassigned = 0;
+        // Clear folderId on this folder's messages in bulk (one UPDATE per page);
+        // reassigned rows drop out of the filter, so always re-read the first page.
+        for (;;) {
+          const msgs = await domain.list(rc, "email", {
+            filters: [{ field: "folderId", op: "eq", value: id }],
+            pageSize: 250,
+            page: 1,
+          });
+          if (msgs.items.length === 0) break;
+          reassigned += await domain.updateMany(rc, "email", msgs.items.map((m) => String(m.id)), { folderId: null });
+        }
+        await domain.remove(rc, "emailFolder", id);
+        return { ok: true, reassigned };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // ---- bulk mailbox ops (one request for the whole selection; the UI chunks at
+  //      250 so 1000s of messages move/delete without 1000s of round trips) -----
+
+  // Move many messages to a system folder (folder + clear folderId) or a custom
+  // folder (set folderId) — ONE bulk UPDATE. Organizational only (no IMAP).
+  r.post(
+    "/email/move",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { ids?: string[]; folder?: string; folderId?: string | null };
+        const ids = (body.ids ?? []).map(String);
+        const patch: Record<string, unknown> = {};
+        if (typeof body.folder === "string") patch.folder = body.folder;
+        if ("folderId" in body) patch.folderId = body.folderId ?? null;
+        const domain = await getDomainService();
+        const updated = await domain.updateMany(rc, "email", ids, patch);
+        return { updated };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Move many messages to Trash (folder → "trash", folderId cleared) in ONE bulk
+  // UPDATE, then remove them from the IMAP server (Gmail) by the client-supplied
+  // message-ids when configured.
+  r.post(
+    "/email/trash",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { ids?: string[]; messageIds?: string[] };
+        const ids = (body.ids ?? []).map(String);
+        const domain = await getDomainService();
+        const updated = await domain.updateMany(rc, "email", ids, { folder: "trash", folderId: null });
+        const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
+        const serverDeleted = emailCfg.imapConfigured
+          ? await deleteOnServer(body.messageIds ?? [], { tenantId: rc.tenantId, orgId: rc.orgId })
+          : 0;
+        return { updated, serverDeleted, configured: emailCfg.imapConfigured };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Permanently delete many messages — ONE bulk DELETE + IMAP delete.
+  r.post(
+    "/email/purge",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as { ids?: string[]; messageIds?: string[] };
+        const ids = (body.ids ?? []).map(String);
+        const domain = await getDomainService();
+        const deleted = await domain.removeMany(rc, "email", ids);
+        const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
+        const serverDeleted = emailCfg.imapConfigured
+          ? await deleteOnServer(body.messageIds ?? [], { tenantId: rc.tenantId, orgId: rc.orgId })
+          : 0;
+        return { deleted, serverDeleted, configured: emailCfg.imapConfigured };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Restore many messages from Trash to their original folder (grouped bulk
+  // UPDATEs, since targets may differ) + move them back on the IMAP server.
+  r.post(
+    "/email/restore",
+    runApi(
+      async (rc, req) => {
+        const body = readJson(req) as {
+          items?: { id: string; folder?: string; folderId?: string | null }[];
+          messageIds?: string[];
+        };
+        const incoming = body.items ?? [];
+        const domain = await getDomainService();
+        // Group ids by identical (folder, folderId) target so each group is one UPDATE.
+        const groups = new Map<string, { folder?: string; folderId: string | null; ids: string[] }>();
+        for (const it of incoming) {
+          const folder = typeof it.folder === "string" ? it.folder : undefined;
+          const folderId = it.folderId ?? null;
+          const key = `${folder ?? ""}|${folderId ?? ""}`;
+          const g = groups.get(key) ?? { folder, folderId, ids: [] };
+          g.ids.push(String(it.id));
+          groups.set(key, g);
+        }
+        let updated = 0;
+        for (const g of groups.values()) {
+          const patch: Record<string, unknown> = { folderId: g.folderId };
+          if (g.folder) patch.folder = g.folder;
+          updated += await domain.updateMany(rc, "email", g.ids, patch);
+        }
+        const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);
+        const serverRestored = emailCfg.imapConfigured
+          ? await restoreOnServer(body.messageIds ?? [], { tenantId: rc.tenantId, orgId: rc.orgId })
+          : 0;
+        return { updated, serverRestored };
+      },
+      { mutating: true },
+    ),
   );
 
   // ---- health (public, no auth) ----------------------------------------

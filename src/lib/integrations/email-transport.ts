@@ -55,13 +55,25 @@ export async function sendMail(mail: OutgoingMail, scope?: EmailScope): Promise<
   const cfg = await resolve(scope);
   if (!cfg.smtpConfigured) return null;
   const info = await transporterFor(cfg).sendMail({
-    from: cfg.smtpFrom || cfg.smtpUser,
+    from: fromAddress(cfg),
     to: mail.to,
     subject: mail.subject,
     text: mail.text,
   });
   logger.info("smtp mail sent", { to: mail.to, messageId: info.messageId });
   return info.messageId ?? null;
+}
+
+/**
+ * Build a valid `From`: a full `Name <addr>` or bare address is used as-is; a
+ * name-only value (e.g. "AULA CRM") is wrapped with the authenticated address so
+ * the header is well-formed (some servers reject an address-less From).
+ */
+function fromAddress(cfg: ResolvedEmailConfig): string {
+  const from = (cfg.smtpFrom ?? "").trim();
+  if (!from) return cfg.smtpUser;
+  if (from.includes("@")) return from;
+  return cfg.smtpUser ? `${from} <${cfg.smtpUser}>` : from;
 }
 
 export interface FetchedMail {
@@ -147,6 +159,111 @@ export async function fetchBodiesByUid(uids: number[], scope?: EmailScope): Prom
     await client.logout().catch(() => {});
   }
   return out;
+}
+
+/** Normalise an RFC Message-ID for comparison (strip <>, trim, lowercase). */
+function normId(id: unknown): string {
+  return String(id ?? "").replace(/[<>]/g, "").trim().toLowerCase();
+}
+
+/** Find a mailbox by SPECIAL-USE flag (e.g. "\\Trash"), falling back to common names. */
+async function findMailbox(client: ImapFlow, special: string, fallbacks: string[]): Promise<string | null> {
+  try {
+    const list = (await client.list()) as Array<{ path: string; specialUse?: string }>;
+    const bySpecial = list.find((b) => b.specialUse === special);
+    if (bySpecial) return bySpecial.path;
+    const byPath = new Map(list.map((b) => [b.path.toLowerCase(), b.path]));
+    for (const name of fallbacks) {
+      const hit = byPath.get(name.toLowerCase());
+      if (hit) return hit;
+    }
+  } catch {
+    /* ignore — list unsupported */
+  }
+  return null;
+}
+
+const TRASH_NAMES = ["[Gmail]/Trash", "[Gmail]/Bin", "Trash", "Bin", "Deleted", "Deleted Items", "Deleted Messages"];
+
+/** Scan the currently-open mailbox and return the UIDs whose Message-ID is wanted. */
+async function uidsForMessageIds(client: ImapFlow, wanted: Set<string>): Promise<number[]> {
+  const uids: number[] = [];
+  const mailbox = client.mailbox;
+  const total = typeof mailbox === "object" && mailbox ? mailbox.exists : 0;
+  if (!total) return uids;
+  for await (const msg of client.fetch("1:*", { envelope: true })) {
+    const mid = normId(msg.envelope?.messageId ?? "");
+    if (mid && wanted.has(mid)) uids.push(msg.uid);
+  }
+  return uids;
+}
+
+/**
+ * Delete messages on the IMAP server (Gmail etc.) by Message-ID: move them to the
+ * Trash mailbox (so they leave the inbox / All Mail), or — if no Trash mailbox can
+ * be found — flag `\Deleted` and expunge. Best-effort; returns how many moved.
+ */
+export async function deleteOnServer(messageIds: string[], scope?: EmailScope): Promise<number> {
+  const cfg = await resolve(scope);
+  if (!cfg.imapConfigured) return 0;
+  const wanted = new Set(messageIds.map(normId).filter(Boolean));
+  if (wanted.size === 0) return 0;
+  const client = makeImapClient(cfg);
+  let moved = 0;
+  await client.connect();
+  try {
+    const trash = await findMailbox(client, "\\Trash", TRASH_NAMES);
+    const lock = await client.getMailboxLock(cfg.imapMailbox);
+    try {
+      const uids = await uidsForMessageIds(client, wanted);
+      if (uids.length) {
+        if (trash && trash.toLowerCase() !== cfg.imapMailbox.toLowerCase()) {
+          await client.messageMove(uids.join(","), trash, { uid: true });
+        } else {
+          await client.messageDelete(uids.join(","), { uid: true });
+        }
+        moved = uids.length;
+      }
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    logger.warn("imap delete failed", { error: String(err) });
+  } finally {
+    await client.logout().catch(() => {});
+  }
+  if (moved) logger.info("imap messages deleted", { count: moved });
+  return moved;
+}
+
+/** Restore messages from Trash back to the inbox (undo a server delete). Best-effort. */
+export async function restoreOnServer(messageIds: string[], scope?: EmailScope): Promise<number> {
+  const cfg = await resolve(scope);
+  if (!cfg.imapConfigured) return 0;
+  const wanted = new Set(messageIds.map(normId).filter(Boolean));
+  if (wanted.size === 0) return 0;
+  const client = makeImapClient(cfg);
+  let moved = 0;
+  await client.connect();
+  try {
+    const trash = await findMailbox(client, "\\Trash", TRASH_NAMES);
+    if (!trash) return 0;
+    const lock = await client.getMailboxLock(trash);
+    try {
+      const uids = await uidsForMessageIds(client, wanted);
+      if (uids.length) {
+        await client.messageMove(uids.join(","), cfg.imapMailbox, { uid: true });
+        moved = uids.length;
+      }
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    logger.warn("imap restore failed", { error: String(err) });
+  } finally {
+    await client.logout().catch(() => {});
+  }
+  return moved;
 }
 
 /**

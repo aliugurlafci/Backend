@@ -45,6 +45,7 @@ export const stockMovementEntity: EntityDef = {
         { value: "goodsReceipt", label: "Goods Receipt", tone: "info" },
         { value: "invoice", label: "Invoice", tone: "info" },
         { value: "salesOrder", label: "Sales Order", tone: "info" },
+        { value: "salesReturn", label: "Sales Return", tone: "success" },
         { value: "stockTransfer", label: "Stock Transfer", tone: "info" },
         { value: "adjustment", label: "Adjustment", tone: "neutral" },
       ],

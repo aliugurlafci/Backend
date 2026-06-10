@@ -24,12 +24,18 @@ export const purchaseOrderEntity: EntityDef = {
       defaultValue: "draft",
       options: [
         { value: "draft", label: "Draft", tone: "neutral" },
-        { value: "sent", label: "Sent", tone: "info" },
+        { value: "pending", label: "Pending Approval", tone: "info" },
+        { value: "approved", label: "Approved", tone: "info" },
         { value: "partial", label: "Partially Received", tone: "warning" },
         { value: "received", label: "Received", tone: "success" },
+        { value: "rejected", label: "Rejected", tone: "danger" },
         { value: "cancelled", label: "Cancelled", tone: "danger" },
       ],
     },
+    // Approval routing (set by submit/approve; computed → server-managed only).
+    { name: "approverId", label: "Approver", type: "reference", referenceEntity: "user", computed: true, filterable: true },
+    { name: "approvedAt", label: "Approved At", type: "datetime", computed: true },
+    { name: "rejectionReason", label: "Rejection Reason", type: "string", computed: true, max: 240 },
     currencyField(),
     { name: "orderDate", label: "Order Date", type: "date", sortable: true },
     { name: "expectedDate", label: "Expected Date", type: "date", sortable: true },
@@ -44,15 +50,19 @@ export const purchaseOrderEntity: EntityDef = {
     { field: "total", width: 130 },
     { field: "orderDate", width: 130 },
   ],
+  // Submit / approve / reject are bespoke (conditional supervisor routing +
+  // record-level auth) and run through PurchasingService, not the state machine.
+  // The generic transitions below only cover cancel + reopen.
   lifecycle: {
     field: "status",
     initial: "draft",
-    states: ["draft", "sent", "partial", "received", "cancelled"],
+    states: ["draft", "pending", "approved", "partial", "received", "rejected", "cancelled"],
     finalStates: ["received", "cancelled"],
     transitions: [
-      { from: "draft", to: "sent", action: "send", requires: "purchaseOrder:update" },
       { from: "draft", to: "cancelled", action: "cancel", requires: "purchaseOrder:update" },
-      { from: "sent", to: "cancelled", action: "cancel", requires: "purchaseOrder:update" },
+      { from: "pending", to: "cancelled", action: "cancel", requires: "purchaseOrder:update" },
+      { from: "approved", to: "cancelled", action: "cancel", requires: "purchaseOrder:update" },
+      { from: "rejected", to: "draft", action: "reopen", requires: "purchaseOrder:update" },
     ],
   },
 };

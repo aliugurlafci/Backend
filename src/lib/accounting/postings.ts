@@ -187,53 +187,142 @@ export async function postBillPaymentGL(ctx: RequestContext, payment: EntityReco
   });
 }
 
-/** Post a stock transfer: paired transfer_out / transfer_in movements (no GL). */
+/** Write the paired transfer_out / transfer_in movements for a transfer record
+ *  (idempotent via the ledger; net-zero on total on-hand). No status change. */
+async function applyTransferMovements(ctx: RequestContext, t: EntityRecord): Promise<void> {
+  const qty = Number(t.qty ?? 0);
+  if (qty <= 0) return;
+  const inventory = await getInventoryService();
+  const cost = round2(Number(t.unitCost ?? 0));
+  const branchId = (t.branchId as string) ?? null;
+  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.fromWarehouseId), qty: -qty, type: "transfer_out", unitCost: cost, ref: String(t.id), refType: "stockTransfer", branchId, movedAt: ctx.at });
+  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.toWarehouseId), qty, type: "transfer_in", unitCost: cost, ref: String(t.id), refType: "stockTransfer", branchId, movedAt: ctx.at });
+}
+
+/** Reverse a posted transfer's movements (idempotent via a distinct `:void` ref
+ *  so re-voiding is a no-op and the reversal never collides with the forward keys). */
+async function reverseTransferMovements(ctx: RequestContext, t: EntityRecord): Promise<void> {
+  const qty = Number(t.qty ?? 0);
+  if (qty <= 0) return;
+  const inventory = await getInventoryService();
+  const cost = round2(Number(t.unitCost ?? 0));
+  const branchId = (t.branchId as string) ?? null;
+  const ref = `${String(t.id)}:void`;
+  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.fromWarehouseId), qty, type: "transfer_in", unitCost: cost, ref, refType: "stockTransfer", branchId, movedAt: ctx.at });
+  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.toWarehouseId), qty: -qty, type: "transfer_out", unitCost: cost, ref, refType: "stockTransfer", branchId, movedAt: ctx.at });
+}
+
+/** Post a stock transfer (paired movements, no GL) and flag it posted. Used by the
+ *  dedicated `/stock-transfers/:id/post` endpoint + smoke; the `stockTransfer.post`
+ *  lifecycle transition runs the same movements via registerAccountingPostings. */
 export async function postStockTransfer(ctx: RequestContext, transferId: string): Promise<EntityRecord> {
   const qe = await getQueryEngine();
-  const inventory = await getInventoryService();
   const t = await qe.get(ctx, "stockTransfer", transferId);
   if (t.status === "posted") return t;
-  const qty = Number(t.qty ?? 0);
-  const cost = round2(Number(t.unitCost ?? 0));
-  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.fromWarehouseId), qty: -qty, type: "transfer_out", unitCost: cost, ref: transferId, refType: "stockTransfer", branchId: (t.branchId as string) ?? null, movedAt: ctx.at });
-  await inventory.writeMovement(ctx, { productId: String(t.productId), warehouseId: String(t.toWarehouseId), qty, type: "transfer_in", unitCost: cost, ref: transferId, refType: "stockTransfer", branchId: (t.branchId as string) ?? null, movedAt: ctx.at });
+  await applyTransferMovements(ctx, t);
   return qe.patchComputed(ctx, "stockTransfer", transferId, { status: "posted" });
 }
 
-/** Post a stock adjustment: a signed movement + a GL entry (Inventory vs Adjustments). */
-export async function postStockAdjustment(ctx: RequestContext, adjId: string): Promise<EntityRecord> {
-  const qe = await getQueryEngine();
+/** Write the signed movement + GL entry for an adjustment (idempotent). No status change. */
+async function applyAdjustmentPosting(ctx: RequestContext, a: EntityRecord): Promise<void> {
+  const delta = Number(a.qtyDelta ?? 0);
+  if (delta === 0) return;
   const inventory = await getInventoryService();
   const acc = await getAccountingService();
+  const cost = round2(Number(a.unitCost ?? 0));
+  const branchId = (a.branchId as string) ?? null;
+  await inventory.writeMovement(ctx, { productId: String(a.productId), warehouseId: String(a.warehouseId), qty: delta, type: "adjustment", unitCost: cost, ref: String(a.id), refType: "adjustment", branchId, movedAt: ctx.at });
+  const value = round2(Math.abs(delta) * cost);
+  if (value > 0) {
+    const invAcc = await acc.requireAccount(ctx, "inventory");
+    const adjustExpenseAcc = (await acc.accountBySubtype(ctx, "operating_expense"))?.id ?? invAcc;
+    const lines: JournalLineInput[] = delta > 0
+      ? [{ ledgerAccountId: invAcc, debit: value }, { ledgerAccountId: adjustExpenseAcc, credit: value }]
+      : [{ ledgerAccountId: adjustExpenseAcc, debit: value }, { ledgerAccountId: invAcc, credit: value }];
+    await acc.postFromSource(ctx, { source: "adjustment", sourceRef: String(a.id), date: String(a.adjustedAt ?? today(ctx)), memo: `Adjustment ${String(a.number)}`, branchId, lines });
+  }
+}
+
+/** Reverse a posted adjustment: opposite movement + reversing GL, keyed on a
+ *  distinct `:void` ref so re-voiding is idempotent. */
+async function reverseAdjustmentPosting(ctx: RequestContext, a: EntityRecord): Promise<void> {
+  const delta = Number(a.qtyDelta ?? 0);
+  if (delta === 0) return;
+  const inventory = await getInventoryService();
+  const acc = await getAccountingService();
+  const cost = round2(Number(a.unitCost ?? 0));
+  const branchId = (a.branchId as string) ?? null;
+  const ref = `${String(a.id)}:void`;
+  await inventory.writeMovement(ctx, { productId: String(a.productId), warehouseId: String(a.warehouseId), qty: -delta, type: "adjustment", unitCost: cost, ref, refType: "adjustment", branchId, movedAt: ctx.at });
+  const value = round2(Math.abs(delta) * cost);
+  if (value > 0) {
+    const invAcc = await acc.requireAccount(ctx, "inventory");
+    const adjustExpenseAcc = (await acc.accountBySubtype(ctx, "operating_expense"))?.id ?? invAcc;
+    const lines: JournalLineInput[] = delta > 0
+      ? [{ ledgerAccountId: adjustExpenseAcc, debit: value }, { ledgerAccountId: invAcc, credit: value }]
+      : [{ ledgerAccountId: invAcc, debit: value }, { ledgerAccountId: adjustExpenseAcc, credit: value }];
+    await acc.postFromSource(ctx, { source: "adjustment", sourceRef: ref, date: String(a.adjustedAt ?? today(ctx)), memo: `Void adjustment ${String(a.number)}`, branchId, lines });
+  }
+}
+
+/** Post a stock adjustment (movement + GL) and flag it posted. Used by the
+ *  dedicated `/stock-adjustments/:id/post` endpoint + smoke; the
+ *  `stockAdjustment.post` transition runs the same posting via registerAccountingPostings. */
+export async function postStockAdjustment(ctx: RequestContext, adjId: string): Promise<EntityRecord> {
+  const qe = await getQueryEngine();
   const a = await qe.get(ctx, "stockAdjustment", adjId);
   if (a.status === "posted") return a;
-  const delta = Number(a.qtyDelta ?? 0);
-  const cost = round2(Number(a.unitCost ?? 0));
-  if (delta !== 0) {
-    await inventory.writeMovement(ctx, { productId: String(a.productId), warehouseId: String(a.warehouseId), qty: delta, type: "adjustment", unitCost: cost, ref: adjId, refType: "adjustment", branchId: (a.branchId as string) ?? null, movedAt: ctx.at });
-    const value = round2(Math.abs(delta) * cost);
-    if (value > 0) {
-      const inv = await acc.requireAccount(ctx, "inventory");
-      const adjustExpenseAcc = (await acc.accountBySubtype(ctx, "operating_expense"))?.id ?? inv;
-      const lines: JournalLineInput[] = delta > 0
-        ? [{ ledgerAccountId: inv, debit: value }, { ledgerAccountId: adjustExpenseAcc, credit: value }]
-        : [{ ledgerAccountId: adjustExpenseAcc, debit: value }, { ledgerAccountId: inv, credit: value }];
-      await acc.postFromSource(ctx, { source: "adjustment", sourceRef: adjId, date: String(a.adjustedAt ?? today(ctx)), memo: `Adjustment ${String(a.number)}`, branchId: (a.branchId as string) ?? null, lines });
-    }
-  }
+  await applyAdjustmentPosting(ctx, a);
   return qe.patchComputed(ctx, "stockAdjustment", adjId, { status: "posted" });
 }
 
-/** Subscribe to the invoice `send` transition so AR/Revenue/COGS post automatically. */
+/**
+ * Subscribe to the lifecycle transitions that must produce GL entries / stock
+ * movements. The generic transition endpoint only flips the status field and
+ * emits the event — the (idempotent) side effects run here. This is the single
+ * path the UI drawer uses, so without these subscriptions posting a stock
+ * transfer or adjustment would change the status without ever moving stock.
+ */
 export function registerAccountingPostings(): void {
   eventBus.subscribe("*", async (event: DomainEvent) => {
     try {
-      if (event.type === "invoice.send") {
-        const ctx = systemContext(event.tenantId, event.orgId);
-        await postInvoiceGL(ctx, String(event.payload.id));
+      const id = event.payload.id ? String(event.payload.id) : "";
+      switch (event.type) {
+        case "invoice.send":
+          await postInvoiceGL(systemContext(event.tenantId, event.orgId), id);
+          break;
+        case "stockTransfer.post":
+        case "stockTransfer.void":
+        case "stockAdjustment.post":
+        case "stockAdjustment.void":
+          await handleStockTransition(event, id);
+          break;
+        default:
+          break;
       }
     } catch (error) {
       logger.error("auto-posting failed", { event: event.type, error: error instanceof Error ? error.message : String(error) });
     }
   });
+}
+
+/** Apply (post) or reverse (void) the stock side effects for a transfer/adjustment. */
+async function handleStockTransition(event: DomainEvent, id: string): Promise<void> {
+  if (!id) return;
+  const ctx = systemContext(event.tenantId, event.orgId);
+  const qe = await getQueryEngine();
+  switch (event.type) {
+    case "stockTransfer.post":
+      await applyTransferMovements(ctx, await qe.get(ctx, "stockTransfer", id));
+      break;
+    case "stockTransfer.void":
+      await reverseTransferMovements(ctx, await qe.get(ctx, "stockTransfer", id));
+      break;
+    case "stockAdjustment.post":
+      await applyAdjustmentPosting(ctx, await qe.get(ctx, "stockAdjustment", id));
+      break;
+    case "stockAdjustment.void":
+      await reverseAdjustmentPosting(ctx, await qe.get(ctx, "stockAdjustment", id));
+      break;
+  }
 }
