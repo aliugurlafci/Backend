@@ -42,6 +42,7 @@ const STANDARD_ACCOUNTS: Record<string, { code: string; name: string; type: stri
   retained_earnings: { code: "3000", name: "Opening Balance Equity", type: "equity", normalBalance: "credit" },
   sales_revenue: { code: "4000", name: "Sales Revenue", type: "revenue", normalBalance: "credit" },
   cogs: { code: "5000", name: "Cost of Goods Sold", type: "expense", normalBalance: "debit" },
+  purchase_price_variance: { code: "5100", name: "Purchase Price Variance", type: "expense", normalBalance: "debit" },
   operating_expense: { code: "6000", name: "Operating Expenses", type: "expense", normalBalance: "debit" },
 };
 
@@ -190,7 +191,9 @@ export class AccountingService {
     }
   }
 
-  /** Post a draft entry: re-assert balance + open period, flip header + lines to posted. */
+  /** Post a draft entry: re-assert balance + open period, flip header + lines to
+   *  posted — atomically, so a partially-posted (unbalanced-in-ledger) entry can
+   *  never be observed if any step fails mid-way. */
   async postEntry(ctx: RequestContext, entryId: string): Promise<EntityRecord> {
     const sys = this.sys(ctx);
     const entry = await this.qe.get(sys, "journalEntry", entryId);
@@ -204,14 +207,18 @@ export class AccountingService {
       linesPage.items.map((l) => ({ ledgerAccountId: String(l.ledgerAccountId), debit: Number(l.debit ?? 0), credit: Number(l.credit ?? 0) })),
     );
     await this.assertPeriodOpen(sys, String(entry.date));
-    for (const l of linesPage.items) await this.qe.patchComputed(sys, "journalLine", l.id, { posted: true });
-    return this.qe.patchComputed(sys, "journalEntry", entryId, { status: "posted" });
+    return this.qe.runInTransaction(async () => {
+      for (const l of linesPage.items) await this.qe.patchComputed(sys, "journalLine", l.id, { posted: true });
+      return this.qe.patchComputed(sys, "journalEntry", entryId, { status: "posted" });
+    });
   }
 
-  /** Create and immediately post an entry. */
+  /** Create and immediately post an entry — header, lines and posting commit as one. */
   async createAndPost(ctx: RequestContext, header: JournalHeaderInput, lines: JournalLineInput[]): Promise<EntityRecord> {
-    const { entry } = await this.createEntry(ctx, header, lines);
-    return this.postEntry(ctx, entry.id);
+    return this.qe.runInTransaction(async () => {
+      const { entry } = await this.createEntry(ctx, header, lines);
+      return this.postEntry(ctx, entry.id);
+    });
   }
 
   /** Idempotent posting from a sub-ledger event (skips if already posted). */
@@ -229,7 +236,9 @@ export class AccountingService {
     return this.createAndPost(ctx, input, input.lines);
   }
 
-  /** Void an entry: drafts are marked void; posted entries get a reversing entry. */
+  /** Void an entry: drafts are marked void; posted entries get a reversing entry.
+   *  The reversal + the void flag commit together (a crash between them can no
+   *  longer leave both the original and its reversal posted → doubled balances). */
   async voidEntry(ctx: RequestContext, entryId: string): Promise<EntityRecord> {
     const sys = this.sys(ctx);
     const entry = await this.qe.get(sys, "journalEntry", entryId);
@@ -247,14 +256,16 @@ export class AccountingService {
       description: `Reversal of ${String(entry.number)}`,
       branchId: (l.branchId as string) ?? null,
     }));
-    await this.createAndPost(sys, {
-      date: sys.at.slice(0, 10),
-      memo: `Reversal of ${String(entry.number)}`,
-      source: "reversal",
-      sourceRef: entryId,
-      branchId: (entry.branchId as string) ?? null,
-    }, reversed);
-    return this.qe.patchComputed(sys, "journalEntry", entryId, { status: "void" });
+    return this.qe.runInTransaction(async () => {
+      await this.createAndPost(sys, {
+        date: sys.at.slice(0, 10),
+        memo: `Reversal of ${String(entry.number)}`,
+        source: "reversal",
+        sourceRef: entryId,
+        branchId: (entry.branchId as string) ?? null,
+      }, reversed);
+      return this.qe.patchComputed(sys, "journalEntry", entryId, { status: "void" });
+    });
   }
 
   // ---- reporting ----

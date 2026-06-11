@@ -34,10 +34,12 @@ import { cache } from "@/lib/cache/cache";
 import { statsKey } from "@/lib/cache/invalidation";
 import { notifications, notifyUser, buildInAppMuteFilter } from "@/lib/integrations/notifications";
 import { webhookRegistry, testWebhook } from "@/lib/integrations/webhooks";
-import { exportCsv, importCsv } from "@/lib/integrations/import-export";
+import { exportCsv, importCsv, importXlsx, buildImportTemplate } from "@/lib/integrations/import-export";
 import { exportXlsx, exportPdf } from "@/lib/integrations/export-formats";
 import { renderReportXlsx, type ReportPayload } from "@/lib/integrations/report-export";
 import { runAllJobs, jobsStatus } from "@/lib/jobs/scheduler";
+import { retryFailedPostings } from "@/lib/accounting/postings";
+import { withIdempotency } from "@/lib/http/idempotency-cache";
 import {
   automationStore,
   buildCatalog,
@@ -67,14 +69,40 @@ import { sendMail, fetchHeaders, fetchBodiesByUid, deleteOnServer, restoreOnServ
 import { login, getPosition, parseScreens, findUserById, recordSecurityEvent } from "@/lib/security/auth-service";
 import { randomBase32Secret, totpUri, totpVerify, encrypt, decrypt, hashPassword, verifyPassword } from "@/lib/security/crypto";
 import { SESSION_COOKIE } from "@/lib/security/auth";
+import { rateLimit, peekRateLimit, clearRateLimit } from "@/lib/security/rate-limit";
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { screenCatalog } from "@/lib/config/screens";
 import type { EntityRecord } from "@/lib/metadata/types";
 
-/** Cookie options for the session JWT. */
+/** Minimum length for any password set through the API. */
+const MIN_PASSWORD_LEN = 8;
+
+/** Fields referenced as `{{record.X}}` in a rule's message recipients (email / SMS
+ *  / WhatsApp / notify) — so a manual run can pick a record that actually yields a
+ *  deliverable recipient. */
+const MESSAGING_ACTIONS = new Set(["send_email", "send_sms", "send_whatsapp", "notify"]);
+function emailRecipientFields(rule: { actions?: Array<{ type: string; to?: unknown }> }): string[] {
+  const out = new Set<string>();
+  for (const a of rule.actions ?? []) {
+    if (MESSAGING_ACTIONS.has(a.type) && typeof a.to === "string") {
+      for (const m of a.to.matchAll(/\{\{\s*record\.(\w+)\s*\}\}/g)) out.add(m[1]);
+    }
+  }
+  return [...out];
+}
+
+/** Reject weak passwords (applied to self-service change + admin create/reset). */
+function assertPasswordStrength(pw: string): void {
+  if (!pw || pw.length < MIN_PASSWORD_LEN) {
+    throw new BadRequestError(`password must be at least ${MIN_PASSWORD_LEN} characters`);
+  }
+}
+
+/** Cookie options for the session JWT. `strict` blocks the cookie on cross-site
+ *  requests (CSRF defence-in-depth alongside the double-submit token). */
 function sessionCookieOpts(ttlSec: number) {
-  return { httpOnly: true, sameSite: "lax" as const, path: "/", maxAge: ttlSec * 1000, secure: isProduction };
+  return { httpOnly: true, sameSite: "strict" as const, path: "/", maxAge: ttlSec * 1000, secure: isProduction };
 }
 
 /** Best-effort content-type from a filename (used for inline file/image serving). */
@@ -90,6 +118,28 @@ function guessFileContentType(name: string): string {
     default: return "application/octet-stream";
   }
 }
+
+/** MIME types that are unsafe to store/serve (script/markup the browser may
+ *  execute when served inline → stored-XSS). Rejected at upload time. */
+const BLOCKED_UPLOAD_MIME = new Set([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "application/javascript",
+  "text/javascript",
+  "application/x-msdownload",
+  "application/x-sh",
+]);
+
+/** Content-types we allow to render inline on download; everything else is forced
+ *  to download as an attachment so it can never execute in the browsing context. */
+const INLINE_SAFE_MIME = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "application/pdf",
+]);
 
 /** Drop the password hash + 2FA secret before returning a user record to a client. */
 function stripHash(user: EntityRecord): Record<string, unknown> {
@@ -115,6 +165,24 @@ export function buildApiRouter(): Router {
   r.post("/auth/login", async (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as { email?: string; password?: string; code?: string; actor?: string };
+      // Throttle brute-force: cap attempts per source IP (per minute) and lock an
+      // email after repeated failures (15-min window). Cleared on a successful login.
+      const ip = clientIp(req) ?? "unknown";
+      const ipRl = rateLimit(`login:ip:${ip}`, 30, 60_000);
+      if (!ipRl.allowed) {
+        res.set("Retry-After", String(ipRl.retryAfter));
+        res.status(429).json({ error: { code: "RATE_LIMITED", message: "too many login attempts; try again later" } });
+        return;
+      }
+      const emailKey = `login:fail:${(body.email ?? "").toLowerCase()}`;
+      if (body.email) {
+        const lock = peekRateLimit(emailKey, 8);
+        if (!lock.allowed) {
+          res.set("Retry-After", String(lock.retryAfter));
+          res.status(429).json({ error: { code: "RATE_LIMITED", message: "account temporarily locked after too many failed attempts" } });
+          return;
+        }
+      }
       if (body.email && body.password) {
         const outcome = await login(body.email, body.password, body.code);
         if (outcome.status === "2fa_required") {
@@ -124,13 +192,16 @@ export function buildApiRouter(): Router {
           return;
         }
         if (outcome.status === "invalid_code") {
+          rateLimit(emailKey, 8, 15 * 60_000); // count the failed code attempt
           res.status(401).json({ error: { code: "UNAUTHENTICATED", message: "invalid authentication code" } });
           return;
         }
         if (outcome.status === "invalid") {
+          rateLimit(emailKey, 8, 15 * 60_000); // count the failed credential attempt
           res.status(401).json({ error: { code: "UNAUTHENTICATED", message: "invalid email or password" } });
           return;
         }
+        clearRateLimit(emailKey); // success resets the lockout counter
         await recordSecurityEvent({ tenantId: outcome.tenantId, orgId: outcome.orgId }, outcome.userId, "sign_in", {
           ip: clientIp(req),
           userAgent: req.headers["user-agent"] ?? null,
@@ -293,7 +364,7 @@ export function buildApiRouter(): Router {
         if (!body.currentPassword || !body.newPassword) {
           throw new BadRequestError("currentPassword and newPassword are required");
         }
-        if (body.newPassword.length < 6) throw new BadRequestError("new password must be at least 6 characters");
+        assertPasswordStrength(body.newPassword);
         const user = await findUserById(rc.userId);
         if (!user) throw new BadRequestError("no editable profile for this account");
         if (!verifyPassword(body.currentPassword, String(user.passwordHash ?? ""))) {
@@ -445,8 +516,12 @@ export function buildApiRouter(): Router {
         if (!body.email || !body.password || !body.positionId) {
           throw new BadRequestError("email, password and positionId are required");
         }
-        const qe = await getQueryEngine();
-        const record = await qe.createWithComputed(
+        assertPasswordStrength(body.password);
+        const domain = await getDomainService();
+        // Go through the domain service (not the raw query engine) so a
+        // `user.created` event is emitted — letting automations/webhooks fire
+        // when an admin adds a user (e.g. "email the newly-added user").
+        const record = await domain.createWithComputed(
           rc,
           "user",
           {
@@ -494,6 +569,7 @@ export function buildApiRouter(): Router {
           : await domain.get(rc, "user", req.params.id);
         const qe = await getQueryEngine();
         if (body.password) {
+          assertPasswordStrength(body.password);
           record = await qe.patchComputed(rc, "user", req.params.id, { passwordHash: hashPassword(body.password) });
         }
         // Admin recovery: clear a user's two-factor enrollment (e.g. lost device).
@@ -699,6 +775,18 @@ export function buildApiRouter(): Router {
     res.status(200).send(csv);
   }));
 
+  // Empty import template (one header row of the entity's writable fields), as a
+  // real .xlsx workbook (default) or CSV — the file users fill and re-import.
+  r.get("/import/:entity/template", runApi(async (rc, req, res) => {
+    assertKnownEntity(req.params.entity);
+    const format = String(req.query.format ?? "xlsx").toLowerCase() === "csv" ? "csv" : "xlsx";
+    const { buffer, contentType, ext } = await buildImportTemplate(req.params.entity, metadata, format);
+    setApiHeaders(res, rc.correlationId);
+    res.setHeader("content-type", contentType);
+    res.setHeader("content-disposition", `attachment; filename="${req.params.entity}-template.${ext}"`);
+    res.status(200).send(buffer);
+  }));
+
   // Render a report (sent pre-localized by the client) to a styled Excel workbook.
   // PDF export is the browser's print-to-PDF on the client (full Unicode + theme).
   r.post(
@@ -720,9 +808,12 @@ export function buildApiRouter(): Router {
     runApi(
       async (rc, req) => {
         assertKnownEntity(req.params.entity);
-        const body = readJson(req) as { csv?: string };
+        const body = readJson(req) as { csv?: string; xlsx?: string; aliases?: Record<string, string> };
         const domain = await getDomainService();
-        return importCsv(rc, req.params.entity, body.csv ?? "", metadata, domain);
+        // Accept either a CSV string or a base64 .xlsx workbook; `aliases` maps the
+        // user's (localized) column headers back to field names.
+        if (body.xlsx) return importXlsx(rc, req.params.entity, body.xlsx, metadata, domain, body.aliases);
+        return importCsv(rc, req.params.entity, body.csv ?? "", metadata, domain, body.aliases);
       },
       { mutating: true },
     ),
@@ -1274,8 +1365,9 @@ export function buildApiRouter(): Router {
           throw new ForbiddenError("not allowed to check out POS sales");
         }
         const body = readJson(req) as PosCheckoutInput;
+        const idempotencyKey = req.get("Idempotency-Key") || body.idempotencyKey || null;
         const pos = await getPosService();
-        return pos.checkout(rc, body);
+        return pos.checkout(rc, { ...body, idempotencyKey });
       },
       { mutating: true, status: 201 },
     ),
@@ -1370,6 +1462,7 @@ export function buildApiRouter(): Router {
         if (cart.status === "converted") throw new BadRequestError("cart already checked out");
         if (!lines.length) throw new BadRequestError("cart is empty");
         const result = await pos.checkout(rc, {
+          idempotencyKey: req.get("Idempotency-Key") || `cart:${req.params.id}`,
           branchId: (cart.branchId as string) ?? null,
           warehouseId: (cart.warehouseId as string) ?? null,
           accountId: (cart.accountId as string) ?? null,
@@ -1420,19 +1513,22 @@ export function buildApiRouter(): Router {
           notes?: string | null;
           lines?: LineInput[];
         };
-        const doc = await fin.createDocument(rc, "salesReturn", "RET", {
-          accountId: body.accountId ?? null,
-          invoiceId: body.invoiceId ?? null,
-          warehouseId: body.warehouseId ?? null,
-          branchId: body.branchId ?? null,
-          currencyCode: body.currencyCode ?? "USD",
-          returnDate: body.returnDate ?? rc.at.slice(0, 10),
-          reason: body.reason ?? null,
-          status: "draft",
-          notes: body.notes ?? null,
+        // Idempotent: a double-submit with the same key won't create two returns.
+        return withIdempotency(req.get("Idempotency-Key"), async () => {
+          const doc = await fin.createDocument(rc, "salesReturn", "RET", {
+            accountId: body.accountId ?? null,
+            invoiceId: body.invoiceId ?? null,
+            warehouseId: body.warehouseId ?? null,
+            branchId: body.branchId ?? null,
+            currencyCode: body.currencyCode ?? "USD",
+            returnDate: body.returnDate ?? rc.at.slice(0, 10),
+            reason: body.reason ?? null,
+            status: "draft",
+            notes: body.notes ?? null,
+          });
+          if (body.lines?.length) await fin.replaceLines(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id, body.lines);
+          return fin.getDocument(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id);
         });
-        if (body.lines?.length) await fin.replaceLines(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id, body.lines);
-        return fin.getDocument(rc, "salesReturn", "salesReturnLine", "salesReturnId", doc.id);
       },
       { mutating: true, status: 201 },
     ),
@@ -1492,12 +1588,17 @@ export function buildApiRouter(): Router {
       async (rc) => {
         if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
         const results = await runAllJobs(rc);
+        // Re-attempt any GL/stock postings that previously failed (idempotent).
+        const postings = await retryFailedPostings();
+        if (postings.retried > 0) {
+          results.push({ name: "posting-retry", at: rc.at, ok: postings.dead === 0, summary: `${postings.recovered} recovered, ${postings.remaining} pending, ${postings.dead} dead` });
+        }
         // Also fire any active schedule-triggered automations (force: a manual /
         // external tick runs them all now, regardless of per-rule cadence).
         const automations = await runScheduledAutomations(systemContext(rc.tenantId, rc.orgId), { force: true });
         if (automations.length) {
           const ok = automations.filter((a) => a.status === "success").length;
-          results.push({ name: "automations", at: rc.at, summary: `${ok}/${automations.length} scheduled automation(s) ran` });
+          results.push({ name: "automations", at: rc.at, ok: true, summary: `${ok}/${automations.length} scheduled automation(s) ran` });
         }
         return { results };
       },
@@ -1678,7 +1779,10 @@ export function buildApiRouter(): Router {
     ),
   );
 
-  // Dry-run a rule against a real or sample record (no side effects).
+  // Run a rule on demand. Default is a REAL run (performs the actions) against
+  // the most recent record of the trigger entity (so {{record.field}} resolves to
+  // real data); pass `{ test: true }` for a side-effect-free dry run, or
+  // `{ recordId }` / `{ sample }` to target a specific/synthetic record.
   r.post(
     "/automations/:id/run",
     runApi(
@@ -1686,20 +1790,44 @@ export function buildApiRouter(): Router {
         adminOnly(rc);
         const rule = await automationStore.getRule(rc.tenantId, rc.orgId, req.params.id);
         if (!rule) throw new NotFoundError("automation", req.params.id);
-        const body = readJson(req) as { recordId?: string; sample?: Record<string, unknown> };
+        const body = readJson(req) as { recordId?: string; sample?: Record<string, unknown>; test?: boolean };
+        const isTest = body.test === true;
+        const domain = await getDomainService();
         let record: Record<string, unknown> = body.sample ?? {};
         if (body.recordId && rule.trigger.entity) {
-          const domain = await getDomainService();
           try {
             record = await domain.get(rc, rule.trigger.entity, body.recordId);
           } catch {
             /* fall back to whatever sample was provided */
           }
+        } else if (rule.trigger.entity && Object.keys(record).length === 0) {
+          // No explicit record → run against a recent record of the trigger
+          // entity so the rule executes with real data. Prefer the newest record
+          // that actually populates the message-recipient field(s) (so a
+          // {{record.email}} send has a deliverable address), else the newest.
+          // `createdAt` isn't a declared sortable field, so order in JS rather
+          // than relying on the query engine's sort.
+          try {
+            const page = await domain.list(rc, rule.trigger.entity, { pageSize: 50 });
+            const items = [...page.items].sort((a, b) =>
+              String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
+            const refs = emailRecipientFields(rule);
+            const usable = refs.length
+              ? items.find((r) => refs.every((f) => r[f] != null && String(r[f]).trim() !== ""))
+              : undefined;
+            const chosen = usable ?? items[0];
+            if (chosen) record = chosen;
+          } catch {
+            /* entity not readable / empty — fall through to the placeholder */
+          }
         }
-        if (Object.keys(record).length === 0) record = { id: "sample", name: "Sample record" };
+        // No fabricated placeholder. When nothing resolved, run with an explicit
+        // empty record so the engine reports hasRecord=false and SKIPS
+        // record-dependent actions with a clear reason — instead of interpolating
+        // a fake {id:"manual", name:"Manual run"} into a notify/email.
         const run = await executeRule(rule, systemContext(rc.tenantId, rc.orgId), record, {
-          test: true,
-          trigger: "manual test",
+          test: isTest,
+          trigger: isTest ? "manual test" : "manual run",
         });
         return run;
       },
@@ -2137,6 +2265,10 @@ export function buildApiRouter(): Router {
         // Captured content-type → served verbatim on download (no guessing); fall
         // back to the filename guess so older clients without a type still work.
         const resolvedMime = mimeType.trim() || guessFileContentType(filename);
+        // Reject script/markup uploads that could execute as stored-XSS if served.
+        if (BLOCKED_UPLOAD_MIME.has(resolvedMime.toLowerCase().split(";")[0].trim())) {
+          throw new BadRequestError(`file type "${resolvedMime}" is not allowed`);
+        }
         const record = await domain.create(rc, "file", {
           name: filename,
           folder,
@@ -2167,11 +2299,17 @@ export function buildApiRouter(): Router {
     // `?inline=1` serves with the real content-type + inline disposition so chat
     // image attachments render in <img>; the default stays a forced download.
     // Prefer the stored mimeType (row → blob), falling back to a filename guess.
-    const inline = req.query.inline === "1" || req.query.inline === "true";
     const contentType =
       (typeof record.mimeType === "string" && record.mimeType.trim()) || blob.mimeType || guessFileContentType(name);
+    // Only render inline when both requested AND the type is on the safe list;
+    // anything else is forced to download so it can't execute in the page context.
+    const inline =
+      (req.query.inline === "1" || req.query.inline === "true") &&
+      INLINE_SAFE_MIME.has(contentType.toLowerCase().split(";")[0].trim());
     setApiHeaders(res, rc.correlationId);
     res.setHeader("content-type", inline ? contentType : "application/octet-stream");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("content-length", blob.data.length);
     res.setHeader("content-disposition", `${inline ? "inline" : "attachment"}; filename="${encodeURIComponent(name)}"`);
     res.end(blob.data);
   }));
@@ -2187,6 +2325,9 @@ export function buildApiRouter(): Router {
           .map((t) => String(t).trim())
           .filter(Boolean);
         if (recipients.length === 0) throw new BadRequestError("`to` is required");
+        if (recipients.length > 100) throw new BadRequestError("too many recipients (max 100)");
+        if ((body.subject ?? "").length > 512) throw new BadRequestError("subject too long (max 512)");
+        if ((body.body ?? "").length > 100_000) throw new BadRequestError("body too long (max 100KB)");
         const domain = await getDomainService();
         const scope = { tenantId: rc.tenantId, orgId: rc.orgId };
         const emailCfg = await automationStore.resolveEmail(rc.tenantId, rc.orgId);

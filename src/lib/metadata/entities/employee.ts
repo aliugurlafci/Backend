@@ -14,6 +14,9 @@ export const employeeEntity: EntityDef = {
     { name: "phone", label: "Phone", type: "phone", pii: true },
     { name: "title", label: "Job Title", type: "string", searchable: true, sortable: true, suggest: true },
     { name: "departmentId", label: "Department", type: "reference", referenceEntity: "department", filterable: true },
+    // Manager (üst amir) — pickable from employees OR users; stored as
+    // "employee:<id>" / "user:<id>". Drives department headcount.
+    { name: "managerRef", label: "Manager", type: "string", personPicker: true, filterable: true },
     { name: "branchId", label: "Branch", type: "reference", referenceEntity: "branch", filterable: true },
     { name: "dealerId", label: "Dealer", type: "reference", referenceEntity: "dealer", filterable: true },
     {

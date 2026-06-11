@@ -110,6 +110,14 @@ export class BadRequestError extends AppError {
 
 export function toAppError(err: unknown): AppError {
   if (err instanceof AppError) return err;
+  // express body-parser failures → a clear 4xx instead of an opaque 500.
+  const e = err as { type?: string; status?: number; statusCode?: number };
+  if (e?.type === "entity.too.large" || e?.status === 413 || e?.statusCode === 413) {
+    return new AppError("BAD_REQUEST", 413, "The uploaded file is too large.");
+  }
+  if (err instanceof SyntaxError && /\bJSON\b/i.test(err.message)) {
+    return new BadRequestError("Malformed request body.");
+  }
   const message = err instanceof Error ? err.message : String(err);
   return new AppError("INTERNAL", 500, message, undefined, false);
 }

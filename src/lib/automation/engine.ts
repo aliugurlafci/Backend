@@ -105,12 +105,145 @@ function interpolate(template: string | undefined, record: Rec): string {
   });
 }
 
+/** The `{{record.field}}` tokens inside a single template string. */
+function templateTokens(template: string | undefined): string[] {
+  if (!template) return [];
+  return [...template.matchAll(/\{\{\s*(?:record\.)?([\w.]+)\s*\}\}/g)].map((m) => m[1]);
+}
+
+/**
+ * Explain *why* a recipient resolved empty so the run trace is actionable: when
+ * the address was a `{{record.field}}` reference, name the field(s) that came
+ * back blank (the record has no such value) instead of a generic "no recipient".
+ */
+function recipientSkipReason(template: string | undefined): string {
+  const refs = templateTokens(template);
+  if (refs.length > 0) {
+    return `no recipient — ${refs.map((r) => `{{${r}}}`).join(", ")} is empty on this record`;
+  }
+  return "no recipient — set a 'To' address or a {{field}} reference";
+}
+
+// ---- record hydration -------------------------------------------------------
+
+/**
+ * Every record field a rule reads: condition-leaf fields plus `{{record.field}}`
+ * tokens in any action template (recursing into branch/parallel lanes). Used to
+ * decide which fields a run needs before it can interpolate them.
+ */
+function referencedFields(rule: AutomationRule): Set<string> {
+  const fields = new Set<string>();
+  const fromGroup = (g: ConditionGroup): void => {
+    for (const c of g.children) {
+      if (c.type === "group") fromGroup(c);
+      else if (c.field) fields.add(c.field);
+    }
+  };
+  const fromTemplate = (s: string | undefined): void => {
+    for (const tok of templateTokens(s)) fields.add(tok.split(".")[0]);
+  };
+  const fromActions = (actions: AutomationAction[]): void => {
+    for (const a of actions) {
+      fromTemplate(a.to);
+      fromTemplate(a.subject);
+      fromTemplate(a.body);
+      fromTemplate(a.value);
+      fromTemplate(a.taskSubject);
+      fromTemplate(a.url);
+      for (const as of a.assignments ?? []) fromTemplate(as.value);
+      if (a.condition) fromGroup(a.condition);
+      if (a.thenActions) fromActions(a.thenActions);
+      if (a.elseActions) fromActions(a.elseActions);
+      for (const lane of a.lanes ?? []) fromActions(lane);
+    }
+  };
+  fromGroup(rule.conditions);
+  fromActions(rule.actions);
+  return fields;
+}
+
+function isBlank(v: unknown): boolean {
+  return v === undefined || v === null || String(v).trim() === "";
+}
+
+/**
+ * Whether a run holds a real, fetchable triggering record — as opposed to NO
+ * record at all (a schedule tick, a manual run with nothing selected, a thin
+ * event that lost its id). A genuine entity id is non-empty and not the legacy
+ * "manual" sentinel. This is the single source of truth for the engine's
+ * `hasRecord` gating: actions that read `{{record.*}}` or act on a record by id
+ * are SKIPPED with a clear reason (never run against fabricated values) when this
+ * is false — which is the fix for the "Manual run" placeholder leaking into a
+ * notify/email and for schedule rules silently interpolating empty fields.
+ */
+function recordHasRealId(record: Rec): boolean {
+  const id = record.id;
+  return id != null && id !== "manual" && String(id).trim() !== "";
+}
+
+/** The `{{record.*}}` field tokens an action reads in its OWN templates (not
+ *  recursing — branch/parallel gate their children individually). Drives the
+ *  no-record skip: an action with any record token depends on the record. */
+function actionRecordTokens(action: AutomationAction): string[] {
+  const out = new Set<string>();
+  const add = (s: string | undefined): void => {
+    for (const tok of templateTokens(s)) out.add(tok);
+  };
+  add(action.to);
+  add(action.subject);
+  add(action.body);
+  add(action.taskSubject);
+  add(action.value);
+  add(action.url);
+  for (const as of action.assignments ?? []) add(as.value);
+  return [...out];
+}
+
+/** Actions that act ON the triggering record by id — meaningless without one. */
+const ACTION_NEEDS_RECORD_ID = new Set<AutomationAction["type"]>([
+  "update_record",
+  "update_stage",
+  "assign_owner",
+  "ai_score",
+]);
+
+/**
+ * Guarantee a run sees a *complete* record. Domain event payloads are not
+ * uniform — the generic create/update/transition events carry the full record,
+ * but `deleted` carries only `{id}` and bespoke (e.g. purchasing) events ship a
+ * thin `{id, …}`. So when the rule is entity-scoped and we hold a real id, fetch
+ * the live record and merge it in (transient payload keys like from/to survive;
+ * persisted fields win). This single point is what makes `{{record.*}}` resolve
+ * reliably regardless of which event fired.
+ *
+ * No-ops — adding no read — when there is no real record (schedule ticks, manual
+ * runs with nothing selected), when the rule reads no record fields, and when the
+ * payload already carries every referenced field (the common full-payload case).
+ */
+async function hydrateRecord(ctx: RequestContext, rule: AutomationRule, record: Rec): Promise<Rec> {
+  const entity = rule.trigger.entity;
+  if (!entity || !recordHasRealId(record)) return record;
+  const needed = referencedFields(rule);
+  if (needed.size === 0) return record; // rule reads no record fields
+  if (![...needed].some((f) => isBlank(record[f]))) return record; // payload already complete
+  try {
+    const qe = await getQueryEngine();
+    const full = await qe.get(ctx, entity, String(record.id));
+    return { ...record, ...full };
+  } catch {
+    return record; // record deleted / unreadable — interpolate with what we have
+  }
+}
+
 // ---- execution --------------------------------------------------------------
 
 interface ExecContext {
   ctx: RequestContext;
   entity?: string;
   record: Rec;
+  /** Whether this run has a real triggering record (see recordHasRealId). When
+   *  false, record-dependent actions are skipped with a reason. */
+  hasRecord: boolean;
   dry: boolean;
   steps: RunStep[];
   output: Record<string, number>;
@@ -150,6 +283,24 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
   const step: RunStep = { name: labelFor(action), type: action.type, status: "ok", ms: 0 };
   try {
     const id = ec.record.id ? String(ec.record.id) : null;
+    // No-record gate: when the run has no real triggering record, skip any action
+    // that reads {{record.*}} or acts on a record by id — surfacing a clear reason
+    // instead of firing against a fabricated/empty record (the "Manual run"
+    // notification bug). Container actions (branch/parallel) are not gated here;
+    // their child actions are gated individually when they run.
+    if (!ec.hasRecord && action.type !== "branch" && action.type !== "parallel") {
+      const tokens = actionRecordTokens(action);
+      if (tokens.length > 0 || ACTION_NEEDS_RECORD_ID.has(action.type)) {
+        step.status = "skipped";
+        step.output =
+          tokens.length > 0
+            ? `no record — references ${tokens.map((tk) => `{{${tk}}}`).join(", ")} (run from an event or pick a record)`
+            : "no record — this action targets a record (run from an event or pick a record)";
+        step.ms = Date.now() - t0;
+        ec.steps.push(step);
+        return;
+      }
+    }
     switch (action.type) {
       case "send_email": {
         const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
@@ -157,7 +308,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
         const text = interpolate(action.body, ec.record) || "Sent by automation.";
         if (!to) {
           step.status = "skipped";
-          step.output = "no recipient — set a 'To' address or a {{field}} reference";
+          step.output = recipientSkipReason(action.to);
           break;
         }
         if (!ec.dry) {
@@ -190,7 +341,14 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
       case "send_whatsapp":
       case "notify": {
         const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
-        const to = interpolate(action.to, ec.record);
+        const to = interpolate(action.to, ec.record).trim();
+        // SMS/WhatsApp need a recipient — skip (like send_email) when the address
+        // resolves empty. `notify` is a team broadcast and may have no address.
+        if (action.type !== "notify" && !to) {
+          step.status = "skipped";
+          step.output = recipientSkipReason(action.to);
+          break;
+        }
         if (!ec.dry) {
           notifications.add({
             at: ec.ctx.at,
@@ -494,10 +652,15 @@ export async function executeRule(
   const t0 = Date.now();
   markStart(ctx, rule.id);
   try {
+  // Hydrate first so conditions, actions and the run's input snapshot all see a
+  // complete record — even when the triggering event carried only an id.
+  const hydrated = await hydrateRecord(ctx, rule, record);
+  const hasRecord = recordHasRealId(hydrated);
   const ec: ExecContext = {
     ctx,
     entity: rule.trigger.entity,
-    record,
+    record: hydrated,
+    hasRecord,
     dry: opts.test,
     steps: [
       {
@@ -505,7 +668,7 @@ export async function executeRule(
         type: "trigger",
         status: "ok",
         ms: 0,
-        output: rule.trigger.entity ? `record ${record.id ?? ""}` : opts.trigger,
+        output: rule.trigger.entity ? (hasRecord ? `record ${hydrated.id}` : "no record") : opts.trigger,
       },
     ],
     output: {},
@@ -513,7 +676,7 @@ export async function executeRule(
 
   // Condition gate.
   const leaves = countLeaves(rule.conditions);
-  const passed = evaluateGroup(rule.conditions, record);
+  const passed = evaluateGroup(rule.conditions, hydrated);
   ec.steps.push({
     name: leaves ? `Conditions (${leaves})` : "Conditions",
     type: "condition",
@@ -544,7 +707,7 @@ export async function executeRule(
     ruleName: rule.name,
     status,
     trigger: opts.trigger,
-    input: record,
+    input: hydrated,
     output: ec.output,
     steps: ec.steps,
     startedAt,
@@ -559,7 +722,14 @@ export async function executeRule(
   // Failure handling for live runs: enqueue to retry, alert if configured. When
   // the run *is* a queue item being processed, the queue processor owns its
   // lifecycle (attempts/backoff/dead), so we don't enqueue a duplicate here.
-  if (!opts.test && !opts.fromQueue && status === "failed") {
+  //
+  // Only replay-worthy runs are enqueued: a failed run with a real record, or a
+  // schedule rule (whose legitimate input is {scheduledAt}). A no-record run of
+  // an entity rule (e.g. a manual run with nothing selected) is NOT enqueued —
+  // replaying it would just re-skip its record-dependent actions every scheduler
+  // tick, which is the background-notification recurrence we must not create.
+  const replayable = hasRecord || rule.trigger.kind === "schedule";
+  if (!opts.test && !opts.fromQueue && status === "failed" && replayable) {
     const settings = await automationStore.getSettings(ctx.tenantId, ctx.orgId);
     await automationStore.enqueue({
       tenantId: ctx.tenantId,
@@ -572,7 +742,7 @@ export async function executeRule(
       nextAttemptAt: new Date(Date.now() + 5 * 60_000).toISOString(),
       enqueuedAt: finishedAt,
       lastError: error,
-      input: record,
+      input: hydrated,
     });
     if (settings.failureAlerts) {
       notifications.add({

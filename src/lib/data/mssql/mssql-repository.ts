@@ -8,6 +8,8 @@
  * WHERE / ORDER BY / OFFSET-FETCH / GROUP BY and maps optimistic concurrency to
  * version-guarded UPDATE/DELETE.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { env } from "@/lib/config/env";
 import { BadRequestError, ConflictError } from "@/lib/enforcement/errors";
 import type { EntityRecord } from "@/lib/metadata/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
@@ -58,6 +60,13 @@ function escapeLike(term: string): string {
   return term.replace(/[\\%_[]/g, (ch) => `\\${ch}`);
 }
 
+/**
+ * The active SQL transaction for the current async call chain (set by
+ * `runInTransaction`). Statements issued while one is present run on the
+ * transaction's connection, so they commit/rollback together.
+ */
+const activeTx = new AsyncLocalStorage<sql.Transaction>();
+
 function nvarchar(len: number): sql.ISqlType {
   return sql.NVarChar(len) as unknown as sql.ISqlType;
 }
@@ -87,7 +96,29 @@ export class MssqlRepository implements Repository {
   }
 
   private async request(): Promise<sql.Request> {
+    const tx = activeTx.getStore();
+    if (tx) return new sql.Request(tx); // bound to the open transaction
     return (await getPool()).request();
+  }
+
+  /**
+   * Atomic block: opens a SQL transaction (BEGIN TRAN), runs `fn` with every
+   * statement bound to it via AsyncLocalStorage, then COMMIT — or ROLLBACK if
+   * `fn` throws. Nested calls join the outer transaction (single boundary).
+   */
+  async runInTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (activeTx.getStore()) return fn(); // already in a transaction — join it
+    const tx = new sql.Transaction(await getPool());
+    await tx.begin();
+    let committed = false;
+    try {
+      const result = await activeTx.run(tx, fn);
+      await tx.commit();
+      committed = true;
+      return result;
+    } finally {
+      if (!committed) await tx.rollback().catch(() => {});
+    }
   }
 
   private scopeClause(scope: TenantScope, p: Params): string {
@@ -224,6 +255,37 @@ export class MssqlRepository implements Repository {
       `SET IDENTITY_INSERT ${t} OFF;`;
     await p.apply(await this.request()).query(text);
     return record;
+  }
+
+  async bulkInsert(entity: string, records: EntityRecord[]): Promise<EntityRecord[]> {
+    if (records.length === 0) return [];
+    const t = tableName(entity);
+    // Runtime create: let IDENTITY assign ids (same as insert's id-less path).
+    const cols = this.cols(entity).filter((c) => !c.identity);
+    const names = cols.map((c) => ident(c.name)).join(", ");
+
+    // SQL Server caps a single request at 2100 parameters and an INSERT…VALUES
+    // at 1000 row-expressions. Chunk to stay under both (with headroom).
+    const perRow = Math.max(1000, cols.length);
+    const chunkSize = Math.max(1, Math.min(1000, Math.floor(2000 / perRow)));
+
+    const out: EntityRecord[] = [];
+    for (let i = 0; i < records.length; i += chunkSize) {
+      const chunk = records.slice(i, i + chunkSize);
+      const p = new Params();
+      const tuples = chunk.map((rec) => {
+        const data = rec as Record<string, unknown>;
+        return `(${cols.map((c) => p.col(c, data[c.name])).join(", ")})`;
+      });
+      const text =
+        `INSERT INTO ${t} (${names}) OUTPUT INSERTED.${ident("id")} AS [id] VALUES ${tuples.join(", ")}`;
+      const result = await p.apply(await this.request()).query(text);
+      const ids = (result.recordset as Array<{ id: unknown }>).map((r) => r.id);
+      // OUTPUT row order is not guaranteed to match VALUES order, so we don't
+      // map ids back to specific inputs — callers only need the created set/count.
+      chunk.forEach((rec, j) => out.push({ ...rec, id: String(ids[j] ?? "") }));
+    }
+    return out;
   }
 
   async update(
@@ -364,16 +426,28 @@ export class MssqlRepository implements Repository {
     });
   }
 
-  /** System-level scan across every entity table (used for search reindex). */
+  /** System-level scan across every entity table (used for search reindex).
+   *  Reads tables with bounded concurrency: on a cloud SQL each SELECT is a
+   *  round-trip, so a serial scan of ~50 tables added tens of seconds to boot. */
   async scanAll(): Promise<{ entity: string; record: EntityRecord }[]> {
-    const out: { entity: string; record: EntityRecord }[] = [];
-    for (const entity of this.metadata.listEntities()) {
-      const selectCols = this.cols(entity.name).map((c) => ident(c.name)).join(", ");
-      const result = await (await this.request()).query(`SELECT ${selectCols} FROM ${tableName(entity.name)}`);
-      for (const row of result.recordset as Array<Record<string, unknown>>) {
-        out.push({ entity: entity.name, record: this.toRecord(entity.name, row) });
+    const entities = this.metadata.listEntities();
+    const lanes = Math.max(2, (env.MSSQL_POOL_MAX || 8) - 1);
+    const results: { entity: string; record: EntityRecord }[][] = new Array(entities.length);
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= entities.length) return;
+        const entity = entities[i];
+        const selectCols = this.cols(entity.name).map((c) => ident(c.name)).join(", ");
+        const result = await (await this.request()).query(`SELECT ${selectCols} FROM ${tableName(entity.name)}`);
+        results[i] = (result.recordset as Array<Record<string, unknown>>).map((row) => ({
+          entity: entity.name,
+          record: this.toRecord(entity.name, row),
+        }));
       }
-    }
-    return out;
+    };
+    await Promise.all(Array.from({ length: Math.min(lanes, entities.length) }, () => worker()));
+    return results.flat();
   }
 }

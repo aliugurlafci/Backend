@@ -60,6 +60,13 @@ export interface FieldDef {
    * in the data (e.g. Job Title), so users reuse defined values without an enum.
    */
   suggest?: boolean;
+  /**
+   * For string fields: render a combined people picker (employees + users) and
+   * store the choice as `"employee:<id>"` / `"user:<id>"`. Lets one field point at
+   * a person from either entity (e.g. a department's manager). Treated as a plain
+   * string by the backend; the UI provides the picker and name resolution.
+   */
+  personPicker?: boolean;
 }
 
 /** A finite-state lifecycle attached to an entity (Phase 7 consumes this). */

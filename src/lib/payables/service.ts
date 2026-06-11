@@ -12,6 +12,8 @@ import type { QueryEngine } from "@/lib/data/query-engine";
 import { numberSequence, NumberSequence } from "@/lib/finance/number-sequence";
 import { getFinanceService, type FinanceService, type LineInput, type DocumentResult } from "@/lib/finance/service";
 import { postVendorBillGL, postBillPaymentGL } from "@/lib/accounting/postings";
+import { BadRequestError } from "@/lib/enforcement/errors";
+import { retryOnConflict } from "@/lib/data/optimistic";
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -65,41 +67,54 @@ export class PayablesService {
     return page.items;
   }
 
-  /** Pay a bill: record payment, post AP/Cash, recompute amountPaid/balance/status. */
+  /** Pay a bill: record payment, post AP/Cash, recompute — atomically, no overpay. */
   async payBill(ctx: RequestContext, billId: string, input: BillPaymentInput): Promise<EntityRecord> {
     const sys = this.sys(ctx);
     const bill = await this.qe.get(sys, "vendorBill", billId);
-    const number = await this.seq.next(ctx.tenantId, "BPAY");
-    const payment = await this.qe.createWithComputed(
-      sys,
-      "billPayment",
-      {
-        billId,
-        supplierId: bill.supplierId,
-        branchId: bill.branchId ?? null,
-        amount: input.amount,
-        method: input.method,
-        paidAt: input.paidAt,
-        notes: input.notes ?? null,
-      },
-      { number },
+    if (!(input.amount > 0)) throw new BadRequestError("payment amount must be positive");
+    const already = round2(
+      (await this.listBillPayments(sys, billId)).reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0),
     );
-    await postBillPaymentGL(sys, payment);
-    return this.recomputeBill(sys, billId);
+    const balance = round2(Number(bill.total ?? 0) - already);
+    if (input.amount > balance + 0.005) {
+      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`);
+    }
+    return this.qe.runInTransaction(async () => {
+      const number = await this.seq.next(ctx.tenantId, "BPAY");
+      const payment = await this.qe.createWithComputed(
+        sys,
+        "billPayment",
+        {
+          billId,
+          supplierId: bill.supplierId,
+          branchId: bill.branchId ?? null,
+          amount: input.amount,
+          method: input.method,
+          paidAt: input.paidAt,
+          notes: input.notes ?? null,
+        },
+        { number },
+      );
+      await postBillPaymentGL(sys, payment);
+      return this.recomputeBill(sys, billId);
+    });
   }
 
   private async recomputeBill(ctx: RequestContext, billId: string): Promise<EntityRecord> {
-    const bill = await this.qe.get(ctx, "vendorBill", billId);
-    const payments = await this.listBillPayments(ctx, billId);
-    const amountPaid = round2(payments.reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0));
-    const total = Number(bill.total ?? 0);
-    const balance = round2(total - amountPaid);
-    let status = String(bill.status);
-    if (status !== "void") {
-      if (balance <= 0 && total > 0) status = "paid";
-      else if (amountPaid > 0) status = "partial";
-    }
-    return this.qe.patchComputed(ctx, "vendorBill", billId, { amountPaid, balance, status });
+    // Version-guarded so concurrent bill payments can't lose each other's totals.
+    return retryOnConflict(async () => {
+      const bill = await this.qe.get(ctx, "vendorBill", billId);
+      const payments = await this.listBillPayments(ctx, billId);
+      const amountPaid = round2(payments.reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0));
+      const total = Number(bill.total ?? 0);
+      const balance = round2(total - amountPaid);
+      let status = String(bill.status);
+      if (status !== "void") {
+        if (balance <= 0 && total > 0) status = "paid";
+        else if (amountPaid > 0) status = "partial";
+      }
+      return this.qe.patchComputed(ctx, "vendorBill", billId, { amountPaid, balance, status }, bill.version);
+    });
   }
 }
 

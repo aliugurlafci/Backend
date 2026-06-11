@@ -10,13 +10,20 @@ import { systemContext } from "@/lib/context/resolver";
 import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
 import { getFinanceService } from "@/lib/finance/service";
 import { runScheduledAutomations, processQueue } from "@/lib/automation/engine";
+import { retryFailedPostings } from "@/lib/accounting/postings";
 import { logger } from "@/lib/observability/logger";
 
 export interface JobResult {
   name: string;
   at: string;
   summary: string;
+  ok: boolean;
+  /** Consecutive failures so far; jobs are idempotent and re-run every tick. */
+  failStreak?: number;
 }
+
+/** A job that has failed this many ticks in a row is escalated (dead-letter alert). */
+const JOB_DLQ_THRESHOLD = 3;
 
 export interface JobDef {
   name: string;
@@ -50,11 +57,18 @@ export const JOBS: JobDef[] = [
 
 class JobRunLog {
   private last = new Map<string, JobResult>();
+  /** Consecutive-failure counter per job (resets on success). */
+  private streak = new Map<string, number>();
   record(r: JobResult): void {
     this.last.set(r.name, r);
   }
   get(name: string): JobResult | undefined {
     return this.last.get(name);
+  }
+  bumpStreak(name: string, failed: boolean): number {
+    const next = failed ? (this.streak.get(name) ?? 0) + 1 : 0;
+    this.streak.set(name, next);
+    return next;
   }
 }
 
@@ -65,14 +79,23 @@ export async function runAllJobs(ctx: RequestContext): Promise<JobResult[]> {
   for (const job of JOBS) {
     try {
       const summary = await job.run(ctx);
-      const result = { name: job.name, at: ctx.at, summary };
+      jobLog.bumpStreak(job.name, false);
+      const result: JobResult = { name: job.name, at: ctx.at, summary, ok: true, failStreak: 0 };
       jobLog.record(result);
       results.push(result);
     } catch (e) {
+      // Jobs are idempotent and re-run every tick, so this IS the retry; we track
+      // the consecutive-failure streak and escalate (dead-letter) on persistence.
+      const failStreak = jobLog.bumpStreak(job.name, true);
       const summary = `failed: ${e instanceof Error ? e.message : String(e)}`;
-      jobLog.record({ name: job.name, at: ctx.at, summary });
-      results.push({ name: job.name, at: ctx.at, summary });
-      logger.error("scheduled job failed", { job: job.name, error: summary });
+      const result: JobResult = { name: job.name, at: ctx.at, summary, ok: false, failStreak };
+      jobLog.record(result);
+      results.push(result);
+      if (failStreak >= JOB_DLQ_THRESHOLD) {
+        logger.error("scheduled job repeatedly failing (dead-letter — needs attention)", { job: job.name, failStreak, error: summary });
+      } else {
+        logger.error("scheduled job failed (will retry next tick)", { job: job.name, failStreak, error: summary });
+      }
     }
   }
   return results;
@@ -109,6 +132,7 @@ export function startScheduler(): void {
     try {
       const ctx = systemContext(DEMO_TENANT, DEMO_ORG);
       await runAllJobs(ctx);
+      await retryFailedPostings(); // re-attempt any GL/stock postings that failed
       await runScheduledAutomations(ctx); // cadence-aware (no force)
       await processQueue(ctx); // drain pending + due-retry items to completion
     } catch (e) {

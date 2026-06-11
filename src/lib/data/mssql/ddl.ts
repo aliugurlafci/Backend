@@ -18,6 +18,8 @@ function ddlColumnType(col: ColumnDesc): string {
   switch (col.kind) {
     case "float":
       return "FLOAT";
+    case "decimal":
+      return `DECIMAL(${col.precision ?? 18},${col.scale ?? 2})`;
     case "bit":
       return "BIT";
     case "int":
@@ -105,6 +107,45 @@ export function entityStatements(entity: EntityDef): string[] {
   }
 
   return stmts;
+}
+
+/**
+ * Foreign-key constraints for an entity's reference fields — referential
+ * integrity at the DB layer (no orphan invoiceLine, journalLine, payment…).
+ *
+ * The parent→child relationship of a line-item entity gets ON DELETE CASCADE
+ * (deleting an invoice removes its lines); every other reference uses NO ACTION
+ * (can't delete a row that's still referenced, and no multiple-cascade-path
+ * ambiguity). Emitted as guarded ALTERs so they're idempotent, and run in a
+ * tolerant pass by the migrator so a single FK can never block provisioning.
+ * Only references whose target entity actually has a table are emitted.
+ */
+export function foreignKeyStatements(entity: EntityDef, knownEntities: Set<string>): string[] {
+  const t = entity.name;
+  const stmts: string[] = [];
+  for (const f of entity.fields) {
+    if (f.type !== "reference" || !f.referenceEntity) continue;
+    if (!knownEntities.has(f.referenceEntity)) continue; // target must be a real table
+    const target = f.referenceEntity;
+    const fkName = `FK_${t}_${f.name}`;
+    const isParentEdge = entity.parent?.entity === target && entity.parent?.field === f.name;
+    // Self-references (e.g. ledgerAccount.parentId) can't cascade in SQL Server.
+    const onDelete = isParentEdge && target !== t ? "ON DELETE CASCADE" : "ON DELETE NO ACTION";
+    stmts.push(
+      `IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'${fkName}')\n` +
+        `ALTER TABLE [dbo].${ident(t)} ADD CONSTRAINT [${fkName}] ` +
+        `FOREIGN KEY (${ident(f.name)}) REFERENCES [dbo].${ident(target)}(${ident("id")}) ${onDelete};`,
+    );
+  }
+  return stmts;
+}
+
+/** All FK statements across the given entities (run after every table exists). */
+export function allForeignKeyStatements(entities: EntityDef[]): string[] {
+  const known = new Set(entities.map((e) => e.name));
+  const out: string[] = [];
+  for (const entity of entities) out.push(...foreignKeyStatements(entity, known));
+  return out;
 }
 
 /** Platform support tables (schema-version ledger + document number counters). */

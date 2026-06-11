@@ -18,7 +18,8 @@ import { getInventoryService } from "@/lib/inventory/service";
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 const today = (ctx: RequestContext): string => ctx.at.slice(0, 10);
 
-/** Customer invoice → Dr AR, Cr Revenue (+ Cr Tax), then COGS for stock lines. */
+/** Customer invoice → Dr AR, Cr Revenue (+ Cr Tax), then COGS for stock lines.
+ *  The AR entry, the stock issue and the COGS entry commit together (atomic). */
 export async function postInvoiceGL(ctx: RequestContext, invoiceId: string): Promise<void> {
   const qe = await getQueryEngine();
   const acc = await getAccountingService();
@@ -28,22 +29,35 @@ export async function postInvoiceGL(ctx: RequestContext, invoiceId: string): Pro
   const subtotal = round2(Number(inv.subtotal ?? 0));
   const tax = round2(Number(inv.taxTotal ?? 0));
 
-  const lines: JournalLineInput[] = [
-    { ledgerAccountId: await acc.requireAccount(ctx, "accounts_receivable"), debit: total },
-    { ledgerAccountId: await acc.requireAccount(ctx, "sales_revenue"), credit: subtotal },
-  ];
-  if (tax > 0) lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "tax_payable"), credit: tax });
+  await qe.runInTransaction(async () => {
+    const lines: JournalLineInput[] = [
+      { ledgerAccountId: await acc.requireAccount(ctx, "accounts_receivable"), debit: total },
+      { ledgerAccountId: await acc.requireAccount(ctx, "sales_revenue"), credit: subtotal },
+    ];
+    if (tax > 0) lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "tax_payable"), credit: tax });
 
-  await acc.postFromSource(ctx, {
-    source: "invoice",
-    sourceRef: invoiceId,
-    date: String(inv.issueDate ?? today(ctx)),
-    memo: `Invoice ${String(inv.number)}`,
-    branchId: (inv.branchId as string) ?? null,
-    lines,
+    await acc.postFromSource(ctx, {
+      source: "invoice",
+      sourceRef: invoiceId,
+      date: String(inv.issueDate ?? today(ctx)),
+      memo: `Invoice ${String(inv.number)}`,
+      branchId: (inv.branchId as string) ?? null,
+      lines,
+    });
+
+    await postInvoiceCOGS(ctx, inv);
   });
+}
 
-  await postInvoiceCOGS(ctx, inv);
+/** Resolve the warehouse an invoice issues stock from: its explicit warehouse
+ *  (POS / picking), else its branch's warehouse, else any warehouse. */
+async function resolveIssueWarehouse(ctx: RequestContext, inv: EntityRecord): Promise<EntityRecord | undefined> {
+  const qe = await getQueryEngine();
+  const explicitWh = inv.warehouseId ? await qe.get(ctx, "warehouse", String(inv.warehouseId)).catch(() => undefined) : undefined;
+  const branchWh = !explicitWh && inv.branchId
+    ? (await qe.list(ctx, "warehouse", { filters: [{ field: "branchId", op: "eq", value: inv.branchId }], pageSize: 1 })).items[0]
+    : undefined;
+  return explicitWh ?? branchWh ?? (await qe.list(ctx, "warehouse", { pageSize: 1 })).items[0];
 }
 
 /** Issue stock + post COGS for each stock-tracked invoice line. */
@@ -57,13 +71,7 @@ async function postInvoiceCOGS(ctx: RequestContext, inv: EntityRecord): Promise<
     pageSize: 200,
   });
 
-  // Resolve a warehouse to issue from: the invoice's explicit warehouse (set by
-  // POS / picking), else the invoice's branch, else any warehouse.
-  const explicitWh = inv.warehouseId ? await qe.get(ctx, "warehouse", String(inv.warehouseId)).catch(() => undefined) : undefined;
-  const branchWh = !explicitWh && inv.branchId
-    ? (await qe.list(ctx, "warehouse", { filters: [{ field: "branchId", op: "eq", value: inv.branchId }], pageSize: 1 })).items[0]
-    : undefined;
-  const warehouse = explicitWh ?? branchWh ?? (await qe.list(ctx, "warehouse", { pageSize: 1 })).items[0];
+  const warehouse = await resolveIssueWarehouse(ctx, inv);
   if (!warehouse) return;
 
   let cogsTotal = 0;
@@ -100,6 +108,79 @@ async function postInvoiceCOGS(ctx: RequestContext, inv: EntityRecord): Promise<
       { ledgerAccountId: await acc.requireAccount(ctx, "cogs"), debit: cogsTotal },
       { ledgerAccountId: await acc.requireAccount(ctx, "inventory"), credit: cogsTotal },
     ],
+  });
+}
+
+/** Void a posted invoice → reverse AR/Revenue/Tax + restock issued stock and
+ *  reverse COGS. Idempotent via distinct void source refs, so re-voiding is a
+ *  no-op. Keeps the GL + AR sub-ledger + stock ledger consistent on cancellation. */
+export async function reverseInvoiceGL(ctx: RequestContext, invoiceId: string): Promise<void> {
+  const qe = await getQueryEngine();
+  const acc = await getAccountingService();
+  const inventory = await getInventoryService();
+  const inv = await qe.get(ctx, "invoice", invoiceId);
+  const total = round2(Number(inv.total ?? 0));
+  // Only reverse if the invoice was actually posted to the GL.
+  const postedAr = await qe.list(ctx, "journalEntry", {
+    filters: [
+      { field: "source", op: "eq", value: "invoice" },
+      { field: "sourceRef", op: "eq", value: invoiceId },
+      { field: "status", op: "eq", value: "posted" },
+    ],
+    pageSize: 1,
+  });
+  if (total <= 0 || postedAr.total === 0) return;
+  const subtotal = round2(Number(inv.subtotal ?? 0));
+  const tax = round2(Number(inv.taxTotal ?? 0));
+
+  await qe.runInTransaction(async () => {
+    const arLines: JournalLineInput[] = [
+      { ledgerAccountId: await acc.requireAccount(ctx, "sales_revenue"), debit: subtotal },
+      { ledgerAccountId: await acc.requireAccount(ctx, "accounts_receivable"), credit: total },
+    ];
+    if (tax > 0) arLines.splice(1, 0, { ledgerAccountId: await acc.requireAccount(ctx, "tax_payable"), debit: tax });
+    await acc.postFromSource(ctx, {
+      source: "invoiceVoid",
+      sourceRef: invoiceId,
+      date: today(ctx),
+      memo: `Void invoice ${String(inv.number)}`,
+      branchId: (inv.branchId as string) ?? null,
+      lines: arLines,
+    });
+
+    // Restock issued goods (receipt) + reverse COGS (Dr Inventory, Cr COGS).
+    const warehouse = await resolveIssueWarehouse(ctx, inv);
+    if (!warehouse) return;
+    const linesPage = await qe.list(ctx, "invoiceLine", { filters: [{ field: "invoiceId", op: "eq", value: inv.id }], pageSize: 200 });
+    let cogsTotal = 0;
+    for (const line of linesPage.items) {
+      if (!line.productId) continue;
+      const product = await qe.get(ctx, "product", String(line.productId));
+      if (!product.trackStock) continue;
+      const qty = Number(line.qty ?? 0);
+      if (qty <= 0) continue;
+      const cost = round2(Number(product.costPrice ?? 0));
+      await inventory.writeMovement(ctx, {
+        productId: String(line.productId), warehouseId: String(warehouse.id), qty,
+        type: "receipt", unitCost: cost, ref: `${String(inv.id)}:void`, refType: "invoice",
+        branchId: (inv.branchId as string) ?? null, movedAt: ctx.at,
+      });
+      cogsTotal += round2(qty * cost);
+    }
+    cogsTotal = round2(cogsTotal);
+    if (cogsTotal > 0) {
+      await acc.postFromSource(ctx, {
+        source: "stockIssueVoid",
+        sourceRef: String(inv.id),
+        date: today(ctx),
+        memo: `Void COGS for ${String(inv.number)}`,
+        branchId: (inv.branchId as string) ?? null,
+        lines: [
+          { ledgerAccountId: await acc.requireAccount(ctx, "inventory"), debit: cogsTotal },
+          { ledgerAccountId: await acc.requireAccount(ctx, "cogs"), credit: cogsTotal },
+        ],
+      });
+    }
   });
 }
 
@@ -145,19 +226,36 @@ export async function postGoodsReceiptGL(
   });
 }
 
-/** Vendor bill received → Dr GR/IR (or Expense) + Tax, Cr Accounts Payable. */
+/** Vendor bill received → Dr GR/IR (or Expense) + Tax, Cr Accounts Payable.
+ *  3-way match: when linked to a GRN, GR/IR is cleared for the *receipt* value and
+ *  any difference vs the billed subtotal is posted to Purchase Price Variance, so
+ *  GR/IR nets to zero instead of carrying a hidden balance. */
 export async function postVendorBillGL(ctx: RequestContext, bill: EntityRecord): Promise<void> {
+  const qe = await getQueryEngine();
   const acc = await getAccountingService();
   const total = round2(Number(bill.total ?? 0));
   if (total <= 0) return;
   const subtotal = round2(Number(bill.subtotal ?? 0));
   const tax = round2(Number(bill.taxTotal ?? 0));
-  // 3-way match: if linked to a GRN the stock is already in Inventory via GR/IR; else expense it.
-  const debitSubtype = bill.goodsReceiptId ? "gr_ir" : "operating_expense";
-  const lines: JournalLineInput[] = [
-    { ledgerAccountId: await acc.requireAccount(ctx, debitSubtype), debit: subtotal },
-    { ledgerAccountId: await acc.requireAccount(ctx, "accounts_payable"), credit: total },
-  ];
+  const lines: JournalLineInput[] = [];
+
+  if (bill.goodsReceiptId) {
+    // Clear GR/IR at the value the goods receipt credited it with…
+    const grnLines = await qe.list(ctx, "goodsReceiptLine", { filters: [{ field: "grnId", op: "eq", value: bill.goodsReceiptId }], pageSize: 500 });
+    const grnValue = round2(grnLines.items.reduce((s, l) => s + Number(l.qty ?? 0) * Number(l.unitCost ?? 0), 0));
+    lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "gr_ir"), debit: grnValue });
+    // …and book the receipt-vs-bill difference as a purchase price variance.
+    const variance = round2(subtotal - grnValue);
+    if (Math.abs(variance) >= 0.005) {
+      const ppv = await acc.requireAccount(ctx, "purchase_price_variance");
+      lines.push(variance > 0 ? { ledgerAccountId: ppv, debit: variance } : { ledgerAccountId: ppv, credit: -variance });
+    }
+  } else {
+    // No GRN linked → straight expense.
+    lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "operating_expense"), debit: subtotal });
+  }
+
+  lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "accounts_payable"), credit: total });
   if (tax > 0) lines.push({ ledgerAccountId: await acc.requireAccount(ctx, "tax_payable"), debit: tax });
   await acc.postFromSource(ctx, {
     source: "vendorBill",
@@ -276,42 +374,29 @@ export async function postStockAdjustment(ctx: RequestContext, adjId: string): P
   return qe.patchComputed(ctx, "stockAdjustment", adjId, { status: "posted" });
 }
 
-/**
- * Subscribe to the lifecycle transitions that must produce GL entries / stock
- * movements. The generic transition endpoint only flips the status field and
- * emits the event — the (idempotent) side effects run here. This is the single
- * path the UI drawer uses, so without these subscriptions posting a stock
- * transfer or adjustment would change the status without ever moving stock.
- */
-export function registerAccountingPostings(): void {
-  eventBus.subscribe("*", async (event: DomainEvent) => {
-    try {
-      const id = event.payload.id ? String(event.payload.id) : "";
-      switch (event.type) {
-        case "invoice.send":
-          await postInvoiceGL(systemContext(event.tenantId, event.orgId), id);
-          break;
-        case "stockTransfer.post":
-        case "stockTransfer.void":
-        case "stockAdjustment.post":
-        case "stockAdjustment.void":
-          await handleStockTransition(event, id);
-          break;
-        default:
-          break;
-      }
-    } catch (error) {
-      logger.error("auto-posting failed", { event: event.type, error: error instanceof Error ? error.message : String(error) });
-    }
-  });
-}
+/** The lifecycle events that produce GL entries / stock movements. */
+const POSTING_EVENTS = new Set([
+  "invoice.send",
+  "invoice.void",
+  "stockTransfer.post",
+  "stockTransfer.void",
+  "stockAdjustment.post",
+  "stockAdjustment.void",
+]);
 
-/** Apply (post) or reverse (void) the stock side effects for a transfer/adjustment. */
-async function handleStockTransition(event: DomainEvent, id: string): Promise<void> {
+/** Run the (idempotent) side effect for a posting event. Shared by the live
+ *  subscriber and the retry pass so both take exactly the same path. */
+async function dispatchPosting(type: string, tenantId: string, orgId: string, id: string): Promise<void> {
   if (!id) return;
-  const ctx = systemContext(event.tenantId, event.orgId);
+  const ctx = systemContext(tenantId, orgId);
   const qe = await getQueryEngine();
-  switch (event.type) {
+  switch (type) {
+    case "invoice.send":
+      await postInvoiceGL(ctx, id);
+      break;
+    case "invoice.void":
+      await reverseInvoiceGL(ctx, id);
+      break;
     case "stockTransfer.post":
       await applyTransferMovements(ctx, await qe.get(ctx, "stockTransfer", id));
       break;
@@ -325,4 +410,99 @@ async function handleStockTransition(event: DomainEvent, id: string): Promise<vo
       await reverseAdjustmentPosting(ctx, await qe.get(ctx, "stockAdjustment", id));
       break;
   }
+}
+
+// ---- posting-failure tracking + retry (no more silent loss) ----------------
+export interface PostingFailure {
+  tenantId: string;
+  orgId: string;
+  type: string;
+  id: string;
+  attempts: number;
+  lastError: string;
+  firstAt: string;
+  lastAt: string;
+  dead: boolean;
+}
+const postingFailures = new Map<string, PostingFailure>();
+const MAX_POSTING_ATTEMPTS = 6;
+const failureKey = (t: string, o: string, type: string, id: string) => `${t}:${o}:${type}:${id}`;
+
+/**
+ * Subscribe to the lifecycle transitions that must produce GL entries / stock
+ * movements. The generic transition endpoint only flips the status field and
+ * emits the event — the (idempotent) side effects run here.
+ *
+ * A posting failure is no longer silently swallowed: it is recorded in a retry
+ * queue (so it's visible and eventually re-attempted by the scheduler) rather
+ * than leaving the GL/stock ledger quietly out of sync with the document.
+ */
+export function registerAccountingPostings(): void {
+  eventBus.subscribe("*", async (event: DomainEvent) => {
+    if (!POSTING_EVENTS.has(event.type)) return;
+    const id = event.payload.id ? String(event.payload.id) : "";
+    if (!id) return;
+    const key = failureKey(event.tenantId, event.orgId, event.type, id);
+    try {
+      await dispatchPosting(event.type, event.tenantId, event.orgId, id);
+      postingFailures.delete(key); // recovered (or never failed)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const prev = postingFailures.get(key);
+      postingFailures.set(key, {
+        tenantId: event.tenantId,
+        orgId: event.orgId,
+        type: event.type,
+        id,
+        attempts: (prev?.attempts ?? 0) + 1,
+        lastError: msg,
+        firstAt: prev?.firstAt ?? event.at,
+        lastAt: event.at,
+        dead: false,
+      });
+      logger.error("auto-posting failed (queued for retry)", { event: event.type, id, error: msg });
+    }
+  });
+}
+
+/**
+ * Re-run queued posting failures (idempotent, so safe to retry). Drives the GL +
+ * stock ledger back into sync after a transient failure; a posting that still
+ * fails after MAX_POSTING_ATTEMPTS is parked as dead-letter (kept for inspection,
+ * not retried) and logged loudly. Called from the scheduler tick + /cron/tick.
+ */
+export async function retryFailedPostings(): Promise<{ retried: number; recovered: number; remaining: number; dead: number }> {
+  let retried = 0;
+  let recovered = 0;
+  let dead = 0;
+  for (const [key, f] of [...postingFailures.entries()]) {
+    if (f.dead) continue;
+    retried++;
+    try {
+      await dispatchPosting(f.type, f.tenantId, f.orgId, f.id);
+      postingFailures.delete(key);
+      recovered++;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const attempts = f.attempts + 1;
+      const isDead = attempts >= MAX_POSTING_ATTEMPTS;
+      postingFailures.set(key, { ...f, attempts, lastError: msg, dead: isDead });
+      if (isDead) {
+        dead++;
+        logger.error("auto-posting permanently failed (dead-letter)", { event: f.type, id: f.id, attempts, error: msg });
+      }
+    }
+  }
+  const remaining = [...postingFailures.values()].filter((x) => !x.dead).length;
+  return { retried, recovered, remaining, dead };
+}
+
+/** Current posting failures for a tenant (diagnostics / admin surface). */
+export function listPostingFailures(tenantId: string, orgId: string): PostingFailure[] {
+  return [...postingFailures.values()].filter((f) => f.tenantId === tenantId && f.orgId === orgId);
+}
+
+/** Test/diagnostic helper: clear the posting-failure queue. */
+export function clearPostingFailures(): void {
+  postingFailures.clear();
 }

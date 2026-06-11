@@ -10,6 +10,7 @@
  */
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
+import { retryOnConflict } from "@/lib/data/optimistic";
 import { systemClock } from "@/lib/core/clock";
 import { DEMO_ORG, DEMO_TENANT, DEMO_USERS } from "@/lib/context/dev";
 import type { RequestContext } from "@/lib/context/types";
@@ -527,11 +528,16 @@ export class AutomationStore {
     const rule = rules.find((a) => a.enabled && a.entity === entity);
     if (!rule || rule.pool.length === 0) return null;
     if (rule.strategy === "round_robin" || rule.strategy === "load_based") {
-      const idx = rule.cursor % rule.pool.length;
-      const owner = rule.pool[idx];
       const qe = await getQueryEngine();
-      await qe.update(ctxOf(tenantId, orgId), ASSIGN, rule.id, { cursor: (idx + 1) % rule.pool.length });
-      return owner ?? null;
+      const ctx = ctxOf(tenantId, orgId);
+      // Version-guarded so concurrent assignments rotate fairly through the pool
+      // instead of both reading the same cursor and assigning the same person.
+      return retryOnConflict(async () => {
+        const current = await qe.get(ctx, ASSIGN, rule.id);
+        const idx = Number(current.cursor ?? 0) % rule.pool.length;
+        await qe.update(ctx, ASSIGN, rule.id, { cursor: (idx + 1) % rule.pool.length }, { expectedVersion: current.version });
+        return rule.pool[idx] ?? null;
+      });
     }
     return rule.pool[0] ?? null;
   }
@@ -819,16 +825,12 @@ export class AutomationStore {
       startedAt: ago(20), finishedAt: ago(20), durationMs: 130, test: false,
     });
 
-    // Processing queue samples.
-    await this.enqueue({
-      tenantId, orgId, ruleId: welcome.id, ruleName: welcome.name, state: "retry",
-      attempts: 1, maxAttempts: 3, nextAttemptAt: new Date(Date.now() + 5 * 60_000).toISOString(),
-      enqueuedAt: ago(20), lastError: "SMTP timeout contacting mail provider", input: { id: "ld_demo2", email: "sam@prospect.test" },
-    });
-    await this.enqueue({
-      tenantId, orgId, ruleId: welcome.id, ruleName: welcome.name, state: "pending",
-      attempts: 0, maxAttempts: 3, nextAttemptAt: null, enqueuedAt: ago(2), input: { id: "ld_demo3", email: "kai@prospect.test" },
-    });
+    // Processing-queue sample — DEAD-LETTER ONLY. We must NOT seed live
+    // pending/retry items: processQueue() drains them with real side effects, so
+    // a seeded `welcome` send_email item would actually email its fake recipient
+    // (e.g. sam@prospect.test) on the next scheduler tick. `dead` items are never
+    // processed, so this is display-only and safe. (Live items are also ephemeral
+    // — they'd drain within one tick — so seeding them serves no purpose.)
     await this.enqueue({
       tenantId, orgId, ruleId: bigDeal.id, ruleName: bigDeal.name, state: "dead",
       attempts: 3, maxAttempts: 3, nextAttemptAt: null, enqueuedAt: ago(180),

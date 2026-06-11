@@ -27,6 +27,8 @@ export const journalEntryEntity: EntityDef = {
         { value: "billPayment", label: "Bill Payment", tone: "info" },
         { value: "goodsReceipt", label: "Goods Receipt", tone: "info" },
         { value: "stockIssue", label: "Stock Issue", tone: "info" },
+        { value: "stockIssueVoid", label: "Stock Issue Void", tone: "warning" },
+        { value: "invoiceVoid", label: "Invoice Void", tone: "warning" },
         { value: "stockTransfer", label: "Stock Transfer", tone: "info" },
         { value: "adjustment", label: "Adjustment", tone: "neutral" },
         { value: "reversal", label: "Reversal", tone: "warning" },

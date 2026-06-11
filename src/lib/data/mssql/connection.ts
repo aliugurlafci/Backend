@@ -19,6 +19,11 @@ function buildConfig(): sql.config {
     database: env.MSSQL_DATABASE,
     user: env.MSSQL_USER,
     password: env.MSSQL_PASSWORD,
+    // node-mssql defaults requestTimeout to 15s — far too tight for bulk work
+    // (a single large multi-row INSERT or the uniqueness preload aggregate on a
+    // big table can exceed it, throwing mid-import and leaving a partial write).
+    requestTimeout: 120_000,
+    connectionTimeout: 30_000,
     options: {
       encrypt: env.MSSQL_ENCRYPT,
       trustServerCertificate: env.MSSQL_TRUST_SERVER_CERTIFICATE,

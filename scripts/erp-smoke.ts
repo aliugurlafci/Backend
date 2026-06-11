@@ -14,10 +14,14 @@ import { getPurchasingService } from "@/lib/purchasing/service";
 import { getAccountingService } from "@/lib/accounting/service";
 import { getFinanceService } from "@/lib/finance/service";
 import { getPayablesService } from "@/lib/payables/service";
-import { postInvoiceGL, postStockTransfer, postStockAdjustment, registerAccountingPostings } from "@/lib/accounting/postings";
+import { postInvoiceGL, reverseInvoiceGL, postStockTransfer, postStockAdjustment, registerAccountingPostings, retryFailedPostings, listPostingFailures, clearPostingFailures } from "@/lib/accounting/postings";
+import { eventBus } from "@/lib/workflow/event-bus";
 import { getPosService } from "@/lib/pos/service";
 import { getDomainService } from "@/lib/domain";
-import { executeRule, runScheduledAutomations, enqueueScheduled, processQueue, getLiveActivity, evaluateLeaf } from "@/lib/automation/engine";
+import ExcelJS from "exceljs";
+import { importCsv, importXlsx, buildImportTemplate, parseXlsx } from "@/lib/integrations/import-export";
+import { exportXlsx } from "@/lib/integrations/export-formats";
+import { executeRule, runScheduledAutomations, enqueueScheduled, processQueue, getLiveActivity, evaluateLeaf, registerAutomationEngine } from "@/lib/automation/engine";
 import { automationStore } from "@/lib/automation/store";
 import { runAllJobs } from "@/lib/jobs/scheduler";
 import { notifications, registerNotifications, inQuietHours, buildInAppMuteFilter } from "@/lib/integrations/notifications";
@@ -26,6 +30,7 @@ import { grantsClaimFor, login, recordSecurityEvent } from "@/lib/security/auth-
 import { randomBase32Secret, totpNow, totpVerify, encrypt } from "@/lib/security/crypto";
 import type { EntityRecord } from "@/lib/metadata/types";
 import { internalEan13, isValidBarcode } from "@/lib/barcode/check-digit";
+import { assertSafeWebhookUrl } from "@/lib/integrations/webhooks";
 
 let failures = 0;
 function assert(cond: boolean, msg: string): void {
@@ -534,6 +539,50 @@ async function main(): Promise<void> {
   bal = await sumTB();
   assert(bal.dr === bal.cr, `TB balanced end-to-end (${bal.dr}/${bal.cr})`);
 
+  // ---- Phase A: financial-integrity guards + atomic void ----
+  console.log("\n[integrity] overpayment + negative stock are rejected:");
+  // invDoc total = 2880, 500 already paid → balance 2380; paying 5000 must reject.
+  await expectReject("overpayment beyond the invoice balance is rejected", () =>
+    finance.applyPayment(ctx, invDoc.id, { amount: 5000, method: "bank", paidAt: "2026-02-16" }));
+  // Paying exactly the remaining balance is allowed (epsilon tolerance).
+  const okPay = await finance.applyPayment(ctx, invDoc.id, { amount: 2380, method: "bank", paidAt: "2026-02-16" });
+  assert(String(okPay.status) === "paid", `paying the exact balance settles the invoice (got ${okPay.status})`);
+  const routerMainNow = await inventory.onHand(ctx, router.id, whMain.id);
+  await expectReject("issuing more than on-hand is rejected (no negative stock)", () =>
+    inventory.writeMovement(ctx, { productId: router.id, warehouseId: whMain.id, qty: -(routerMainNow + 50), type: "issue", unitCost: 720, ref: "NEG-TEST", refType: "invoice" }));
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === routerMainNow, "rejected issue left on-hand unchanged");
+
+  console.log("\n[security] webhook SSRF guard rejects private/loopback targets:");
+  for (const bad of [
+    "http://169.254.169.254/latest/meta-data", "http://localhost:4000/x", "http://127.0.0.1/y", "http://10.0.0.5/z", "ftp://example.com",
+    "http://[::ffff:127.0.0.1]/x", "http://[::ffff:169.254.169.254]/meta", "http://2130706433/", "http://0x7f000001/", "http://[::1]/",
+  ]) {
+    let threw = false;
+    try { assertSafeWebhookUrl(bad); } catch { threw = true; }
+    assert(threw, `blocked unsafe webhook URL ${bad}`);
+  }
+  assert(!!assertSafeWebhookUrl("https://hooks.example.com/aula"), "allows a public https webhook URL");
+
+  console.log("\n[integrity] invoice void reverses GL + restocks (idempotent):");
+  const voidInv = await finance.createDocument(ctx, "invoice", "INV", {
+    accountId: account.id, branchId: whMain.branchId as string, warehouseId: whMain.id, currencyCode: "USD",
+    issueDate: "2026-02-18", dueDate: "2026-03-18", status: "draft",
+  });
+  await finance.replaceLines(ctx, "invoice", "invoiceLine", "invoiceId", voidInv.id, [
+    { productId: router.id, description: "Edge Router X100", qty: 1, unitPrice: 1200, taxRate: 20 },
+  ]);
+  const voidStockBefore = await inventory.onHand(ctx, router.id, whMain.id);
+  await postInvoiceGL(ctx, voidInv.id);
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === voidStockBefore - 1, "void-test invoice issued 1 unit");
+  await reverseInvoiceGL(ctx, voidInv.id);
+  assert((await jeCount("invoiceVoid", voidInv.id)) === 1, "invoice void posts a reversing AR entry");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === voidStockBefore, "void restocked the issued unit");
+  bal = await sumTB();
+  assert(bal.dr === bal.cr, `TB balanced after invoice void (${bal.dr}/${bal.cr})`);
+  await reverseInvoiceGL(ctx, voidInv.id);
+  assert((await jeCount("invoiceVoid", voidInv.id)) === 1, "re-void is idempotent (no double reversal)");
+  assert((await inventory.onHand(ctx, router.id, whMain.id)) === voidStockBefore, "re-void leaves stock unchanged");
+
   // ---- Phase 6: AP + transfer/adjustment ----
   console.log("\n[payables] vendor bill receive → AP, then pay → AP/Cash:");
   const payables = await getPayablesService();
@@ -554,6 +603,22 @@ async function main(): Promise<void> {
   assert((await jeCount("billPayment", bpay.id)) === 1, "AP/Cash entry posted on bill payment");
   bal = await sumTB();
   assert(bal.dr === bal.cr, `TB balanced after bill payment (${bal.dr}/${bal.cr})`);
+
+  console.log("\n[payables] GR/IR price variance posted on a GRN-linked bill:");
+  // GRN received router 20 @ 720 = 14400 (GR/IR credit). Bill it at 730 → +200 variance.
+  const varBill = await payables.createBill(
+    ctx,
+    { supplierId: supplier.id, goodsReceiptId: grn.doc.id, branchId: whMain.branchId as string, billDate: "2026-02-28", dueDate: "2026-03-28", currencyCode: "USD" },
+    [{ productId: router.id, description: "Edge Router X100", qty: 20, unitPrice: 730, taxRate: 0 }],
+  );
+  await payables.receiveBill(ctx, varBill.doc.id);
+  assert((await jeCount("vendorBill", varBill.doc.id)) === 1, "GRN-linked vendor bill posted");
+  const ppvAcc = (await acctSvc.accountBySubtype(ctx, "purchase_price_variance"))?.id;
+  assert(!!ppvAcc, "purchase price variance account self-provisioned");
+  const ppvLines = await qe.list(ctx, "journalLine", { filters: [{ field: "ledgerAccountId", op: "eq", value: String(ppvAcc) }], pageSize: 10 });
+  assert(ppvLines.items.some((l) => Number(l.debit) === 200), "price variance (200) booked to PPV");
+  bal = await sumTB();
+  assert(bal.dr === bal.cr, `TB balanced after GR/IR variance (${bal.dr}/${bal.cr})`);
 
   console.log("\n[inventory] stock transfer (net-zero total on-hand):");
   const whEast = (await qe.list(ctx, "warehouse", { filters: [{ field: "code", op: "eq", value: "WH-EAST" }], pageSize: 1 })).items[0];
@@ -646,6 +711,30 @@ async function main(): Promise<void> {
   // expectedCash = float(100) + cashTotal(1560) = 1660; counted 1700 → +40
   assert(closed.status === "closed", "shift closed");
   assert(Number(closed.variance) === 40, `cash variance = +40 (got ${closed.variance})`);
+
+  console.log("\n[pos] checkout is idempotent (double-submit rings up one sale):");
+  const idemStockBefore = await inventory.onHand(ctx, switchProd!.id, whMain.id);
+  const idemArgs = {
+    branchId: whMain.branchId as string, warehouseId: whMain.id, sessionId: null, currencyCode: "USD",
+    lines: [{ productId: switchProd!.id, description: String(switchProd!.name), qty: 1, unitPrice: 650, taxRate: 20 }],
+    payments: [{ method: "cash", amount: 780 }], idempotencyKey: "smoke-idem-1",
+  };
+  const firstIdem = await posSvc.checkout(ctx, idemArgs);
+  const secondIdem = await posSvc.checkout(ctx, idemArgs);
+  assert(String(firstIdem.invoice.id) === String(secondIdem.invoice.id), "duplicate checkout returns the same invoice");
+  assert((await inventory.onHand(ctx, switchProd!.id, whMain.id)) === idemStockBefore - 1, "duplicate checkout issues stock only once");
+
+  console.log("\n[posting-retry] a failed GL posting is queued, not silently lost:");
+  clearPostingFailures();
+  // Publish a posting event for a non-existent invoice → reverseInvoiceGL throws →
+  // the failure must be captured in the retry queue (visible + re-attempted).
+  await eventBus.publish({ id: "evt_fail", type: "invoice.void", at: ctx.at, tenantId: DEMO_TENANT, orgId: DEMO_ORG, actorId: "system", correlationId: "cid_fail", payload: { id: "987654" } });
+  const postFails = listPostingFailures(DEMO_TENANT, DEMO_ORG);
+  assert(postFails.some((f) => f.type === "invoice.void" && f.id === "987654"), "failed posting recorded in the retry queue");
+  const retryRes = await retryFailedPostings();
+  assert(retryRes.retried >= 1, `retry pass re-attempts queued postings (retried ${retryRes.retried})`);
+  clearPostingFailures();
+  assert(listPostingFailures(DEMO_TENANT, DEMO_ORG).length === 0, "posting-failure queue clears");
 
   console.log("\n[inventory] per-location on-hand join (stock-levels source):");
   const onHandRows = await inventory.onHandByKey(ctx);
@@ -771,6 +860,15 @@ async function main(): Promise<void> {
   const rbGen2 = await rbFin.generateDueInvoices(ctx, RB_TODAY);
   assert(rbGen2.length === 0, "re-running the same day generates nothing (idempotent until the next period)");
 
+  console.log("\n[recurring] month-end plan clamps (Jan 31 → Feb 28, no skipped month):");
+  const mePlan = await qe.create(ctx, "recurringPlan", {
+    name: "Month-end sub", accountId: rbAccount.id, description: "Month-end fee", amount: 100, taxRate: 0,
+    currencyCode: "USD", frequency: "monthly", nextRun: "2026-01-31", active: true,
+  });
+  const meGen = await rbFin.generateDueInvoices(ctx, "2026-04-15"); // Jan31, Feb28, Mar28 due by Apr 15
+  assert(meGen.length === 3, `month-end plan generates one per month, no skips (got ${meGen.length})`);
+  assert(String((await qe.get(ctx, "recurringPlan", String(mePlan.id))).nextRun) === "2026-04-28", "month-end nextRun clamps to a valid day");
+
   console.log("\n[automation] send_email action drives the mail path + schedule cadence:");
   // Exercise the engine → sendMail wiring with SMTP turned off, so sendMail returns
   // null (no network, no real message) and the action falls back to an in-app
@@ -872,6 +970,251 @@ async function main(): Promise<void> {
   const crFail = await executeRule(crFailRule, ctx, { id: "y" }, { test: false, trigger: "account.created" });
   assert(crFail.status === "failed", `create_record missing required field fails (got ${crFail.status})`);
   assert(/name/i.test(String(crFail.error ?? "")), `failed run error names the missing field (got "${crFail.error}")`);
+
+  // End-to-end event path: a real domain event fires the matching ACTIVE rule
+  // with the REAL record (not a fixed/seeded value), and admin user-creation
+  // now emits user.created so "email the newly-added user" automations work.
+  console.log("\n[automation] real domain event fires the matching active rule (user.created):");
+  registerAutomationEngine();
+  const userRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Welcome new user", status: "active",
+    trigger: { kind: "event", entity: "user", event: "created" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "se9", type: "send_email", to: "{{record.email}}", subject: "Welcome {{record.displayName}}", body: "Hi" }],
+    by: "system",
+  });
+  const dsvc = await getDomainService();
+  await dsvc.createWithComputed(ctx, "user", {
+    email: "newhire@aula.example", displayName: "New Hire", positionId: "1", active: true,
+  }, { passwordHash: "x.y" });
+  const userRuns = await automationStore.listRuns(DEMO_TENANT, DEMO_ORG, { ruleId: userRule.id, limit: 50 });
+  const fired = userRuns.find((r) => r.ruleId === userRule.id && r.trigger === "user.created");
+  assert(!!fired, "creating a user fires the active user.created automation (admin create now emits the event)");
+  const fireStep = fired?.steps.find((s) => s.type === "send_email");
+  assert(!!fireStep && /newhire@aula\.example/.test(String(fireStep.output)), `{{record.email}} resolves to the REAL new record (got ${fireStep?.output})`);
+
+  // Robustness: events whose payload carries ONLY an id (stage_changed, deleted,
+  // or a manual run handing over a thin record) must still resolve {{record.*}} —
+  // the engine hydrates the full record from the store before interpolating.
+  console.log("\n[automation] thin event payload ({id} only) is hydrated so {{record.*}} still resolves:");
+  const qeHy = await getQueryEngine();
+  const acctHy = await qeHy.create(ctx, "account", { name: "Hydration Test Co", email: "owner@hydration.example" });
+  const hydrateRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Email account on stage change", status: "active",
+    trigger: { kind: "event", entity: "account", event: "stage_changed" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "seHy", type: "send_email", to: "{{record.email}}", subject: "Hi {{record.name}}", body: "x" }],
+    by: "system",
+  });
+  // Simulate a stage_changed payload — only {id, from, to}, NO email/name.
+  const hydrateRun = await executeRule(
+    hydrateRule, ctx, { id: acctHy.id, from: "a", to: "b" }, { test: false, trigger: "account.stage_changed" },
+  );
+  const hydrateStep = hydrateRun.steps.find((s) => s.type === "send_email");
+  assert(!!hydrateStep && /owner@hydration\.example/.test(String(hydrateStep.output)),
+    `thin {id} payload hydrates {{record.email}} from the store (got ${hydrateStep?.output})`);
+  assert(String(hydrateRun.input.email) === "owner@hydration.example",
+    "run input snapshot reflects the hydrated record, not the thin payload");
+  // A rule that reads no record fields takes no extra read and still runs.
+  const noFieldRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Static notify", status: "active",
+    trigger: { kind: "event", entity: "account", event: "stage_changed" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "nf1", type: "notify", to: "ops@aula.example", subject: "stage moved", body: "x" }],
+    by: "system",
+  });
+  const noFieldRun = await executeRule(
+    noFieldRule, ctx, { id: acctHy.id, from: "a", to: "b" }, { test: false, trigger: "account.stage_changed" },
+  );
+  assert(noFieldRun.status === "success", "rule referencing no record fields runs without hydration");
+
+  // NO-RECORD GATING — the fix for the "Manual run" placeholder bug. A run that
+  // resolves NO record (empty {} — what the manual-run endpoint now passes instead
+  // of a fabricated {id:"manual",name:"Manual run"}) must SKIP record-dependent
+  // actions with a clear reason, never fire a notify/email against invented values,
+  // still run record-INDEPENDENT actions, and NOT enqueue a retry (no background
+  // recurrence).
+  console.log("\n[automation] no-record run skips record-dependent actions (no fabricated 'Manual run'):");
+  const welcomeRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Welcome new hire", status: "active",
+    trigger: { kind: "event", entity: "user", event: "created" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [
+      { id: "wn1", type: "notify", to: "", subject: "Yeni İşe Giriş - {{record.name}}", body: "{{record.name}} - yeni işe giriş yapmıştır" },
+      { id: "we1", type: "send_email", to: "{{record.email}}", subject: "Hi", body: "x" },
+      { id: "ws1", type: "notify", to: "hr@aula.example", subject: "A new hire joined", body: "static — no record tokens" },
+    ],
+    by: "system",
+  });
+  const qBeforeNoRec = (await automationStore.listQueue(DEMO_TENANT, DEMO_ORG)).length;
+  const noRecRun = await executeRule(welcomeRule, ctx, {}, { test: false, trigger: "manual run" });
+  assert(
+    noRecRun.steps.some((s) => s.type === "notify" && s.status === "skipped" && /no record/.test(String(s.output))),
+    "no-record run SKIPS the {{record.name}} notify with a 'no record' reason",
+  );
+  assert(
+    !noRecRun.steps.some((s) => /Manual run/.test(`${s.output ?? ""}${s.error ?? ""}`)),
+    "no-record run never fabricates the literal 'Manual run' value",
+  );
+  assert(
+    noRecRun.steps.find((s) => s.type === "send_email")?.status === "skipped",
+    "no-record run skips the {{record.email}} send",
+  );
+  assert(noRecRun.output.notifications === 1, "the record-INDEPENDENT (static) notify still fires exactly once");
+  const qAfterNoRec = (await automationStore.listQueue(DEMO_TENANT, DEMO_ORG)).length;
+  assert(qAfterNoRec === qBeforeNoRec, "a no-record run does NOT enqueue a retry (kills the background recurrence)");
+
+  // Same gating fixes SCHEDULE rules: their input is {scheduledAt} (no record), so
+  // a {{record.*}} send is skipped rather than firing with empty fields.
+  const schedRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Daily blast", status: "active",
+    trigger: { kind: "schedule", schedule: "daily" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "sb1", type: "send_email", to: "{{record.email}}", subject: "x", body: "y" }],
+    by: "system",
+  });
+  const schedRun = await executeRule(schedRule, ctx, { scheduledAt: ctx.at }, { test: false, trigger: "schedule" });
+  assert(
+    schedRun.steps.find((s) => s.type === "send_email")?.status === "skipped",
+    "schedule rule with {{record.*}} skips the send (no record) instead of firing empty",
+  );
+
+  // deleted events now carry a record snapshot so delete-triggered automations
+  // can resolve {{record.*}} even though the row is already gone.
+  console.log("\n[automation] deleted event carries the record snapshot:");
+  const delAcct = await qeHy.create(ctx, "account", { name: "ToDelete Co", email: "bye@del.example" });
+  const delRule = await automationStore.createRule({
+    tenantId: DEMO_TENANT, orgId: DEMO_ORG, name: "Notify on account delete", status: "active",
+    trigger: { kind: "event", entity: "account", event: "deleted" },
+    conditions: { type: "group", logic: "AND", children: [] },
+    actions: [{ id: "dn1", type: "notify", to: "ops@aula.example", subject: "Deleted {{record.name}}", body: "{{record.email}} removed" }],
+    by: "system",
+  });
+  const dsvcDel = await getDomainService();
+  await dsvcDel.remove(ctx, "account", String(delAcct.id));
+  const delFired = (await automationStore.listRuns(DEMO_TENANT, DEMO_ORG, { ruleId: delRule.id, limit: 10 }))
+    .find((r) => r.trigger === "account.deleted");
+  assert(
+    !!delFired && String(delFired.input.name) === "ToDelete Co" && String(delFired.input.email) === "bye@del.example",
+    "deleted event carries the record snapshot so {{record.*}} resolves",
+  );
+  assert(delFired?.steps.find((s) => s.type === "notify")?.status === "ok", "notify fires on delete with the snapshot record");
+
+  // PEOPLE: a department's headcount is DERIVED live on read from its manager's
+  // reports — employees via managerRef + users via managerId — and the manager is
+  // pickable from both ("employee:<id>" / "user:<id>"). Never entered by hand.
+  console.log("\n[people] department headcount derives from the manager's reports (employees + users):");
+  const qePpl = await getQueryEngine();
+  const boss = await qePpl.create(ctx, "user", { email: "boss@aula.example", displayName: "Boss", positionId: "1", active: true });
+  const bossRef = `user:${boss.id}`;
+  await qePpl.create(ctx, "employee", { firstName: "Rep", lastName: "One", managerRef: bossRef });
+  await qePpl.create(ctx, "employee", { firstName: "Rep", lastName: "Two", managerRef: bossRef });
+  await qePpl.create(ctx, "user", { email: "rep3@aula.example", displayName: "Rep Three", positionId: "1", active: true, managerId: String(boss.id) });
+  const dept = await qePpl.create(ctx, "department", { name: "Engineering X", head: bossRef });
+  const pplDom = await getDomainService();
+  const deptRow = (await pplDom.list(ctx, "department", {})).items.find((d) => d.id === dept.id);
+  assert(Number(deptRow?.headcount) === 3, `headcount = manager's reports: 2 employees + 1 user = 3 (got ${deptRow?.headcount})`);
+  const deptOne = await pplDom.get(ctx, "department", String(dept.id));
+  assert(Number(deptOne.headcount) === 3, `single department GET also derives headcount live (got ${deptOne.headcount})`);
+  // An employee can manage too: head = "employee:<id>" counts employees reporting to that employee.
+  const empBoss = await qePpl.create(ctx, "employee", { firstName: "Emp", lastName: "Boss" });
+  const empBossRef = `employee:${empBoss.id}`;
+  await qePpl.create(ctx, "employee", { firstName: "Sub", lastName: "Ord", managerRef: empBossRef });
+  const dept2 = await qePpl.create(ctx, "department", { name: "Ops X", head: empBossRef });
+  const dept2Row = (await pplDom.list(ctx, "department", {})).items.find((d) => d.id === dept2.id);
+  assert(Number(dept2Row?.headcount) === 1, `employee-manager headcount counts employee reports (got ${dept2Row?.headcount})`);
+
+  // IMPORT: accepts Excel (.xlsx), not just CSV — round-trips with enum/number coercion.
+  console.log("\n[import] xlsx import + enum-label CSV round-trip:");
+  const impDom = await getDomainService();
+  const wbImp = new ExcelJS.Workbook();
+  const wsImp = wbImp.addWorksheet("currency");
+  wsImp.addRow(["id", "code", "symbol", "rate"]);
+  wsImp.addRow(["", "XTS", "X", "2.5"]);
+  const xbuf = await wbImp.xlsx.writeBuffer();
+  const xb64 = Buffer.from(xbuf as ArrayBuffer).toString("base64");
+  const xRes = await importXlsx(ctx, "currency", xb64, metadata, impDom);
+  assert(
+    xRes.created.length === 1 && xRes.errors.length === 0,
+    `xlsx import created 1 currency (got ${xRes.created.length}, errors ${JSON.stringify(xRes.errors)})`,
+  );
+  const curr = await qe.get(ctx, "currency", xRes.created[0]);
+  assert(String(curr.code) === "XTS" && Number(curr.rate) === 2.5, `xlsx values coerced (code=${curr.code}, rate=${curr.rate})`);
+  // Header cells resolved by LABEL too (this is how the xlsx/pdf export writes them).
+  const wbLbl = new ExcelJS.Workbook();
+  const wsLbl = wbLbl.addWorksheet("currency");
+  wsLbl.addRow(["ID", "Code", "Symbol", "Rate (per USD)"]); // localized labels, not field names
+  wsLbl.addRow(["", "XTC", "Y", "3"]);
+  const lb64 = Buffer.from((await wbLbl.xlsx.writeBuffer()) as ArrayBuffer).toString("base64");
+  const lRes = await importXlsx(ctx, "currency", lb64, metadata, impDom);
+  assert(
+    lRes.created.length === 1 && lRes.errors.length === 0,
+    `label-header xlsx import created 1 currency (got ${lRes.created.length}, errors ${JSON.stringify(lRes.errors)})`,
+  );
+  // CSV import maps an enum LABEL ("Technology") back to its stored value ("technology").
+  const cRes = await importCsv(ctx, "account", "id,name,industry\n,EnumImportCo,Technology\n", metadata, impDom);
+  assert(cRes.created.length === 1, `csv import created 1 account (got ${cRes.created.length}, errors ${JSON.stringify(cRes.errors)})`);
+  const acc = await qe.get(ctx, "account", cRes.created[0]);
+  assert(String(acc.industry) === "technology", `enum label mapped to value on import (got ${acc.industry})`);
+  // ROUND-TRIP: re-importing a real xlsx export (label headers) must NOT fail
+  // validation — any errors are unique-conflicts (records already exist), not the
+  // "Validation failed" the broken label-header path produced.
+  const xlsxBuf = await exportXlsx(ctx, "account", metadata, impDom);
+  const rt = await importXlsx(ctx, "account", xlsxBuf.toString("base64"), metadata, impDom);
+  assert(
+    rt.errors.every((e) => !/validation failed/i.test(e.message)),
+    `xlsx export round-trips without validation errors (got ${JSON.stringify(rt.errors.slice(0, 2))})`,
+  );
+  // LOCALIZED headers: a file headed in the user's language imports via aliases
+  // (localized field label → field name) supplied by the UI.
+  const trRes = await importCsv(
+    ctx, "account", "Ad,E-posta\nLokalize Co,lokalize@test.example\n", metadata, impDom,
+    { Ad: "name", "E-posta": "email" },
+  );
+  assert(
+    trRes.created.length === 1 && trRes.errors.length === 0,
+    `localized-header import created 1 account (got ${trRes.created.length}, errors ${JSON.stringify(trRes.errors)})`,
+  );
+  const trAcc = await qe.get(ctx, "account", trRes.created[0]);
+  assert(
+    String(trAcc.name) === "Lokalize Co" && String(trAcc.email) === "lokalize@test.example",
+    `localized headers mapped via aliases (name=${trAcc.name}, email=${trAcc.email})`,
+  );
+  // Unrecognized columns are reported (not silently dropped).
+  const ignRes = await importCsv(ctx, "account", "Bilinmeyen,name\nx,IgnoreColCo\n", metadata, impDom);
+  assert((ignRes.ignored ?? []).includes("Bilinmeyen"), `unrecognized column reported as ignored (got ${JSON.stringify(ignRes.ignored)})`);
+  // Import TEMPLATE is a real .xlsx with one header row of the writable field labels.
+  const acctTpl = await buildImportTemplate("account", metadata, "xlsx");
+  assert(acctTpl.ext === "xlsx" && acctTpl.buffer.length > 0, `xlsx template built (${acctTpl.buffer.length} bytes)`);
+  const tplRows = await parseXlsx(acctTpl.buffer);
+  assert(
+    tplRows.length === 1 && tplRows[0].includes("Account Name"),
+    `template = single header row of writable field labels (got ${JSON.stringify(tplRows[0])})`,
+  );
+  // BULK: a large import goes through qe.bulkCreate (no per-row domain events), so
+  // thousands of rows complete fast instead of timing out.
+  const BULK_N = 2000;
+  let bulkCsv = "Name,Unit Price,SKU\n";
+  for (let i = 0; i < BULK_N; i++) bulkCsv += `Bulk Prod ${i},9.99,BULK-${i}\n`;
+  const t0 = Date.now();
+  const bulkRes = await importCsv(ctx, "product", bulkCsv, metadata, impDom);
+  console.log(`  (bulk-imported ${BULK_N} products in ${Date.now() - t0}ms)`);
+  assert(
+    bulkRes.created.length === BULK_N && bulkRes.errors.length === 0,
+    `bulk import created ${BULK_N} products (got ${bulkRes.created.length}, errors ${bulkRes.errors.length})`,
+  );
+  // Within-batch duplicate unique value → one created, one rejected.
+  const dupRes = await importCsv(ctx, "product", "Name,Unit Price,SKU\nDup A,1,DUP-SKU\nDup B,1,DUP-SKU\n", metadata, impDom);
+  assert(
+    dupRes.created.length === 1 && dupRes.errors.length === 1 && /unique/i.test(dupRes.errors[0].message),
+    `within-batch duplicate SKU rejected (created ${dupRes.created.length}, errors ${JSON.stringify(dupRes.errors)})`,
+  );
+  // Unique value that already exists → rejected with a clear message.
+  const existRes = await importCsv(ctx, "product", "Name,Unit Price,SKU\nExisting Dup,1,BULK-1\n", metadata, impDom);
+  assert(
+    existRes.created.length === 0 && /already exists/i.test(existRes.errors[0]?.message ?? ""),
+    `existing unique SKU rejected (got ${JSON.stringify(existRes.errors)})`,
+  );
 
   console.log(failures === 0 ? "\n✅ ERP smoke passed (Phase 1–6 + barcode/POS/labels + cart/returns + automation)\n" : `\n❌ ${failures} assertion(s) failed\n`);
   process.exit(failures === 0 ? 0 : 1);

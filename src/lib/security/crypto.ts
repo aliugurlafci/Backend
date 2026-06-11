@@ -6,9 +6,20 @@
  * dev fallback keeps local runs working but must be overridden in production.
  */
 import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { env, isProduction } from "@/lib/config/env";
+
+const INSECURE_KEY = "dev-insecure-key-change-me";
 
 function secret(): string {
-  return process.env.AULA_ENCRYPTION_KEY ?? "dev-insecure-key-change-me";
+  const key = env.AULA_ENCRYPTION_KEY;
+  // In production a strong key is mandatory (startup also enforces this); never
+  // fall back to the well-known dev key, which would render PII/2FA secrets
+  // trivially decryptable. Outside production the dev fallback keeps local runs working.
+  if (!key || key === INSECURE_KEY) {
+    if (isProduction) throw new Error("AULA_ENCRYPTION_KEY must be set to a strong value");
+    return INSECURE_KEY;
+  }
+  return key;
 }
 
 function deriveKey(pass: string): Buffer {

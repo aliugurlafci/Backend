@@ -43,6 +43,7 @@ export const ledgerAccountEntity: EntityDef = {
         { value: "retained_earnings", label: "Retained Earnings" },
         { value: "sales_revenue", label: "Sales Revenue" },
         { value: "cogs", label: "Cost of Goods Sold" },
+        { value: "purchase_price_variance", label: "Purchase Price Variance" },
         { value: "operating_expense", label: "Operating Expense" },
         { value: "other", label: "Other" },
       ],

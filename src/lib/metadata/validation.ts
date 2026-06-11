@@ -35,11 +35,13 @@ function fieldSchema(field: FieldDef): z.ZodTypeAny {
     case "url":
       base = z.string().url();
       break;
-    case "enum":
-      base = z.enum(
-        (field.options ?? []).map((o) => o.value) as [string, ...string[]],
-      );
+    case "enum": {
+      const values = (field.options ?? []).map((o) => o.value);
+      // z.enum requires ≥1 value; fall back to a plain string for an
+      // (mis)configured option-less enum rather than throwing at schema build.
+      base = values.length ? z.enum(values as [string, ...string[]]) : z.string();
       break;
+    }
     case "date":
     case "datetime":
       base = z.string().refine((v) => !Number.isNaN(Date.parse(v)), {

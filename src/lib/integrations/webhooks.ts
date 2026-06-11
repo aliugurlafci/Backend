@@ -8,8 +8,72 @@
 import { createHmac } from "node:crypto";
 import { newId } from "@/lib/core/ids";
 import { logger } from "@/lib/observability/logger";
+import { BadRequestError } from "@/lib/enforcement/errors";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { withRetry } from "@/lib/workflow/retry";
+
+/** Whether a dotted-quad IPv4 (as 4 octets) is private/loopback/link-local. */
+function isBlockedIpv4(o: number[]): boolean {
+  const [a, b] = o;
+  if (a === 0 || a === 127) return true; // this-host / loopback
+  if (a === 10) return true; // private
+  if (a === 192 && b === 168) return true; // private
+  if (a === 172 && b >= 16 && b <= 31) return true; // private
+  if (a === 169 && b === 254) return true; // link-local + cloud metadata (169.254.169.254)
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+/** Block private/loopback/link-local hosts to stop SSRF (e.g. cloud metadata at
+ *  169.254.169.254, internal services on localhost or RFC-1918 ranges). Handles
+ *  dotted IPv4, IPv6 loopback, unique-local/link-local IPv6, and IPv4-mapped IPv6
+ *  in BOTH dotted (`::ffff:127.0.0.1`) and the hex form Node canonicalises to
+ *  (`::ffff:7f00:1`). Decimal/hex/octal IPv4 literals are already normalised to
+ *  dotted-quad by the URL parser before they reach here. DNS-rebinding (a public
+ *  name resolving to a private IP) is out of scope. */
+function isBlockedWebhookHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h === "0.0.0.0" || h === "::" || h === "::1") return true;
+
+  const dotted = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (dotted) return isBlockedIpv4(dotted.slice(1).map(Number));
+
+  // IPv4-mapped IPv6: dotted tail (::ffff:127.0.0.1) or hex tail (::ffff:7f00:1).
+  const mapped = h.match(/^::ffff:(.+)$/);
+  if (mapped) {
+    const tail = mapped[1];
+    const td = tail.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (td) return isBlockedIpv4(td.slice(1).map(Number));
+    const hx = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hx) {
+      const hi = parseInt(hx[1], 16);
+      const lo = parseInt(hx[2], 16);
+      return isBlockedIpv4([(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]);
+    }
+  }
+
+  // IPv6 unique-local (fc00::/7) / link-local (fe80::/10).
+  if (/^f[cd][0-9a-f]{0,2}:/.test(h) || h.startsWith("fe80:")) return true;
+  return false;
+}
+
+/** Validate a webhook target URL; throws BadRequestError if unsafe. */
+export function assertSafeWebhookUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new BadRequestError("invalid webhook URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new BadRequestError("webhook URL must use http or https");
+  }
+  if (isBlockedWebhookHost(url.hostname)) {
+    throw new BadRequestError("webhook URL must not target a private, loopback or link-local address");
+  }
+  return url;
+}
 
 export interface WebhookEndpoint {
   id: string;
@@ -38,6 +102,7 @@ export class WebhookRegistry {
   private deliveries: WebhookDelivery[] = [];
 
   register(input: Omit<WebhookEndpoint, "id" | "createdAt"> & { createdAt: string }): WebhookEndpoint {
+    assertSafeWebhookUrl(input.url); // reject SSRF targets at registration
     const endpoint = { id: newId("wh"), ...input };
     this.endpoints.push(endpoint);
     return endpoint;
@@ -89,6 +154,7 @@ async function deliver(endpoint: WebhookEndpoint, event: DomainEvent): Promise<v
   const signature = signWebhook(body, endpoint.secret);
   let status: number | null = null;
   try {
+    assertSafeWebhookUrl(endpoint.url); // defense-in-depth: never deliver to a blocked host
     await withRetry(
       async () => {
         const res = await fetch(endpoint.url, {

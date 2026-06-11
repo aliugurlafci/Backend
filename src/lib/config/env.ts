@@ -75,6 +75,10 @@ const schema = z.object({
   // Bootstrap behaviour
   AULA_AUTO_MIGRATE: boolish(true),
   AULA_AUTO_SEED: boolish(true),
+
+  // Inventory policy: when false (default) a stock issue/transfer that would
+  // drive on-hand negative is rejected; set true to permit overselling/backorders.
+  AULA_ALLOW_NEGATIVE_STOCK: boolish(false),
 });
 
 export type Env = z.infer<typeof schema>;

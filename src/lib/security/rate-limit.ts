@@ -32,6 +32,26 @@ export function rateLimit(key: string, limit: number, windowMs: number): RateLim
   };
 }
 
+/** Inspect a key's current state WITHOUT counting a hit (for pre-checks like
+ *  account lockout, where the increment happens only on a failed attempt). */
+export function peekRateLimit(key: string, limit: number): RateLimitResult {
+  const now = Date.now();
+  const bucket = buckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    return { allowed: true, remaining: limit, retryAfter: 0 };
+  }
+  return {
+    allowed: bucket.count < limit,
+    remaining: Math.max(0, limit - bucket.count),
+    retryAfter: Math.ceil((bucket.resetAt - now) / 1000),
+  };
+}
+
+/** Drop a key's counter (e.g. clear failed-login attempts after a success). */
+export function clearRateLimit(key: string): void {
+  buckets.delete(key);
+}
+
 export function resetRateLimits(): void {
   buckets.clear();
 }

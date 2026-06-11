@@ -9,6 +9,8 @@ import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import type { RequestContext } from "@/lib/context/types";
 import type { Filter } from "@/lib/data/query";
 import { systemContext } from "@/lib/context/resolver";
+import { env } from "@/lib/config/env";
+import { ConflictError } from "@/lib/enforcement/errors";
 import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
 
@@ -64,6 +66,18 @@ export class InventoryService {
         pageSize: 1,
       });
       if (existing.total > 0) return existing.items[0]; // already posted — no-op
+    }
+    // Guard against overselling: a stock issue / transfer-out must not drive the
+    // location's on-hand negative (unless AULA_ALLOW_NEGATIVE_STOCK permits it).
+    // Skipped for receipts, transfer-in and adjustments (corrections may zero out).
+    if (!env.AULA_ALLOW_NEGATIVE_STOCK && (m.type === "issue" || m.type === "transfer_out") && m.qty < 0) {
+      const current = await this.onHand(sys, m.productId, m.warehouseId);
+      if (round2(current + m.qty) < -0.0001) {
+        throw new ConflictError(
+          `insufficient stock: ${current} on hand, cannot issue ${Math.abs(m.qty)}`,
+          [{ field: "qty", message: "exceeds available on-hand stock" }],
+        );
+      }
     }
     const unitCost = m.unitCost ?? 0;
     const computed: Record<string, FieldValue> = {

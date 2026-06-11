@@ -47,6 +47,15 @@ export class QueryEngine {
     private readonly clock: Clock = systemClock,
   ) {}
 
+  /**
+   * Run a unit of work atomically (all writes commit together, or none do).
+   * Services wrap multi-step financial/inventory flows in this so a mid-way
+   * failure can never leave the GL, sub-ledgers and stock ledger inconsistent.
+   */
+  runInTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    return this.repo.runInTransaction(fn);
+  }
+
   // ---- reads -------------------------------------------------------------
 
   async list(ctx: RequestContext, entityName: string, query: Query = {}): Promise<Page> {
@@ -136,6 +145,106 @@ export class QueryEngine {
   }
 
   /**
+   * Bulk-create many records efficiently (CSV/Excel import). Unlike calling
+   * `create` per row, this:
+   *  - checks `create` permission and builds the validation schema ONCE,
+   *  - preloads existing unique-field values in a single aggregate per field
+   *    (O(n) instead of an `existsByField` scan per row → O(n²)),
+   *  - dedupes unique values WITHIN the batch as it goes,
+   *  - and (crucially) does NOT emit per-record domain events — so importing
+   *    20k rows doesn't fire 20k automations / search re-indexes / webhooks.
+   * Per-row validation / uniqueness failures are collected (by input index)
+   * rather than aborting the batch.
+   */
+  async bulkCreate(
+    ctx: RequestContext,
+    entityName: string,
+    inputs: Record<string, unknown>[],
+  ): Promise<{ created: EntityRecord[]; errors: { index: number; message: string }[] }> {
+    const entity = this.metadata.getEntity(entityName);
+    assertAllowed(this.permissions.evaluate(ctx, { action: `${entityName}:create`, entity: entityName }));
+    const schema = buildCreateSchema(entity);
+    const uniqueFields = entity.fields.filter((f) => f.unique);
+
+    // Preload existing unique values once (distinct-by-group) → O(n), not O(n²).
+    const seen = new Map<string, Set<string>>();
+    for (const f of uniqueFields) {
+      const rows = await this.repo.aggregate(scopeOf(ctx), entityName, {
+        groupBy: f.name,
+        measures: [{ op: "count", as: "c" }],
+      });
+      seen.set(f.name, new Set(rows.map((r) => (r.key == null ? "" : String(r.key))).filter((k) => k !== "")));
+    }
+
+    const errors: { index: number; message: string }[] = [];
+    const pending: { index: number; record: EntityRecord }[] = [];
+    const now = this.clock.isoNow();
+
+    inputs.forEach((input, index) => {
+      const outcome = validateRecord(schema, input ?? {});
+      if (!outcome.success) {
+        const detail = (outcome.issues ?? []).map((i) => `${i.field}: ${i.message}`).join("; ");
+        errors.push({ index, message: `Validation failed${detail ? ` — ${detail}` : ""}` });
+        return;
+      }
+      const values = this.applyDefaults(entity, outcome.data ?? {});
+      const conflict = uniqueFields.find((f) => {
+        const v = values[f.name];
+        return v != null && v !== "" && seen.get(f.name)!.has(String(v));
+      });
+      if (conflict) {
+        errors.push({
+          index,
+          message: `${entity.label} with ${conflict.label} "${String(values[conflict.name])}" already exists — ${conflict.name}: must be unique`,
+        });
+        return;
+      }
+      for (const f of uniqueFields) {
+        const v = values[f.name];
+        if (v != null && v !== "") seen.get(f.name)!.add(String(v));
+      }
+      pending.push({
+        index,
+        record: {
+          id: "",
+          tenantId: ctx.tenantId,
+          orgId: ctx.orgId,
+          ownerId: entity.ownable ? ctx.userId : null,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: ctx.userId,
+          updatedBy: ctx.userId,
+          version: 1,
+          ...values,
+        },
+      });
+    });
+
+    // Write in bulk: a handful of chunked multi-row INSERTs instead of one
+    // round-trip per row (a 20k-row import was 20k serial inserts → HTTP
+    // timeout). If a chunk fails on a DB-level constraint not caught above, we
+    // retry that chunk row-by-row to attribute the error to the offending row
+    // and let its neighbours still land (partial-success semantics preserved).
+    const created: EntityRecord[] = [];
+    const CHUNK = 500;
+    for (let i = 0; i < pending.length; i += CHUNK) {
+      const group = pending.slice(i, i + CHUNK);
+      try {
+        created.push(...(await this.repo.bulkInsert(entityName, group.map((p) => p.record))));
+      } catch {
+        for (const p of group) {
+          try {
+            created.push(await this.repo.insert(entityName, p.record));
+          } catch (e) {
+            errors.push({ index: p.index, message: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+    }
+    return { created, errors };
+  }
+
+  /**
    * Internal: write server-computed fields onto an existing record without
    * re-validating user input (used by the finance service to store totals).
    */
@@ -144,6 +253,9 @@ export class QueryEngine {
     entityName: string,
     id: string,
     computed: Record<string, FieldValue>,
+    /** When given, the write is version-guarded (optimistic lock): a concurrent
+     *  modification since the caller read the record raises a ConflictError. */
+    expectedVersion?: number,
   ): Promise<EntityRecord> {
     const entity = this.metadata.getEntity(entityName);
     const current = await this.repo.get(scopeOf(ctx), entityName, id);
@@ -155,7 +267,7 @@ export class QueryEngine {
       updatedBy: ctx.userId,
       version: current.version + 1,
     };
-    return this.repo.update(scopeOf(ctx), entityName, next);
+    return this.repo.update(scopeOf(ctx), entityName, next, expectedVersion);
   }
 
   async update(

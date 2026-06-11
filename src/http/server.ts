@@ -54,7 +54,8 @@ export function createApp(): express.Express {
     }),
   );
 
-  app.use(express.json({ limit: "1mb" }));
+  // 25mb so spreadsheet imports (a base64 .xlsx in the JSON body) aren't rejected.
+  app.use(express.json({ limit: "25mb" }));
   app.use(cookieParser());
 
   // Issue a CSRF token cookie (double-submit) if the client doesn't have one.

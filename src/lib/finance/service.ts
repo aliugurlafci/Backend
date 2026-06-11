@@ -12,6 +12,8 @@ import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import type { RequestContext } from "@/lib/context/types";
 import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
+import { BadRequestError } from "@/lib/enforcement/errors";
+import { retryOnConflict } from "@/lib/data/optimistic";
 import { docTotals, lineTotals } from "./totals";
 import { numberSequence, NumberSequence } from "./number-sequence";
 import { postPaymentGL } from "@/lib/accounting/postings";
@@ -46,10 +48,17 @@ function addDays(isoDate: string, days: number): string {
 
 function advance(isoDate: string, frequency: string): string {
   const d = new Date(isoDate);
-  if (frequency === "weekly") d.setDate(d.getDate() + 7);
-  else if (frequency === "quarterly") d.setMonth(d.getMonth() + 3);
-  else if (frequency === "yearly") d.setFullYear(d.getFullYear() + 1);
-  else d.setMonth(d.getMonth() + 1); // monthly
+  if (frequency === "weekly") {
+    d.setDate(d.getDate() + 7);
+  } else {
+    const day = d.getDate();
+    if (frequency === "quarterly") d.setMonth(d.getMonth() + 3);
+    else if (frequency === "yearly") d.setFullYear(d.getFullYear() + 1);
+    else d.setMonth(d.getMonth() + 1); // monthly
+    // Month-end clamp: a day-31 plan advanced by a month must land on the last
+    // day of the target month (Jan 31 → Feb 28/29), not overflow to Mar 3.
+    if (d.getDate() !== day) d.setDate(0);
+  }
   return d.toISOString().slice(0, 10);
 }
 
@@ -159,44 +168,60 @@ export class FinanceService {
     return page.items;
   }
 
-  /** Record a payment, post it to the GL, then recompute the invoice. */
+  /** Record a payment, post it to the GL, then recompute the invoice — atomically. */
   async applyPayment(ctx: RequestContext, invoiceId: string, input: PaymentInput): Promise<EntityRecord> {
     const invoice = await this.qe.get(ctx, "invoice", invoiceId);
-    const number = await this.seq.next(ctx.tenantId, "P");
-    const payment = await this.qe.createWithComputed(
-      ctx,
-      "payment",
-      {
-        invoiceId,
-        accountId: invoice.accountId,
-        branchId: invoice.branchId ?? null,
-        dealerId: invoice.dealerId ?? null,
-        amount: input.amount,
-        method: input.method,
-        paidAt: input.paidAt,
-        notes: input.notes ?? null,
-      },
-      { number },
+    if (!(input.amount > 0)) throw new BadRequestError("payment amount must be positive");
+    // Reject overpayment: the tendered amount may not exceed the open balance
+    // (a small epsilon absorbs rounding). Prevents a silent negative AR balance.
+    const already = round2(
+      (await this.listPayments(ctx, invoiceId)).reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0),
     );
-    // Synchronous, idempotent GL posting (Dr Cash, Cr AR).
-    await postPaymentGL(ctx, payment);
-    return this.recomputeInvoice(ctx, invoiceId);
+    const balance = round2(Number(invoice.total ?? 0) - already);
+    if (input.amount > balance + 0.005) {
+      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`);
+    }
+    return this.qe.runInTransaction(async () => {
+      const number = await this.seq.next(ctx.tenantId, "P");
+      const payment = await this.qe.createWithComputed(
+        ctx,
+        "payment",
+        {
+          invoiceId,
+          accountId: invoice.accountId,
+          branchId: invoice.branchId ?? null,
+          dealerId: invoice.dealerId ?? null,
+          amount: input.amount,
+          method: input.method,
+          paidAt: input.paidAt,
+          notes: input.notes ?? null,
+        },
+        { number },
+      );
+      // Synchronous, idempotent GL posting (Dr Cash, Cr AR).
+      await postPaymentGL(ctx, payment);
+      return this.recomputeInvoice(ctx, invoiceId);
+    });
   }
 
   async recomputeInvoice(ctx: RequestContext, invoiceId: string): Promise<EntityRecord> {
-    const invoice = await this.qe.get(ctx, "invoice", invoiceId);
-    const payments = await this.listPayments(ctx, invoiceId);
-    const amountPaid = round2(
-      payments.reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0),
-    );
-    const total = typeof invoice.total === "number" ? invoice.total : 0;
-    const balance = round2(total - amountPaid);
-    let status = String(invoice.status);
-    if (status !== "void") {
-      if (balance <= 0 && total > 0) status = "paid";
-      else if (amountPaid > 0) status = "partial";
-    }
-    return this.qe.patchComputed(ctx, "invoice", invoiceId, { amountPaid, balance, status });
+    // Version-guarded read-compute-write: two concurrent payments can't clobber
+    // each other's amountPaid/balance (lost update). Replays on a version race.
+    return retryOnConflict(async () => {
+      const invoice = await this.qe.get(ctx, "invoice", invoiceId);
+      const payments = await this.listPayments(ctx, invoiceId);
+      const amountPaid = round2(
+        payments.reduce((s, p) => s + (typeof p.amount === "number" ? p.amount : 0), 0),
+      );
+      const total = typeof invoice.total === "number" ? invoice.total : 0;
+      const balance = round2(total - amountPaid);
+      let status = String(invoice.status);
+      if (status !== "void") {
+        if (balance <= 0 && total > 0) status = "paid";
+        else if (amountPaid > 0) status = "partial";
+      }
+      return this.qe.patchComputed(ctx, "invoice", invoiceId, { amountPaid, balance, status }, invoice.version);
+    });
   }
 
   /** Convert an accepted quote into a draft invoice (copies lines). */

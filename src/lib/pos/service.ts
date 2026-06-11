@@ -20,6 +20,7 @@ import { getFinanceService, type FinanceService, type LineInput } from "@/lib/fi
 import { getDomainService } from "@/lib/domain";
 import { normalizeScan } from "@/lib/barcode/check-digit";
 import { BadRequestError } from "@/lib/enforcement/errors";
+import { retryOnConflict } from "@/lib/data/optimistic";
 
 export interface PosLine {
   productId?: string | null;
@@ -41,6 +42,9 @@ export interface PosCheckoutInput {
   currencyCode?: string;
   lines: PosLine[];
   payments: PosPayment[];
+  /** Client-supplied dedupe token: a double-submit (same key) returns the first
+   *  sale's result instead of ringing up a second invoice. */
+  idempotencyKey?: string | null;
 }
 export interface PosSessionInput {
   branchId?: string | null;
@@ -61,6 +65,10 @@ const round2 = (n: number): number => Math.round(n * 100) / 100;
 export const WALK_IN_ACCOUNT_NAME = "Walk-in Customer";
 
 export class PosService {
+  /** In-flight + recently-completed checkouts, keyed by tenant+idempotency token,
+   *  so a double-submit collapses onto the first sale instead of duplicating it. */
+  private readonly inflight = new Map<string, Promise<PosCheckoutResult>>();
+
   constructor(
     private readonly qe: QueryEngine,
     private readonly finance: FinanceService,
@@ -69,6 +77,26 @@ export class PosService {
 
   private sys(ctx: RequestContext): RequestContext {
     return systemContext(ctx.tenantId, ctx.orgId, { userId: ctx.userId, displayName: ctx.displayName, email: ctx.email });
+  }
+
+  /** Idempotent entry point: dedupe by `idempotencyKey`, then ring the sale. A
+   *  duplicate that arrives while the first is in-flight (or within ~60s after)
+   *  receives the same result; a failed attempt is dropped so a retry can proceed. */
+  async checkout(ctx: RequestContext, input: PosCheckoutInput): Promise<PosCheckoutResult> {
+    const key = input.idempotencyKey ? `${ctx.tenantId}:${ctx.orgId}:${input.idempotencyKey}` : null;
+    if (!key) return this.checkoutInner(ctx, input);
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const p = this.checkoutInner(ctx, input);
+    this.inflight.set(key, p);
+    p.then(
+      () => {
+        const timer = setTimeout(() => this.inflight.delete(key), 60_000);
+        timer.unref?.();
+      },
+      () => this.inflight.delete(key), // failed sale: allow a genuine retry
+    );
+    return p;
   }
 
   /** Resolve a product by exact barcode, then SKU. Returns null if not found. */
@@ -90,72 +118,96 @@ export class PosService {
     return String(created.id);
   }
 
-  /** Ring up a sale: invoice → send (GL + stock issue) → tender as payments. */
-  async checkout(ctx: RequestContext, input: PosCheckoutInput): Promise<PosCheckoutResult> {
+  /** Ring up a sale: invoice → send (GL + stock issue) → tender as payments.
+   *  The whole sale is atomic: if any step fails (e.g. insufficient stock or the
+   *  ledger posting), nothing is committed — no orphan invoice, stock or payment. */
+  private async checkoutInner(ctx: RequestContext, input: PosCheckoutInput): Promise<PosCheckoutResult> {
     if (!input.lines?.length) throw new BadRequestError("cart is empty");
     const sys = this.sys(ctx);
     const domain = await getDomainService();
     const accountId = input.accountId ?? (await this.defaultAccountId(sys));
     const issueDate = ctx.at.slice(0, 10);
 
-    const invoice = await this.finance.createDocument(sys, "invoice", "INV", {
-      accountId,
-      branchId: input.branchId ?? null,
-      dealerId: input.dealerId ?? null,
-      warehouseId: input.warehouseId ?? null,
-      currencyCode: input.currencyCode ?? "USD",
-      issueDate,
-      dueDate: issueDate,
-      status: "draft",
-      notes: input.sessionId ? `POS sale · session ${input.sessionId}` : "POS sale",
+    return this.qe.runInTransaction(async () => {
+      const invoice = await this.finance.createDocument(sys, "invoice", "INV", {
+        accountId,
+        branchId: input.branchId ?? null,
+        dealerId: input.dealerId ?? null,
+        warehouseId: input.warehouseId ?? null,
+        currencyCode: input.currencyCode ?? "USD",
+        issueDate,
+        dueDate: issueDate,
+        status: "draft",
+        notes: input.sessionId ? `POS sale · session ${input.sessionId}` : "POS sale",
+      });
+
+      const lineInputs: LineInput[] = input.lines.map((l) => ({
+        productId: l.productId ?? null,
+        description: l.description ?? "",
+        qty: l.qty,
+        unitPrice: l.unitPrice,
+        taxRate: l.taxRate,
+      }));
+      await this.finance.replaceLines(sys, "invoice", "invoiceLine", "invoiceId", invoice.id, lineInputs);
+
+      // Send: posts AR / Revenue / Tax + COGS and issues stock from warehouseId.
+      await domain.transition(sys, "invoice", invoice.id, "send");
+
+      const after = await this.qe.get(sys, "invoice", invoice.id);
+      const total = round2(Number(after.total ?? 0));
+
+      // The GL posting runs through the (failure-isolating) event bus, so verify
+      // it actually landed — otherwise roll the whole sale back rather than hand
+      // the cashier a receipt for an unposted invoice.
+      if (total > 0) {
+        const posted = await this.qe.list(sys, "journalEntry", {
+          filters: [
+            { field: "source", op: "eq", value: "invoice" },
+            { field: "sourceRef", op: "eq", value: invoice.id },
+            { field: "status", op: "eq", value: "posted" },
+          ],
+          pageSize: 1,
+        });
+        if (posted.total === 0) throw new BadRequestError("sale could not be completed (stock or ledger posting failed)");
+      }
+
+      const tendered = round2((input.payments ?? []).reduce((s, p) => s + (p.amount > 0 ? p.amount : 0), 0));
+      const change = round2(Math.max(0, tendered - total));
+
+      // Apply tender (cap the recorded payment at the balance so we never overpay
+      // the AR ledger; the change is returned from the drawer, not posted).
+      let paid = 0;
+      let remaining = total;
+      for (const p of input.payments ?? []) {
+        if (p.amount <= 0 || remaining <= 0) continue;
+        const applied = round2(Math.min(p.amount, remaining));
+        if (applied <= 0) continue;
+        await this.finance.applyPayment(sys, invoice.id, { amount: applied, method: p.method, paidAt: issueDate });
+        paid = round2(paid + applied);
+        remaining = round2(remaining - applied);
+      }
+
+      if (input.sessionId) await this.accumulateSession(sys, input.sessionId, total, input.payments ?? [], change);
+
+      const doc = await this.finance.getDocument(sys, "invoice", "invoiceLine", "invoiceId", invoice.id);
+      return { invoice: doc.doc, lines: doc.lines, total, paid, change };
     });
-
-    const lineInputs: LineInput[] = input.lines.map((l) => ({
-      productId: l.productId ?? null,
-      description: l.description ?? "",
-      qty: l.qty,
-      unitPrice: l.unitPrice,
-      taxRate: l.taxRate,
-    }));
-    await this.finance.replaceLines(sys, "invoice", "invoiceLine", "invoiceId", invoice.id, lineInputs);
-
-    // Send: posts AR / Revenue / Tax + COGS and issues stock from warehouseId.
-    await domain.transition(sys, "invoice", invoice.id, "send");
-
-    const after = await this.qe.get(sys, "invoice", invoice.id);
-    const total = round2(Number(after.total ?? 0));
-    const tendered = round2((input.payments ?? []).reduce((s, p) => s + (p.amount > 0 ? p.amount : 0), 0));
-    const change = round2(Math.max(0, tendered - total));
-
-    // Apply tender (cap the recorded payment at the balance so we never overpay
-    // the AR ledger; the change is returned from the drawer, not posted).
-    let paid = 0;
-    let remaining = total;
-    for (const p of input.payments ?? []) {
-      if (p.amount <= 0 || remaining <= 0) continue;
-      const applied = round2(Math.min(p.amount, remaining));
-      if (applied <= 0) continue;
-      await this.finance.applyPayment(sys, invoice.id, { amount: applied, method: p.method, paidAt: issueDate });
-      paid = round2(paid + applied);
-      remaining = round2(remaining - applied);
-    }
-
-    if (input.sessionId) await this.accumulateSession(sys, input.sessionId, total, input.payments ?? [], change);
-
-    const doc = await this.finance.getDocument(sys, "invoice", "invoiceLine", "invoiceId", invoice.id);
-    return { invoice: doc.doc, lines: doc.lines, total, paid, change };
   }
 
-  /** Fold a completed sale into the open session's running cash/sales totals. */
+  /** Fold a completed sale into the open session's running cash/sales totals.
+   *  Version-guarded so two registers/checkouts on the same session can't lose
+   *  each other's accruals (which would corrupt the cash-variance reconciliation). */
   private async accumulateSession(ctx: RequestContext, sessionId: string, total: number, payments: PosPayment[], change: number): Promise<void> {
-    const session = await this.qe.get(ctx, "posSession", sessionId).catch(() => null);
-    if (!session || session.status !== "open") return;
     const cashPaid = round2(payments.filter((p) => p.method === "cash").reduce((s, p) => s + (p.amount > 0 ? p.amount : 0), 0));
     const cashKept = Math.max(0, round2(cashPaid - change));
-    const salesTotal = round2(Number(session.salesTotal ?? 0) + total);
-    const cashTotal = round2(Number(session.cashTotal ?? 0) + cashKept);
-    const expectedCash = round2(Number(session.openingFloat ?? 0) + cashTotal);
-    await this.qe.patchComputed(ctx, "posSession", sessionId, { salesTotal, cashTotal, expectedCash });
+    await retryOnConflict(async () => {
+      const session = await this.qe.get(ctx, "posSession", sessionId).catch(() => null);
+      if (!session || session.status !== "open") return;
+      const salesTotal = round2(Number(session.salesTotal ?? 0) + total);
+      const cashTotal = round2(Number(session.cashTotal ?? 0) + cashKept);
+      const expectedCash = round2(Number(session.openingFloat ?? 0) + cashTotal);
+      await this.qe.patchComputed(ctx, "posSession", sessionId, { salesTotal, cashTotal, expectedCash }, session.version);
+    });
   }
 
   // ---- shift / till sessions ----

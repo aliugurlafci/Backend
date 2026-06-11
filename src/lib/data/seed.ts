@@ -388,22 +388,29 @@ export async function seedInto(repo: Repository): Promise<void> {
   }
 
   // --- People: departments + staff ---
-  const deptSales = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Sales", head: "Morgan Manager", headcount: 8 });
-  const deptEng = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Engineering", head: "Dana Lee", headcount: 14 });
-  const deptSupport = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Support", head: "Sam Park", headcount: 5 });
-  for (const d of [deptSales, deptEng, deptSupport]) await put(d);
+  // Staff are created first so a department's `head` can point at a real person
+  // ("employee:<id>") and reports can link to their manager via `managerRef` —
+  // which drives the live-derived headcount. Managers' own departmentId is wired
+  // after the departments exist.
+  const morgan = mk("employee", DEMO_TENANT, DEMO_ORG, mgr, { firstName: "Morgan", lastName: "Manager", email: "morgan@aula.example", phone: "+1-555-0300", title: "Sales Manager", branchId: hq.id, status: "active" });
+  const dana = mk("employee", DEMO_TENANT, DEMO_ORG, mgr, { firstName: "Dana", lastName: "Lee", email: "dana@aula.example", phone: "+1-555-0302", title: "Eng Lead", branchId: hq.id, status: "active" });
+  const sam = mk("employee", DEMO_TENANT, DEMO_ORG, mgr, { firstName: "Sam", lastName: "Park", email: "sam@aula.example", phone: "+1-555-0303", title: "Support Lead", branchId: branchEast.id, status: "on_leave" });
 
-  // Staff are scoped to a branch (headquarters/branch) or a dealer.
-  const staff: Record<string, string>[] = [
-    { firstName: "Morgan", lastName: "Manager", email: "morgan@aula.example", phone: "+1-555-0300", title: "Sales Manager", departmentId: deptSales.id, branchId: hq.id, status: "active" },
-    { firstName: "Riley", lastName: "Rep", email: "riley@aula.example", phone: "+1-555-0301", title: "Account Executive", departmentId: deptSales.id, branchId: branchEast.id, status: "active" },
-    { firstName: "Dana", lastName: "Lee", email: "dana@aula.example", phone: "+1-555-0302", title: "Eng Lead", departmentId: deptEng.id, branchId: hq.id, status: "active" },
-    { firstName: "Sam", lastName: "Park", email: "sam@aula.example", phone: "+1-555-0303", title: "Support Lead", departmentId: deptSupport.id, branchId: branchEast.id, status: "on_leave" },
-    { firstName: "Cory", lastName: "Channel", email: "cory@aula.example", phone: "+1-555-0304", title: "Dealer Account Manager", departmentId: deptSales.id, dealerId: dealerAcme.id, status: "active" },
-  ];
-  for (const e of staff) {
-    await put(mk("employee", DEMO_TENANT, DEMO_ORG, mgr, e));
-  }
+  const deptSales = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Sales", head: `employee:${morgan.id}` });
+  const deptEng = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Engineering", head: `employee:${dana.id}` });
+  const deptSupport = mk("department", DEMO_TENANT, DEMO_ORG, mgr, { name: "Support", head: `employee:${sam.id}` });
+
+  morgan.departmentId = deptSales.id;
+  dana.departmentId = deptEng.id;
+  sam.departmentId = deptSupport.id;
+
+  // Reports — `managerRef` links each to their manager so the manager's
+  // department headcount derives to a real number on read.
+  const riley = mk("employee", DEMO_TENANT, DEMO_ORG, mgr, { firstName: "Riley", lastName: "Rep", email: "riley@aula.example", phone: "+1-555-0301", title: "Account Executive", departmentId: deptSales.id, branchId: branchEast.id, status: "active", managerRef: `employee:${morgan.id}` });
+  const cory = mk("employee", DEMO_TENANT, DEMO_ORG, mgr, { firstName: "Cory", lastName: "Channel", email: "cory@aula.example", phone: "+1-555-0304", title: "Dealer Account Manager", departmentId: deptSales.id, dealerId: dealerAcme.id, status: "active", managerRef: `employee:${morgan.id}` });
+
+  for (const d of [deptSales, deptEng, deptSupport]) await put(d);
+  for (const e of [morgan, dana, sam, riley, cory]) await put(e);
 
   // --- Calendar events (shared org calendar; admin-managed) ---
   for (const ev of [

@@ -35,8 +35,26 @@ export class PurchasingService {
     return systemContext(ctx.tenantId, ctx.orgId, { userId: ctx.userId, displayName: ctx.displayName, email: ctx.email });
   }
 
-  /** Publish a domain event (notifications, automation, webhooks subscribe). */
+  /**
+   * Publish a domain event (notifications, automation, webhooks subscribe).
+   *
+   * Attaches the FULL entity record to the payload (entity = the part of the type
+   * before the dot, id = payload.id) so automation `{{record.*}}` resolves the
+   * same way it does for DomainService events — without these bespoke emits
+   * shipping a thin `{id, …}` payload. Transient payload keys (number, ownerId,
+   * reason, …) survive alongside `record`. Fetch failures (e.g. a just-deleted
+   * row) leave the record absent rather than blocking the event.
+   */
   private async emit(ctx: RequestContext, type: string, payload: Record<string, unknown>): Promise<void> {
+    let record = payload.record;
+    if (record == null && typeof payload.id === "string") {
+      const entity = type.split(".")[0];
+      try {
+        record = await this.qe.get(this.sys(ctx), entity, payload.id);
+      } catch {
+        /* row unreadable / gone — publish without a record (subscriber falls back to {id}) */
+      }
+    }
     await eventBus.publish({
       id: newId("evt"),
       type,
@@ -45,7 +63,7 @@ export class PurchasingService {
       orgId: ctx.orgId,
       actorId: ctx.userId,
       correlationId: ctx.correlationId,
-      payload,
+      payload: record == null ? payload : { ...payload, record },
     });
   }
 

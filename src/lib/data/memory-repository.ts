@@ -62,6 +62,32 @@ export class InMemoryRepository implements Repository {
   private collections = new Map<string, Map<string, EntityRecord>>();
   /** Per-entity id counter — emulates `INT IDENTITY(1,1)`. */
   private counters = new Map<string, number>();
+  /** Depth of the active transaction (0 = none). Nested tx join the outermost. */
+  private txDepth = 0;
+
+  /**
+   * Atomic block. Snapshots every collection + counter before running `fn`
+   * (records are replaced wholesale on write — never mutated in place — so a
+   * shallow Map clone is a faithful point-in-time copy). On throw, restores the
+   * snapshot (rollback). Nested calls just run inline under the outer snapshot.
+   */
+  async runInTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.txDepth > 0) return fn(); // join the outer transaction
+    const snapCollections = new Map<string, Map<string, EntityRecord>>();
+    for (const [k, v] of this.collections) snapCollections.set(k, new Map(v));
+    const snapCounters = new Map(this.counters);
+    this.txDepth++;
+    try {
+      const result = await fn();
+      return result;
+    } catch (e) {
+      this.collections = snapCollections; // rollback
+      this.counters = snapCounters;
+      throw e;
+    } finally {
+      this.txDepth--;
+    }
+  }
 
   private collection(entity: string): Map<string, EntityRecord> {
     let c = this.collections.get(entity);
@@ -119,6 +145,12 @@ export class InMemoryRepository implements Repository {
     }
     this.collection(entity).set(stored.id, stored);
     return stored;
+  }
+
+  async bulkInsert(entity: string, records: EntityRecord[]): Promise<EntityRecord[]> {
+    const out: EntityRecord[] = [];
+    for (const record of records) out.push(await this.insert(entity, record));
+    return out;
   }
 
   async update(

@@ -53,6 +53,7 @@ export const fieldDefSchema = z
     defaultValue: z.unknown().optional(),
     computed: z.boolean().optional(),
     suggest: z.boolean().optional(),
+    personPicker: z.boolean().optional(),
   })
   .refine((f) => f.type !== "enum" || (f.options?.length ?? 0) > 0, {
     message: "enum fields require at least one option",
