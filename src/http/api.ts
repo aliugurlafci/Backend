@@ -34,7 +34,8 @@ import { cache } from "@/lib/cache/cache";
 import { statsKey } from "@/lib/cache/invalidation";
 import { notifications, notifyUser, buildInAppMuteFilter } from "@/lib/integrations/notifications";
 import { webhookRegistry, testWebhook } from "@/lib/integrations/webhooks";
-import { exportCsv, importCsv, importXlsx, buildImportTemplate } from "@/lib/integrations/import-export";
+import { exportCsv, importCsv, importXlsx, buildImportTemplate, parseImportFile } from "@/lib/integrations/import-export";
+import { startImportJob, getImportJob, toView } from "@/lib/integrations/import-jobs";
 import { exportXlsx, exportPdf } from "@/lib/integrations/export-formats";
 import { renderReportXlsx, type ReportPayload } from "@/lib/integrations/report-export";
 import { runAllJobs, jobsStatus } from "@/lib/jobs/scheduler";
@@ -49,6 +50,7 @@ import {
   processQueue,
   getLiveActivity,
   INTEGRATION_PROVIDERS,
+  fieldApplies,
   SYSTEM_SETTINGS,
   type AssignmentRule,
   type AutomationAction,
@@ -66,6 +68,11 @@ import type { Filter, Measure } from "@/lib/data/query";
 import { issuePersonaToken } from "@/lib/security/auth-config";
 import { saveBlob, readBlob } from "@/lib/integrations/file-storage";
 import { sendMail, fetchHeaders, fetchBodiesByUid, deleteOnServer, restoreOnServer } from "@/lib/integrations/email-transport";
+import { sendSms } from "@/lib/integrations/sms-transport";
+import { sendWhatsApp } from "@/lib/integrations/whatsapp-transport";
+import { sendSlack } from "@/lib/integrations/slack-transport";
+import { restTestConnection } from "@/lib/integrations/rest-transport";
+import { erpTestConnection } from "@/lib/integrations/erp-transport";
 import { login, getPosition, parseScreens, findUserById, recordSecurityEvent } from "@/lib/security/auth-service";
 import { randomBase32Secret, totpUri, totpVerify, encrypt, decrypt, hashPassword, verifyPassword } from "@/lib/security/crypto";
 import { SESSION_COOKIE } from "@/lib/security/auth";
@@ -817,6 +824,36 @@ export function buildApiRouter(): Router {
       },
       { mutating: true },
     ),
+  );
+
+  // Background import: parse the file (fail fast on corrupt uploads), register a
+  // job and return its id immediately. Large imports (20k+ rows) must not block
+  // the request/response — a proxy/DB timeout would abort them mid-write — so the
+  // rows are processed in the background and the client polls the GET below.
+  r.post(
+    "/import/:entity/job",
+    runApi(
+      async (rc, req) => {
+        assertKnownEntity(req.params.entity);
+        const body = readJson(req) as { csv?: string; xlsx?: string; aliases?: Record<string, string> };
+        const domain = await getDomainService();
+        const rows = await parseImportFile(body);
+        const job = startImportJob(rc, req.params.entity, rows, metadata, domain, body.aliases);
+        return toView(job);
+      },
+      { mutating: true, status: 202 },
+    ),
+  );
+
+  // Poll an import job's progress / final result (scoped to the caller's tenant).
+  r.get(
+    "/import/:entity/job/:id",
+    runApi(async (rc, req) => {
+      assertKnownEntity(req.params.entity);
+      const job = getImportJob(rc, req.params.id);
+      if (!job) throw new NotFoundError("import job", req.params.id);
+      return toView(job);
+    }),
   );
 
   // ---- quotes -----------------------------------------------------------
@@ -2070,18 +2107,67 @@ export function buildApiRouter(): Router {
             message: `SMTP ${cfg.smtpConfigured ? "ready" : "not configured"} · IMAP ${cfg.imapConfigured ? "ready" : "not configured"}`,
           };
         }
-        const filled = def.fields.filter((f) => {
-          const v = state.config[f.key];
-          return v !== undefined && v !== null && String(v) !== "";
-        }).length;
-        const ok = state.enabled && filled > 0;
+        const isBlank = (key: string) => {
+          const v = state.config[key];
+          return v === undefined || v === null || String(v).trim() === "";
+        };
+        if (!state.enabled) {
+          return { ok: false, message: "Integration is disabled — enable it to connect." };
+        }
+        // Only validate the fields the chosen provider actually uses (each field's
+        // `showWhen` is evaluated against the saved config).
+        const activeFields = def.fields.filter((f) => fieldApplies(f, state.config));
+        // Every active field flagged `required` must be present…
+        const missing = activeFields.filter((f) => f.required && isBlank(f.key)).map((f) => f.label);
+        // …and each `requireOneOf` group needs at least one of its active fields.
+        const oneOfMissing = (def.requireOneOf ?? [])
+          .map((grp) => grp.filter((k) => activeFields.some((f) => f.key === k)))
+          .filter((grp) => grp.length > 0 && grp.every(isBlank))
+          .map((grp) => grp.map((k) => def.fields.find((f) => f.key === k)?.label ?? k).join(" / "));
+        if (missing.length || oneOfMissing.length) {
+          const parts: string[] = [];
+          if (missing.length) parts.push(`Missing required: ${missing.join(", ")}`);
+          if (oneOfMissing.length) parts.push(`Provide at least one of: ${oneOfMissing.join("; ")}`);
+          return { ok: false, message: parts.join(" · ") };
+        }
+        // Live check: actually exercise the connection so the admin gets real
+        // confirmation, not just "settings look complete".
+        const scope = { tenantId: rc.tenantId, orgId: rc.orgId };
+        const testTo = String((readJson(req) as { to?: string }).to ?? "").trim();
+        if (provider === "sms" && testTo) {
+          const res = await sendSms(scope, testTo, "Aula CRM — SMS gateway test ✓");
+          return res.ok
+            ? { ok: true, message: `Test SMS sent to ${testTo}${res.id ? ` (${res.id})` : ""}` }
+            : { ok: false, message: `Test SMS failed: ${res.error ?? "unknown error"}` };
+        }
+        if (provider === "whatsapp" && testTo) {
+          const res = await sendWhatsApp(scope, testTo, "Aula CRM — WhatsApp test ✓");
+          return res.ok
+            ? { ok: true, message: `Test WhatsApp sent to ${testTo}${res.id ? ` (${res.id})` : ""}` }
+            : { ok: false, message: `Test WhatsApp failed: ${res.error ?? "unknown error"}` };
+        }
+        if (provider === "slack") {
+          const res = await sendSlack(scope, "Aula CRM — Slack integration test ✓");
+          return res.ok
+            ? { ok: true, message: "Test message posted to Slack" }
+            : { ok: false, message: `Slack test failed: ${res.error ?? "unknown error"}` };
+        }
+        if (provider === "rest") {
+          const res = await restTestConnection(scope);
+          return res.ok
+            ? { ok: true, message: `REST endpoint reachable (HTTP ${res.status ?? "200"})` }
+            : { ok: false, message: `REST test failed: ${res.error ?? "unknown error"}${res.status ? ` (HTTP ${res.status})` : ""}` };
+        }
+        if (provider === "erp") {
+          const res = await erpTestConnection(scope);
+          return res.ok
+            ? { ok: true, message: `ERP reachable${res.status ? ` (HTTP ${res.status})` : ""}${res.error ? ` — ${res.error}` : ""}` }
+            : { ok: false, message: `ERP test failed: ${res.error ?? "unknown error"}` };
+        }
+        const filled = activeFields.filter((f) => !isBlank(f.key)).length;
         return {
-          ok,
-          message: ok
-            ? `${filled} setting(s) configured — connection looks ready`
-            : state.enabled
-              ? "No connection details configured yet"
-              : "Integration is disabled",
+          ok: true,
+          message: `All required settings present — ${filled} field(s) configured, connection looks ready.`,
         };
       },
       { mutating: true },

@@ -265,8 +265,10 @@ export class MssqlRepository implements Repository {
     const names = cols.map((c) => ident(c.name)).join(", ");
 
     // SQL Server caps a single request at 2100 parameters and an INSERT…VALUES
-    // at 1000 row-expressions. Chunk to stay under both (with headroom).
-    const perRow = Math.max(1000, cols.length);
+    // at 1000 row-expressions. perRow = params each row consumes (its column
+    // count); chunk so paramsPerStatement (chunkSize × perRow) stays < 2100 and
+    // rows/statement ≤ 1000. The Math.max(1, …) only guards divide-by-zero.
+    const perRow = Math.max(1, cols.length);
     const chunkSize = Math.max(1, Math.min(1000, Math.floor(2000 / perRow)));
 
     const out: EntityRecord[] = [];

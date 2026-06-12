@@ -83,6 +83,13 @@ export interface ImportResult {
  *  labels the UI shows), so a file headed in the user's language still maps. */
 export type ImportAliases = Record<string, string>;
 
+/** Running tallies reported to a progress callback while a batched import runs. */
+export interface ImportProgress {
+  processed: number;
+  created: number;
+  failed: number;
+}
+
 /** Coerce any ExcelJS cell value to text (rich text, hyperlinks, formula results,
  *  dates → ISO date). */
 function cellText(v: unknown): string {
@@ -162,6 +169,7 @@ export async function importRows(
   metadata: MetadataResolver,
   domain: DomainService,
   aliases?: ImportAliases,
+  onProgress?: (progress: ImportProgress) => void,
 ): Promise<ImportResult> {
   const entity = metadata.getEntity(entityName);
   const lifecycleField = entity.lifecycle?.field;
@@ -211,12 +219,29 @@ export async function importRows(
   }
 
   const qe = await getQueryEngine();
-  const { created, errors } = await qe.bulkCreate(ctx, entityName, inputs);
-  return {
-    created: created.map((r) => String(r.id)),
-    errors: errors.map((e) => ({ row: rowNumbers[e.index] ?? e.index + 1, message: e.message })),
-    ignored,
-  };
+  const created: string[] = [];
+  const errors: { row: number; message: string }[] = [];
+
+  // Process in batches so a huge import (a) can report progress to a background
+  // job and (b) commits incrementally rather than as one monster statement.
+  // Each batch's uniqueness preload re-reads already-committed rows, so a
+  // duplicate that spans two batches is still caught.
+  const BATCH = 1000;
+  onProgress?.({ processed: 0, created: 0, failed: 0 });
+  for (let start = 0; start < inputs.length; start += BATCH) {
+    const slice = inputs.slice(start, start + BATCH);
+    const res = await qe.bulkCreate(ctx, entityName, slice);
+    for (const r of res.created) created.push(String(r.id));
+    for (const e of res.errors) {
+      errors.push({ row: rowNumbers[start + e.index] ?? start + e.index + 1, message: e.message });
+    }
+    onProgress?.({
+      processed: Math.min(start + slice.length, inputs.length),
+      created: created.length,
+      failed: errors.length,
+    });
+  }
+  return { created, errors, ignored };
 }
 
 export async function importCsv(
@@ -230,6 +255,22 @@ export async function importCsv(
   return importRows(ctx, entityName, parseCsv(csv), metadata, domain, aliases);
 }
 
+/** Parse an uploaded import payload (base64 .xlsx or raw CSV text) into rows of
+ *  string cells — shared by the synchronous import endpoints and the background
+ *  import job, so both read the file the same way. */
+export async function parseImportFile(payload: { xlsx?: string; csv?: string }): Promise<string[][]> {
+  if (payload.xlsx) {
+    try {
+      return await parseXlsx(Buffer.from(payload.xlsx, "base64"));
+    } catch {
+      // A corrupt file or an old .xls (BIFF, which exceljs can't read) — surface
+      // a clear 400 instead of an opaque 500.
+      throw new BadRequestError("Couldn't read the Excel file. Save it as a modern .xlsx workbook and try again.");
+    }
+  }
+  return parseCsv(payload.csv ?? "");
+}
+
 export async function importXlsx(
   ctx: RequestContext,
   entityName: string,
@@ -238,14 +279,7 @@ export async function importXlsx(
   domain: DomainService,
   aliases?: ImportAliases,
 ): Promise<ImportResult> {
-  let rows: string[][];
-  try {
-    rows = await parseXlsx(Buffer.from(base64, "base64"));
-  } catch {
-    // A corrupt file or an old .xls (BIFF, which exceljs can't read) — surface a
-    // clear 400 instead of an opaque 500.
-    throw new BadRequestError("Couldn't read the Excel file. Save it as a modern .xlsx workbook and try again.");
-  }
+  const rows = await parseImportFile({ xlsx: base64 });
   return importRows(ctx, entityName, rows, metadata, domain, aliases);
 }
 

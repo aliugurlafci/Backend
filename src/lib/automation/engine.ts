@@ -14,6 +14,10 @@ import { getQueryEngine } from "@/lib/data/store";
 import { metadata } from "@/lib/metadata";
 import { notifications } from "@/lib/integrations/notifications";
 import { sendMail } from "@/lib/integrations/email-transport";
+import { sendSms } from "@/lib/integrations/sms-transport";
+import { sendWhatsApp } from "@/lib/integrations/whatsapp-transport";
+import { sendSlack } from "@/lib/integrations/slack-transport";
+import { restRequest } from "@/lib/integrations/rest-transport";
 import { logger } from "@/lib/observability/logger";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { automationStore } from "./store";
@@ -337,31 +341,105 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
         bump(ec.output, "emails");
         break;
       }
-      case "send_sms":
-      case "send_whatsapp":
-      case "notify": {
-        const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
+      case "send_sms": {
         const to = interpolate(action.to, ec.record).trim();
-        // SMS/WhatsApp need a recipient — skip (like send_email) when the address
-        // resolves empty. `notify` is a team broadcast and may have no address.
-        if (action.type !== "notify" && !to) {
+        const text = interpolate(action.body, ec.record) || "Sent by automation.";
+        if (!to) {
           step.status = "skipped";
           step.output = recipientSkipReason(action.to);
           break;
         }
         if (!ec.dry) {
+          // Send a real text over the tenant's configured SMS gateway.
+          const res = await sendSms({ tenantId: ec.ctx.tenantId, orgId: ec.ctx.orgId }, to, text);
+          if (res.ok) {
+            step.output = `SMS → ${to} (sent${res.id ? `, ${res.id}` : ""})`;
+          } else if (res.notConfigured) {
+            // No gateway configured — fall back to an in-app notification so the
+            // action still has a visible effect (configure the SMS Gateway under
+            // Automation → Integrations to send real texts).
+            notifications.add({
+              at: ec.ctx.at,
+              tenantId: ec.ctx.tenantId,
+              orgId: ec.ctx.orgId,
+              channel: "system",
+              subject: interpolate(action.subject, ec.record) || defaultSubject(action.type),
+              body: text,
+              eventType: "automation.send_sms",
+            });
+            step.output = `SMS → ${to} (gateway not configured — in-app notification)`;
+          } else {
+            step.status = "failed";
+            step.error = res.error;
+            step.output = `SMS failed → ${to}: ${res.error}`;
+          }
+        } else {
+          step.output = `would send SMS → ${to}`;
+        }
+        bump(ec.output, "notifications");
+        break;
+      }
+      case "send_whatsapp": {
+        const to = interpolate(action.to, ec.record).trim();
+        const text = interpolate(action.body, ec.record) || "Sent by automation.";
+        if (!to) {
+          step.status = "skipped";
+          step.output = recipientSkipReason(action.to);
+          break;
+        }
+        if (!ec.dry) {
+          // Send a real WhatsApp message over the tenant's configured provider.
+          const res = await sendWhatsApp({ tenantId: ec.ctx.tenantId, orgId: ec.ctx.orgId }, to, text);
+          if (res.ok) {
+            step.output = `WhatsApp → ${to} (sent${res.id ? `, ${res.id}` : ""})`;
+          } else if (res.notConfigured) {
+            notifications.add({
+              at: ec.ctx.at,
+              tenantId: ec.ctx.tenantId,
+              orgId: ec.ctx.orgId,
+              channel: "system",
+              subject: interpolate(action.subject, ec.record) || defaultSubject(action.type),
+              body: text,
+              eventType: "automation.send_whatsapp",
+            });
+            step.output = `WhatsApp → ${to} (not configured — in-app notification)`;
+          } else {
+            step.status = "failed";
+            step.error = res.error;
+            step.output = `WhatsApp failed → ${to}: ${res.error}`;
+          }
+        } else {
+          step.output = `would send WhatsApp → ${to}`;
+        }
+        bump(ec.output, "notifications");
+        break;
+      }
+      case "notify": {
+        const subject = interpolate(action.subject, ec.record) || defaultSubject(action.type);
+        const to = interpolate(action.to, ec.record).trim();
+        const bodyText = interpolate(action.body, ec.record) || "notify via automation";
+        let extra = "";
+        if (!ec.dry) {
+          // Always record an in-app notification…
           notifications.add({
             at: ec.ctx.at,
             tenantId: ec.ctx.tenantId,
             orgId: ec.ctx.orgId,
             channel: "system",
             subject,
-            body: interpolate(action.body, ec.record) || `${action.type} via automation`,
-            eventType: `automation.${action.type}`,
+            body: bodyText,
+            eventType: "automation.notify",
           });
+          // …and fan out to Slack when that integration is enabled (best-effort).
+          const slack = await sendSlack(
+            { tenantId: ec.ctx.tenantId, orgId: ec.ctx.orgId },
+            subject ? `*${subject}*\n${bodyText}` : bodyText,
+          );
+          if (slack.ok) extra = " + Slack";
+          else if (!slack.notConfigured) extra = ` (Slack failed: ${slack.error})`;
         }
         bump(ec.output, "notifications");
-        step.output = to ? `${prettyChannel(action.type)} → ${to}` : `${prettyChannel(action.type)} sent`;
+        step.output = (to ? `Notify → ${to}` : "Notify sent") + extra;
         break;
       }
       case "create_task": {
@@ -483,13 +561,26 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
           break;
         }
         if (!ec.dry) {
-          const res = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-aula-event": "automation" },
-            body: JSON.stringify({ record: ec.record }),
-          });
-          if (!res.ok) throw new Error(`webhook returned ${res.status}`);
-          step.output = `POST ${url} → ${res.status}`;
+          // Route through the REST/API integration when it's enabled and the URL
+          // targets its own origin — so the call carries the configured auth /
+          // headers / HMAC signature. Otherwise send a plain unauthenticated POST.
+          const viaRest = await restRequest(
+            { tenantId: ec.ctx.tenantId, orgId: ec.ctx.orgId },
+            { url, method: "POST", body: { record: ec.record }, sameOriginOnly: true },
+          );
+          if (viaRest.notConfigured) {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "content-type": "application/json", "x-aula-event": "automation" },
+              body: JSON.stringify({ record: ec.record }),
+            });
+            if (!res.ok) throw new Error(`webhook returned ${res.status}`);
+            step.output = `POST ${url} → ${res.status}`;
+          } else if (viaRest.ok) {
+            step.output = `POST ${url} → ${viaRest.status} (REST integration)`;
+          } else {
+            throw new Error(`webhook failed: ${viaRest.error}`);
+          }
         } else {
           step.output = `would POST ${url}`;
         }

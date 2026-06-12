@@ -26,6 +26,7 @@ export {
   resolveEmailConfig,
   integrationDefaults,
   getProviderDef,
+  fieldApplies,
 } from "./integrations";
 export type { IntegrationProviderDef, IntegrationField, IntegrationConfig, ResolvedEmailConfig } from "./integrations";
 export { SYSTEM_SETTINGS } from "./system-config";
