@@ -62,6 +62,37 @@ export const MOBILE_IMPLEMENTED_SCREENS = [
   "settings",
 ] as const;
 
+/**
+ * Extra (non-entity) catalog screens the companion app now renders through its
+ * generic hosts — dashboards + the activity feed (from /stats, /activity) and the
+ * comms/admin tools backed by an entity list. Together with every entity screen
+ * (all covered by the generic entity browser), this is the full set the admin UI
+ * flags as mobile-supported. It is intentionally separate from the *default*
+ * mobile config (MOBILE_IMPLEMENTED_SCREENS, the POS core): admins opt the rest
+ * in per client / position / user.
+ */
+export const MOBILE_SUPPORTED_EXTRAS: string[] = [
+  ...MOBILE_IMPLEMENTED_SCREENS,
+  "sales-dashboard",
+  "deals-dashboard",
+  "inventory-dashboard",
+  "accounting-dashboard",
+  "branch-dashboard",
+  "executive-dashboard",
+  "revenue-dashboard",
+  "growth-dashboard",
+  "pipeline",
+  "reports",
+  "finance",
+  "activity",
+  "email",
+  "calendar",
+  "file-manager",
+  "todo",
+  "notes",
+  "automation",
+];
+
 /** One screen per non-system entity (its list/detail screen). */
 export function entityScreens(metadata: MetadataResolver): ScreenDef[] {
   return metadata

@@ -60,8 +60,9 @@ import {
 } from "@/lib/automation";
 import { publishMetadata } from "@/lib/config/governance";
 import { releaseLog } from "@/lib/config/release";
-import { MIGRATIONS } from "@/lib/config/migrations";
+import { schemaStatus } from "@/lib/data/mssql/migrate";
 import { metrics } from "@/lib/observability/metrics";
+import { getInflight } from "@/lib/http/resilience";
 import { env, isProduction, usingInMemoryBackends } from "@/lib/config/env";
 import { BadRequestError, ForbiddenError, NotFoundError, toAppError } from "@/lib/enforcement/errors";
 import type { Filter, Measure } from "@/lib/data/query";
@@ -383,12 +384,12 @@ export function buildApiRouter(): Router {
         assertPasswordStrength(body.newPassword);
         const user = await findUserById(rc.userId);
         if (!user) throw new BadRequestError("no editable profile for this account");
-        if (!verifyPassword(body.currentPassword, String(user.passwordHash ?? ""))) {
+        if (!(await verifyPassword(body.currentPassword, String(user.passwordHash ?? "")))) {
           throw new ForbiddenError("current password is incorrect");
         }
         const qe = await getQueryEngine();
         await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, {
-          passwordHash: hashPassword(body.newPassword),
+          passwordHash: await hashPassword(body.newPassword),
         });
         await recordSecurityEvent({ tenantId: rc.tenantId, orgId: rc.orgId }, rc.userId, "password_changed", {
           ip: clientIp(req),
@@ -411,7 +412,7 @@ export function buildApiRouter(): Router {
       const secret = randomBase32Secret();
       const qe = await getQueryEngine();
       await qe.patchComputed(systemContext(rc.tenantId, rc.orgId), "user", rc.userId, {
-        twoFactorSecret: encrypt(secret),
+        twoFactorSecret: await encrypt(secret),
         twoFactorEnabled: false,
       });
       return { secret, otpauth: totpUri(secret, String(user.email ?? rc.email ?? rc.userId)) };
@@ -426,7 +427,7 @@ export function buildApiRouter(): Router {
       const user = await findUserById(rc.userId);
       if (!user?.twoFactorSecret) throw new BadRequestError("start 2FA setup first");
       let secret = "";
-      try { secret = decrypt(String(user.twoFactorSecret)); } catch { secret = ""; }
+      try { secret = await decrypt(String(user.twoFactorSecret)); } catch { secret = ""; }
       if (!secret || !totpVerify(secret, String(body.code ?? ""))) {
         throw new ForbiddenError("invalid authentication code");
       }
@@ -447,7 +448,7 @@ export function buildApiRouter(): Router {
       const body = readJson(req) as { password?: string };
       const user = await findUserById(rc.userId);
       if (!user) throw new BadRequestError("no editable profile for this account");
-      if (!body.password || !verifyPassword(body.password, String(user.passwordHash ?? ""))) {
+      if (!body.password || !(await verifyPassword(body.password, String(user.passwordHash ?? "")))) {
         throw new ForbiddenError("password is incorrect");
       }
       const qe = await getQueryEngine();
@@ -649,7 +650,7 @@ export function buildApiRouter(): Router {
             phone: body.phone || null,
             jobTitle: body.jobTitle || null,
           },
-          { passwordHash: hashPassword(body.password) },
+          { passwordHash: await hashPassword(body.password) },
         );
         return stripHash(record);
       },
@@ -686,7 +687,7 @@ export function buildApiRouter(): Router {
         const qe = await getQueryEngine();
         if (body.password) {
           assertPasswordStrength(body.password);
-          record = await qe.patchComputed(rc, "user", req.params.id, { passwordHash: hashPassword(body.password) });
+          record = await qe.patchComputed(rc, "user", req.params.id, { passwordHash: await hashPassword(body.password) });
         }
         // Admin recovery: clear a user's two-factor enrollment (e.g. lost device).
         if (body.resetTwoFactor) {
@@ -2415,7 +2416,10 @@ export function buildApiRouter(): Router {
 
   r.get("/admin/releases", runApi(async (rc) => {
     if (!rc.roles.includes("admin")) throw new ForbiddenError("only administrators may view the release trail");
-    return { releases: releaseLog.list(), migrations: MIGRATIONS };
+    // Real applied schema versions from the `_schema_migrations` ledger (empty in
+    // memory mode, which has no physical schema).
+    const migrations = usingInMemoryBackends ? [] : await schemaStatus().catch(() => []);
+    return { releases: releaseLog.list(), migrations };
   }));
 
   // ---- files: real upload / download (local-disk storage) ----------------
@@ -2779,6 +2783,7 @@ export function buildApiRouter(): Router {
       status: "ok",
       metadataVersion: metadata.version,
       backends: usingInMemoryBackends ? "in-memory" : "external",
+      inflight: getInflight(),
       metrics: metrics.snapshot(),
     });
   });

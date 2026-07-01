@@ -5,8 +5,8 @@
  * the domain service (so permissions + projection apply); import creates records
  * one by one, collecting per-row errors rather than failing the whole batch.
  */
-import ExcelJS from "exceljs";
 import { BadRequestError } from "@/lib/enforcement/errors";
+import { parseXlsxRows, renderTemplateXlsx } from "./render-pool";
 import { getQueryEngine } from "@/lib/data/store";
 import type { RequestContext } from "@/lib/context/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
@@ -90,35 +90,11 @@ export interface ImportProgress {
   failed: number;
 }
 
-/** Coerce any ExcelJS cell value to text (rich text, hyperlinks, formula results,
- *  dates → ISO date). */
-function cellText(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Date) return v.toISOString().slice(0, 10);
-  if (typeof v === "object") {
-    const o = v as { text?: string; result?: unknown };
-    if (typeof o.text === "string") return o.text;
-    if (o.result !== undefined && o.result !== null) return String(o.result);
-  }
-  return String(v);
-}
-
 /** Parse the first worksheet of an .xlsx workbook into rows of string cells —
- *  the same shape `parseCsv` returns — so xlsx imports reuse the CSV pipeline. */
+ *  the same shape `parseCsv` returns — so xlsx imports reuse the CSV pipeline.
+ *  The exceljs parse runs off the event loop via the render worker pool. */
 export async function parseXlsx(buffer: Buffer): Promise<string[][]> {
-  const wb = new ExcelJS.Workbook();
-  // exceljs's bundled Buffer type lags Node's generic Buffer<ArrayBufferLike>.
-  await wb.xlsx.load(buffer as unknown as Parameters<typeof wb.xlsx.load>[0]);
-  const ws = wb.worksheets[0];
-  if (!ws) return [];
-  const rows: string[][] = [];
-  ws.eachRow({ includeEmpty: false }, (row) => {
-    const vals = row.values as unknown[]; // 1-indexed; index 0 is empty
-    const cells: string[] = [];
-    for (let i = 1; i < vals.length; i++) cells.push(cellText(vals[i]));
-    rows.push(cells);
-  });
-  return rows.filter((r) => r.some((c) => c.trim().length > 0));
+  return parseXlsxRows(buffer);
 }
 
 /** Coerce a raw cell string to the field's stored value. Enum *labels* and Yes/No
@@ -304,12 +280,7 @@ export async function buildImportTemplate(
     return { buffer: Buffer.from(csv, "utf8"), contentType: "text/csv; charset=utf-8", ext: "csv" };
   }
 
-  const wb = new ExcelJS.Workbook();
-  wb.creator = "Aula CRM";
-  const ws = wb.addWorksheet(entity.pluralLabel.slice(0, 31));
-  ws.columns = headers.map((h) => ({ header: h, key: h, width: Math.min(40, Math.max(14, h.length + 6)) }));
-  ws.getRow(1).font = { bold: true };
-  const buffer = Buffer.from((await wb.xlsx.writeBuffer()) as ArrayBuffer);
+  const buffer = await renderTemplateXlsx({ sheetName: entity.pluralLabel.slice(0, 31), headers });
   return {
     buffer,
     contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

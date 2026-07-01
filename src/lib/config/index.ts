@@ -10,5 +10,5 @@ export type { FeatureFlag } from "./feature-flags";
 export { publishMetadata, rollbackMetadata } from "./governance";
 export { releaseLog, ReleaseLog } from "./release";
 export type { ReleaseRecord, ReleaseKind } from "./release";
-export { MIGRATIONS, MigrationRunner, migrationRunner } from "./migrations";
-export type { Migration } from "./migrations";
+// Schema provisioning lives entirely in the metadata-driven migrator
+// (`@/lib/data/mssql/migrate`); the old Postgres-era placeholder is retired.

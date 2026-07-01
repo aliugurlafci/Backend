@@ -10,6 +10,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { env } from "@/lib/config/env";
+import { metrics } from "@/lib/observability/metrics";
 import { BadRequestError, ConflictError } from "@/lib/enforcement/errors";
 import type { EntityRecord } from "@/lib/metadata/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
@@ -26,6 +27,18 @@ import {
   toStorage,
   type ColumnDesc,
 } from "./schema-map";
+
+/** Retries for a transaction chosen as a deadlock victim / lock-timeout casualty. */
+const MAX_DEADLOCK_RETRIES = 4;
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** SQL Server transient lock errors worth retrying: 1205 = deadlock victim,
+ *  1222 = lock request timeout. mssql surfaces the code on `err.number`. */
+function isTransientLockError(err: unknown): boolean {
+  const n = (err as { number?: number })?.number;
+  return n === 1205 || n === 1222;
+}
 
 interface Bound {
   name: string;
@@ -105,19 +118,36 @@ export class MssqlRepository implements Repository {
    * Atomic block: opens a SQL transaction (BEGIN TRAN), runs `fn` with every
    * statement bound to it via AsyncLocalStorage, then COMMIT — or ROLLBACK if
    * `fn` throws. Nested calls join the outer transaction (single boundary).
+   *
+   * Under concurrency (e.g. many POS checkouts contending on the stock ledger)
+   * SQL Server may pick a transaction as a deadlock victim (error 1205) or hit a
+   * lock timeout (1222). Those are transient: the whole block is rolled back and
+   * retried with a short randomised backoff, so a pile-up of concurrent sales
+   * settles instead of surfacing a 500 to the cashier.
    */
   async runInTransaction<T>(fn: () => Promise<T>): Promise<T> {
     if (activeTx.getStore()) return fn(); // already in a transaction — join it
-    const tx = new sql.Transaction(await getPool());
-    await tx.begin();
-    let committed = false;
-    try {
-      const result = await activeTx.run(tx, fn);
-      await tx.commit();
-      committed = true;
-      return result;
-    } finally {
-      if (!committed) await tx.rollback().catch(() => {});
+    for (let attempt = 0; ; attempt++) {
+      const tx = new sql.Transaction(await getPool());
+      await tx.begin();
+      let committed = false;
+      try {
+        const result = await activeTx.run(tx, fn);
+        await tx.commit();
+        committed = true;
+        return result;
+      } catch (err) {
+        if (isTransientLockError(err) && attempt < MAX_DEADLOCK_RETRIES) {
+          metrics.increment("db.deadlockRetry");
+          await tx.rollback().catch(() => {});
+          committed = true; // handled here — skip the finally's rollback
+          await delay(20 * (attempt + 1) + Math.floor(Math.random() * 30));
+          continue;
+        }
+        throw err;
+      } finally {
+        if (!committed) await tx.rollback().catch(() => {});
+      }
     }
   }
 

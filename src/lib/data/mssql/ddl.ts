@@ -148,6 +148,26 @@ export function allForeignKeyStatements(entities: EntityDef[]): string[] {
   return out;
 }
 
+/**
+ * Additive columns for an entity whose table already exists but is missing some
+ * fields (a new field declared on a provisioned entity). Given the set of column
+ * names the DB already has (from a single introspection query), emit an
+ * unguarded `ALTER TABLE ADD` for each nullable field that's absent — so the
+ * boot-time reconcile self-heals a new field without a schema-version bump and
+ * without a per-column existence round-trip. System columns are NOT NULL and
+ * always present, so they're never added here.
+ */
+export function missingColumnStatements(entity: EntityDef, existing: Set<string>): string[] {
+  const t = entity.name;
+  const stmts: string[] = [];
+  for (const col of entityColumns(entity)) {
+    if (col.notNull) continue;
+    if (existing.has(col.name)) continue;
+    stmts.push(`ALTER TABLE [dbo].${ident(t)} ADD ${columnDdl(col)};`);
+  }
+  return stmts;
+}
+
 /** Platform support tables (schema-version ledger + document number counters). */
 export function supportStatements(): string[] {
   return [

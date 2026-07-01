@@ -54,7 +54,7 @@ export async function ensureAdminSeed(repo: Repository): Promise<void> {
     rec("1", {
       email: ADMIN_EMAIL,
       displayName: "Avery Admin",
-      passwordHash: hashPassword(DEFAULT_PASSWORD),
+      passwordHash: await hashPassword(DEFAULT_PASSWORD),
       positionId: "1",
       active: true,
       branchId: null,
@@ -123,7 +123,7 @@ export async function ensureDemoUsers(repo: Repository): Promise<void> {
   const hqId = branchByCode.get("HQ") ?? null;
   const eastId = branchByCode.get("BR-E") ?? null;
 
-  const passwordHash = hashPassword(DEFAULT_PASSWORD);
+  const passwordHash = await hashPassword(DEFAULT_PASSWORD);
   // Supervisor chain (managerId): rep + accountant → manager → admin (id "1").
   const users = [
     { id: "2", email: "morgan@acme.test", displayName: "Morgan Manager", positionId: "2", branchId: hqId, managerId: "1" },

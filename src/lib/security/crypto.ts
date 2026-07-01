@@ -5,8 +5,16 @@
  * key derives from a secret resolved via env (Phase 14 secret management); a
  * dev fallback keeps local runs working but must be overridden in production.
  */
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import { env, isProduction } from "@/lib/config/env";
+
+/**
+ * Async scrypt (runs on libuv's threadpool, default 4 threads) instead of the
+ * synchronous variant, so password hashing + key derivation don't block the
+ * single event-loop thread under load. Tune parallelism with UV_THREADPOOL_SIZE.
+ */
+const scrypt = promisify(scryptCb) as (password: string | Buffer, salt: string | Buffer, keylen: number) => Promise<Buffer>;
 
 const INSECURE_KEY = "dev-insecure-key-change-me";
 
@@ -22,22 +30,34 @@ function secret(): string {
   return key;
 }
 
-function deriveKey(pass: string): Buffer {
-  return scryptSync(pass, "aula-crm-static-salt", 32);
+/**
+ * Derived encryption keys, cached by passphrase. The passphrase is a process-wide
+ * constant (the env secret) in every real call, so deriving it once — rather than
+ * running scrypt on every encrypt/decrypt — removes a hidden ~scrypt-cost per PII
+ * / 2FA operation. Keyed by passphrase to stay correct for explicit `pass` args.
+ */
+const keyCache = new Map<string, Buffer>();
+
+async function deriveKey(pass: string): Promise<Buffer> {
+  const cached = keyCache.get(pass);
+  if (cached) return cached;
+  const key = await scrypt(pass, "aula-crm-static-salt", 32);
+  keyCache.set(pass, key);
+  return key;
 }
 
 /** Returns `iv.tag.ciphertext`, all base64. */
-export function encrypt(plaintext: string, pass = secret()): string {
+export async function encrypt(plaintext: string, pass = secret()): Promise<string> {
   const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", deriveKey(pass), iv);
+  const cipher = createCipheriv("aes-256-gcm", await deriveKey(pass), iv);
   const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [iv, tag, enc].map((b) => b.toString("base64")).join(".");
 }
 
-export function decrypt(payload: string, pass = secret()): string {
+export async function decrypt(payload: string, pass = secret()): Promise<string> {
   const [ivB64, tagB64, dataB64] = payload.split(".");
-  const decipher = createDecipheriv("aes-256-gcm", deriveKey(pass), Buffer.from(ivB64, "base64"));
+  const decipher = createDecipheriv("aes-256-gcm", await deriveKey(pass), Buffer.from(ivB64, "base64"));
   decipher.setAuthTag(Buffer.from(tagB64, "base64"));
   return Buffer.concat([decipher.update(Buffer.from(dataB64, "base64")), decipher.final()]).toString("utf8");
 }
@@ -45,18 +65,18 @@ export function decrypt(payload: string, pass = secret()): string {
 // ---- password hashing (scrypt) --------------------------------------------
 
 /** Hash a password with a per-record random salt. Returns `salt.hash` (base64). */
-export function hashPassword(password: string): string {
+export async function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(16);
-  const hash = scryptSync(password, salt, 64);
+  const hash = await scrypt(password, salt, 64);
   return `${salt.toString("base64")}.${hash.toString("base64")}`;
 }
 
 /** Constant-time verify of a password against a stored `salt.hash`. */
-export function verifyPassword(password: string, stored: string): boolean {
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const [saltB64, hashB64] = (stored ?? "").split(".");
   if (!saltB64 || !hashB64) return false;
   const expected = Buffer.from(hashB64, "base64");
-  const actual = scryptSync(password, Buffer.from(saltB64, "base64"), expected.length);
+  const actual = await scrypt(password, Buffer.from(saltB64, "base64"), expected.length);
   return expected.length === actual.length && timingSafeEqual(actual, expected);
 }
 

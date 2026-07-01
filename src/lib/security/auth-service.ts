@@ -98,14 +98,14 @@ export type LoginOutcome =
 export async function login(email: string, password: string, code?: string): Promise<LoginOutcome> {
   const user = await findUserByEmail(email);
   if (!user || user.active === false) return { status: "invalid" };
-  if (!verifyPassword(password, String(user.passwordHash ?? ""))) return { status: "invalid" };
+  if (!(await verifyPassword(password, String(user.passwordHash ?? "")))) return { status: "invalid" };
 
   // Second factor (TOTP) when enabled.
   if (user.twoFactorEnabled) {
     if (!code) return { status: "2fa_required" };
     let secret = "";
     try {
-      secret = user.twoFactorSecret ? decrypt(String(user.twoFactorSecret)) : "";
+      secret = user.twoFactorSecret ? await decrypt(String(user.twoFactorSecret)) : "";
     } catch {
       secret = "";
     }

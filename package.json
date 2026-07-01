@@ -13,6 +13,7 @@
     "seed": "tsx scripts/seed.ts",
     "lint": "eslint .",
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "stress": "node scripts/stress-test.mjs",
     "setup": "npm run migrate && npm run seed"
   },
   "dependencies": {

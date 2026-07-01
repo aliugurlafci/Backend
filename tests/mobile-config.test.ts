@@ -20,19 +20,25 @@ test("mobileScreenConfig entity is registered as a system entity", () => {
   }
 });
 
-test("mobile catalog flags exactly the implemented screens", () => {
+test("mobile catalog flags the default + generic-host screens as implemented", () => {
   const catalog = mobileScreenCatalog();
   const implemented = new Set(MOBILE_IMPLEMENTED_SCREENS);
-  // Every implemented key is present and flagged true.
+  // Every default (POS-core) key is present and flagged true.
   for (const key of implemented) {
     const def = catalog.find((s) => s.key === key);
     assert.ok(def, `catalog should include ${key}`);
     assert.equal(def.mobileImplemented, true, `${key} should be mobileImplemented`);
   }
-  // Web-only screens exist and are flagged false (e.g. a dashboard).
-  const webOnly = catalog.find((s) => s.key === "automation");
-  assert.ok(webOnly);
-  assert.equal(webOnly.mobileImplemented, false);
-  // The catalog is the full web catalog, so it has many more than the app set.
+  // Entity screens are covered by the generic entity browser.
+  const invoice = catalog.find((s) => s.key === "invoice");
+  assert.ok(invoice, "catalog should include the invoice entity screen");
+  assert.equal(invoice.mobileImplemented, true, "entity screens are mobile-implemented");
+  // Supported extras (dashboards, activity feed, entity-backed tools) too.
+  for (const key of ["sales-dashboard", "activity", "automation"]) {
+    const def = catalog.find((s) => s.key === key);
+    assert.ok(def, `catalog should include ${key}`);
+    assert.equal(def.mobileImplemented, true, `${key} should be mobileImplemented`);
+  }
+  // The catalog is the full web catalog, so it has many more than the default set.
   assert.ok(catalog.length > implemented.size);
 });

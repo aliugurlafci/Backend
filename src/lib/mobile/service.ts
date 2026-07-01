@@ -13,7 +13,7 @@ import type { EntityRecord } from "@/lib/metadata/types";
 import { systemContext } from "@/lib/context/resolver";
 import { getDomainService } from "@/lib/domain";
 import { metadata } from "@/lib/metadata";
-import { screenCatalog, MOBILE_IMPLEMENTED_SCREENS, type ScreenDef } from "@/lib/config/screens";
+import { screenCatalog, entityScreens, MOBILE_IMPLEMENTED_SCREENS, MOBILE_SUPPORTED_EXTRAS, type ScreenDef } from "@/lib/config/screens";
 import { getPosition, parseScreens } from "@/lib/security/auth-service";
 
 export interface MobileScreenDef extends ScreenDef {
@@ -33,10 +33,19 @@ export interface ResolvedMobileConfig {
 
 const DEFAULT_SCREENS: string[] = [...MOBILE_IMPLEMENTED_SCREENS];
 
-/** The full catalog flagged with which screens the mobile app implements. */
+/**
+ * The full catalog flagged with which screens the mobile app implements. Every
+ * entity screen is covered by the app's generic entity browser, and the supported
+ * extras (dashboards, activity, comms/admin tools) by the generic hosts — so the
+ * admin UI only marks a screen "web-only" if it's neither.
+ */
 export function mobileScreenCatalog(): MobileScreenDef[] {
-  const implemented = new Set<string>(MOBILE_IMPLEMENTED_SCREENS);
-  return screenCatalog(metadata).map((s) => ({ ...s, mobileImplemented: implemented.has(s.key) }));
+  const supported = new Set<string>(MOBILE_SUPPORTED_EXTRAS);
+  const entityKeys = new Set<string>(entityScreens(metadata).map((e) => e.key));
+  return screenCatalog(metadata).map((s) => ({
+    ...s,
+    mobileImplemented: supported.has(s.key) || entityKeys.has(s.key),
+  }));
 }
 
 /** Stable, order-insensitive content hash (djb2) used as the config version. */

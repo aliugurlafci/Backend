@@ -14,6 +14,7 @@ import { corsOrigins } from "@/lib/config/env";
 import { CSRF_COOKIE, issueCsrfToken } from "@/lib/security/csrf";
 import { toAppError } from "@/lib/enforcement/errors";
 import { API_VERSION, setApiHeaders } from "@/lib/http/handler";
+import { resilience } from "@/lib/http/resilience";
 import { buildApiRouter } from "./api";
 
 export function createApp(): express.Express {
@@ -53,6 +54,11 @@ export function createApp(): express.Express {
       exposedHeaders: ["x-api-version", "x-correlation-id"],
     }),
   );
+
+  // Load-shedding + request-timeout guard. Placed before body parsing so shed
+  // requests don't even pay the JSON-parse cost, but after CORS so the browser
+  // can still read the 503.
+  app.use(resilience());
 
   // 25mb so spreadsheet imports (a base64 .xlsx in the JSON body) aren't rejected.
   app.use(express.json({ limit: "25mb" }));

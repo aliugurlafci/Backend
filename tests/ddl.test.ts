@@ -28,10 +28,11 @@ test("reference columns are INT and id-like", () => {
   assert.equal(isIdLike(branchId), true);
 });
 
-test("version is INT but NOT id-like; currency stays FLOAT and not id-like", () => {
+test("version is INT but NOT id-like; currency is DECIMAL(18,2) and not id-like", () => {
   assert.equal(col("version").kind, "int");
   assert.equal(isIdLike(col("version")), false);
-  assert.equal(col("creditLimit").kind, "float");
+  // Money columns are DECIMAL(18,2) since schema v3 (exact, not FLOAT).
+  assert.equal(col("creditLimit").kind, "decimal");
   assert.equal(isIdLike(col("creditLimit")), false);
 });
 

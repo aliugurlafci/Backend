@@ -12,6 +12,9 @@ import { closePool } from "@/lib/data/mssql/connection";
 import { bootstrapPlatform } from "@/lib/bootstrap";
 import { startScheduler } from "@/lib/jobs/scheduler";
 import { createApp } from "@/http/server";
+import { getInflight } from "@/lib/http/resilience";
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 async function main(): Promise<void> {
   configureAuth();
@@ -32,12 +35,20 @@ async function main(): Promise<void> {
     });
   });
 
+  let shuttingDown = false;
   const shutdown = (signal: string) => {
-    logger.info("shutting down", { signal });
-    server.close(() => {
-      void closePool().finally(() => process.exit(0));
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info("shutting down", { signal, inflight: getInflight() });
+    // Stop accepting new connections, then let in-flight requests finish before
+    // we tear down the pool — so a request mid-transaction isn't orphaned.
+    server.close(async () => {
+      const start = Date.now();
+      while (getInflight() > 0 && Date.now() - start < 8_000) await delay(100);
+      await closePool().catch(() => {});
+      process.exit(0);
     });
-    // Force-exit if connections don't drain in time.
+    // Hard cap: force-exit if graceful drain doesn't complete in time.
     setTimeout(() => process.exit(1), 10_000).unref();
   };
 

@@ -41,8 +41,15 @@ const schema = z.object({
   MSSQL_ENCRYPT: boolish(false),
   MSSQL_TRUST_SERVER_CERTIFICATE: boolish(true),
   MSSQL_INSTANCE: z.string().optional(),
-  MSSQL_POOL_MAX: intish(10),
-  MSSQL_POOL_MIN: intish(0),
+  // Connection pool. `max` is the hard ceiling on concurrent DB operations for
+  // this instance and is the app's real throughput limit under load — a write
+  // holds a connection for a whole transaction, a read releases it after one
+  // query. Size it to (SQL Server's usable connections ÷ number of app
+  // instances); 30 is a safe single-instance production default. `min` keeps a
+  // few warm connections so a burst after idle doesn't pay the TLS/handshake
+  // cost on the first requests.
+  MSSQL_POOL_MAX: intish(30),
+  MSSQL_POOL_MIN: intish(2),
 
   // Auth / secrets
   AULA_JWT_SECRET: z.string().optional(),

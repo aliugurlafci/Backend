@@ -343,7 +343,7 @@ async function main(): Promise<void> {
   assert(!totpVerify(tfSecret, "12345"), "TOTP rejects a malformed code");
   // Enable 2FA on a seeded user and confirm login enforces it.
   const riley = (await qe.list(sysCtx, "user", { filters: [{ field: "email", op: "eq", value: "riley@acme.test" }], pageSize: 1 })).items[0];
-  await qe.patchComputed(sysCtx, "user", String(riley.id), { twoFactorEnabled: true, twoFactorSecret: encrypt(tfSecret) });
+  await qe.patchComputed(sysCtx, "user", String(riley.id), { twoFactorEnabled: true, twoFactorSecret: await encrypt(tfSecret) });
   assert((await login("riley@acme.test", "wrong-password")).status === "invalid", "wrong password rejected");
   assert((await login("riley@acme.test", "Passw0rd!")).status === "2fa_required", "2FA-on login without a code → 2fa_required");
   assert((await login("riley@acme.test", "Passw0rd!", "12345")).status === "invalid_code", "2FA login with a bad code → invalid_code");
