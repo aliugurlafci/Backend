@@ -49,6 +49,7 @@ function spawn(): Handle {
   worker.on("message", (msg: { id: number; ok: boolean; result?: unknown; error?: string }) => {
     const pending = handle.current;
     handle.current = null;
+    handle.worker.unref(); // idle again — don't keep the process alive on its own
     if (pending) {
       if (msg.ok) pending.resolve(msg.result);
       else pending.reject(new Error(msg.error ?? "render worker error"));
@@ -90,6 +91,7 @@ function pump(): void {
     const next = queue.shift();
     if (!next) break;
     handle.current = next;
+    handle.worker.ref(); // busy — keep the process alive until this render finishes
     handle.worker.postMessage({ id: next.id, task: next.task, input: next.input });
   }
 }
