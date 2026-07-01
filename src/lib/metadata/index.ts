@@ -56,6 +56,7 @@ import { calendarEventEntity } from "./entities/calendar-event";
 import { positionEntity } from "./entities/position";
 import { userEntity } from "./entities/user";
 import { userSettingEntity } from "./entities/user-setting";
+import { mobileScreenConfigEntity } from "./entities/mobile-screen-config";
 import { securityEventEntity } from "./entities/security-event";
 import {
   automationRuleEntity,
@@ -126,6 +127,7 @@ export const crmEntities: EntityDef[] = [
   positionEntity,
   userEntity,
   userSettingEntity,
+  mobileScreenConfigEntity,
   securityEventEntity,
   // automation platform (system entities; admin-gated, off the auto-nav)
   automationRuleEntity,

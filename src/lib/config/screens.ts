@@ -44,6 +44,24 @@ export const EXTRA_SCREENS: ScreenDef[] = [
   { key: "settings", label: "Settings", group: "admin" },
 ];
 
+/**
+ * Screen keys the companion mobile app actually implements a destination for.
+ * Admins may toggle any catalog screen for mobile, but only these render on a
+ * phone — the mobile gate intersects the configured set with this list, and the
+ * admin UI flags the rest as "web-only". Keys are drawn from the shared catalog.
+ */
+export const MOBILE_IMPLEMENTED_SCREENS = [
+  "home",
+  "pos",
+  "cart",
+  "salesReturn",
+  "stock-levels",
+  "product",
+  "labels",
+  "label-designer",
+  "settings",
+] as const;
+
 /** One screen per non-system entity (its list/detail screen). */
 export function entityScreens(metadata: MetadataResolver): ScreenDef[] {
   return metadata

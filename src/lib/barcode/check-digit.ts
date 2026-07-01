@@ -83,7 +83,77 @@ export function internalEan13(seq: number): string {
   return buildEan13("20" + body);
 }
 
-/** Normalise a scanned code: trim and strip a leading EAN/UPC zero-pad noise. */
+/** Normalise a scanned code: trim surrounding whitespace. Equivalence between
+ *  the retail symbologies (UPC-A vs EAN-13, UPC-E) is handled by
+ *  {@link barcodeCandidates} rather than by mutating the value here. */
 export function normalizeScan(raw: string): string {
   return (raw ?? "").trim();
+}
+
+/**
+ * Expand an 8-digit UPC-E value (number-system + 6 data + check) to its 12-digit
+ * UPC-A form. Returns null if the value is not a well-formed UPC-E. The 6 data
+ * digits select one of four zero-fill expansions via their last digit.
+ */
+function expandUpcE(value: string): string | null {
+  if (value.length !== 8 || !digitsOnly(value)) return null;
+  const ns = value[0];
+  if (ns !== "0" && ns !== "1") return null; // UPC-E only carries number system 0/1
+  const d = value.slice(1, 7); // X1..X6
+  const last = d[5];
+  let body: string; // the 10 manufacturer+item digits
+  switch (last) {
+    case "0":
+    case "1":
+    case "2":
+      body = d.slice(0, 2) + last + "0000" + d.slice(2, 5);
+      break;
+    case "3":
+      body = d.slice(0, 3) + "00000" + d.slice(3, 5);
+      break;
+    case "4":
+      body = d.slice(0, 4) + "00000" + d.slice(4, 5);
+      break;
+    default: // 5–9
+      body = d.slice(0, 5) + "0000" + last;
+      break;
+  }
+  const payload11 = ns + body;
+  if (payload11.length !== 11) return null;
+  return payload11 + String(gtinCheckDigit(payload11));
+}
+
+/**
+ * Equivalent representations of a scanned code, most-specific first. The retail
+ * GS1 symbologies encode the *same* GTIN at different lengths, and a camera or
+ * keyboard-wedge scanner may report either form depending on the platform — e.g.
+ * iOS returns a UPC-A as a 13-digit EAN-13 (leading 0) while Android reports 12
+ * digits; UPC-E is the zero-compressed form of a UPC-A. Looking a scan up by ALL
+ * of its equivalent forms makes the match robust regardless of which form the
+ * product's `barcode` was stored under. Shared verbatim with the mobile app so
+ * online (`/pos/lookup`) and offline (local cache) resolution behave identically.
+ */
+export function barcodeCandidates(raw: string): string[] {
+  const c = normalizeScan(raw);
+  if (!c) return [];
+  const out: string[] = [c];
+  const add = (v: string | null | undefined): void => {
+    if (v && !out.includes(v)) out.push(v);
+  };
+  if (digitsOnly(c)) {
+    // UPC-A (12) ↔ EAN-13 (13 with a leading 0) — the same GTIN.
+    if (c.length === 12) add("0" + c);
+    if (c.length === 13 && c[0] === "0") add(c.slice(1));
+    // GTIN-14 / ITF-14 carrying a leading pack-level 0.
+    if (c.length === 14 && c[0] === "0") add(c.slice(1));
+    // UPC-E (8) → its expanded UPC-A (12) and the matching EAN-13 (13).
+    if (c.length === 8) {
+      const upcA = expandUpcE(c);
+      if (upcA) {
+        add(upcA);
+        add("0" + upcA);
+      }
+    }
+  }
+  return out;
 }

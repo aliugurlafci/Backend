@@ -18,7 +18,7 @@ import type { QueryEngine } from "@/lib/data/query-engine";
 import { numberSequence, NumberSequence } from "@/lib/finance/number-sequence";
 import { getFinanceService, type FinanceService, type LineInput } from "@/lib/finance/service";
 import { getDomainService } from "@/lib/domain";
-import { normalizeScan } from "@/lib/barcode/check-digit";
+import { barcodeCandidates } from "@/lib/barcode/check-digit";
 import { BadRequestError } from "@/lib/enforcement/errors";
 import { retryOnConflict } from "@/lib/data/optimistic";
 
@@ -99,13 +99,14 @@ export class PosService {
     return p;
   }
 
-  /** Resolve a product by exact barcode, then SKU. Returns null if not found. */
+  /** Resolve a product by barcode (matching every equivalent symbology form of
+   *  the scan — UPC-A/EAN-13/UPC-E), then by SKU. Returns null if not found. */
   async lookup(ctx: RequestContext, code: string): Promise<EntityRecord | null> {
-    const c = normalizeScan(code);
-    if (!c) return null;
-    const byBarcode = await this.qe.list(ctx, "product", { filters: [{ field: "barcode", op: "eq", value: c }], pageSize: 1 });
+    const candidates = barcodeCandidates(code);
+    if (!candidates.length) return null;
+    const byBarcode = await this.qe.list(ctx, "product", { filters: [{ field: "barcode", op: "in", value: candidates }], pageSize: 1 });
     if (byBarcode.items[0]) return byBarcode.items[0];
-    const bySku = await this.qe.list(ctx, "product", { filters: [{ field: "sku", op: "eq", value: c }], pageSize: 1 });
+    const bySku = await this.qe.list(ctx, "product", { filters: [{ field: "sku", op: "eq", value: candidates[0] }], pageSize: 1 });
     return bySku.items[0] ?? null;
   }
 

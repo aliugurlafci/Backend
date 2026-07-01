@@ -80,6 +80,7 @@ import { rateLimit, peekRateLimit, clearRateLimit } from "@/lib/security/rate-li
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { screenCatalog } from "@/lib/config/screens";
+import { resolveMobileConfig, mobileScreenCatalog } from "@/lib/mobile/service";
 import type { EntityRecord } from "@/lib/metadata/types";
 
 /** Minimum length for any password set through the API. */
@@ -266,6 +267,9 @@ export function buildApiRouter(): Router {
     });
     const settings: Record<string, string> = {};
     for (const row of settingsRows.items) settings[String(row.key)] = String(row.value ?? "");
+    // Effective mobile screen set (admin config ∩ this user's permitted screens),
+    // so the companion app can gate its navigation straight from the login call.
+    const mobile = await resolveMobileConfig(rc);
     return {
       userId: rc.userId,
       // Prefer the live DB record (reflects self-service profile edits) over the JWT claims.
@@ -279,6 +283,11 @@ export function buildApiRouter(): Router {
       positionId: rc.positionId ?? null,
       position: position ? { id: position.id, name: String(position.name), role: String(position.role) } : null,
       screens,
+      // Screens the companion mobile app may show (a subset of `screens`), plus a
+      // version stamp the app polls to pick up admin changes without a full reload.
+      mobileScreens: mobile.screens,
+      mobileScreensVersion: mobile.version,
+      mobileHiddenFields: mobile.hiddenFields,
       // The caller's effective operation grants (matrix-authoritative, else role defaults).
       grants: rc.grants ? [...rc.grants] : [...grantsFor(rc.roles)],
       phone: (userRec?.phone as string | null) ?? null,
@@ -475,6 +484,106 @@ export function buildApiRouter(): Router {
 
   // Screen catalog (for nav + the admin position editor).
   r.get("/screens", runApi(async () => ({ screens: screenCatalog(metadata) })));
+
+  // ---- mobile screen configuration -------------------------------------
+  // The companion app's screen visibility is curated here. `GET /mobile/config`
+  // is the per-user resolved view the app polls; the rest are admin tools.
+
+  // Resolved config for the signed-in user (app foreground/login + ~60s poll).
+  r.get("/mobile/config", runApi(async (rc, req) => {
+    const clientId = typeof req.query.clientId === "string" ? req.query.clientId : "*";
+    return resolveMobileConfig(rc, clientId);
+  }));
+
+  // Toggleable screen catalog (full web catalog, flagged with mobile support).
+  r.get("/mobile/screens", runApi(async (rc) => {
+    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    return { screens: mobileScreenCatalog() };
+  }));
+
+  // Admin CRUD over the raw config rows. `screens`/`hiddenFields` are persisted
+  // as JSON text; accept either the parsed shape or a pre-stringified value.
+  const asJsonText = (value: unknown, fallback: string): string => {
+    if (value === undefined) return fallback;
+    if (typeof value === "string") return value;
+    return JSON.stringify(value);
+  };
+
+  r.get("/mobile/configs", runApi(async (rc) => {
+    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    const domain = await getDomainService();
+    const page = await domain.list(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", {
+      pageSize: 500,
+      sort: [{ field: "updatedAt", dir: "desc" }],
+    });
+    const configs = page.items.map((row) => ({
+      id: String(row.id),
+      clientId: String(row.clientId ?? "*"),
+      positionId: (row.positionId as string | null) || null,
+      userId: (row.userId as string | null) || null,
+      screens: JSON.parse(String(row.screens ?? "[]")) as string[],
+      hiddenFields: JSON.parse(String(row.hiddenFields ?? "{}")) as Record<string, string[]>,
+      active: row.active !== false,
+      version: Number(row.version ?? 0),
+      updatedAt: String(row.updatedAt ?? ""),
+    }));
+    return { configs };
+  }));
+
+  r.post(
+    "/mobile/configs",
+    runApi(
+      async (rc, req) => {
+        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        const body = readJson(req) as Record<string, unknown>;
+        const domain = await getDomainService();
+        const created = await domain.create(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", {
+          clientId: String(body.clientId ?? "*") || "*",
+          positionId: body.positionId ? String(body.positionId) : null,
+          userId: body.userId ? String(body.userId) : null,
+          screens: asJsonText(body.screens, "[]"),
+          hiddenFields: asJsonText(body.hiddenFields, "{}"),
+          active: body.active === undefined ? true : Boolean(body.active),
+        });
+        return { id: String(created.id) };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  r.patch(
+    "/mobile/configs/:id",
+    runApi(
+      async (rc, req) => {
+        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        const body = readJson(req) as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+        if (body.clientId !== undefined) patch.clientId = String(body.clientId) || "*";
+        if (body.positionId !== undefined) patch.positionId = body.positionId ? String(body.positionId) : null;
+        if (body.userId !== undefined) patch.userId = body.userId ? String(body.userId) : null;
+        if (body.screens !== undefined) patch.screens = asJsonText(body.screens, "[]");
+        if (body.hiddenFields !== undefined) patch.hiddenFields = asJsonText(body.hiddenFields, "{}");
+        if (body.active !== undefined) patch.active = Boolean(body.active);
+        const domain = await getDomainService();
+        const updated = await domain.update(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", req.params.id, patch);
+        return { id: String(updated.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.delete(
+    "/mobile/configs/:id",
+    runApi(
+      async (rc, req) => {
+        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        const domain = await getDomainService();
+        await domain.remove(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", req.params.id);
+        return { deleted: true, id: req.params.id };
+      },
+      { mutating: true },
+    ),
+  );
 
   // Permission catalog (admin only) — every entity's grantable operations + the
   // special (non-entity) grants + each base role's default grants (matrix presets).
