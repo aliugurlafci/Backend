@@ -34,7 +34,7 @@
     "mailparser": "^3.9.9",
     "mssql": "^11.0.1",
     "mysql2": "^3.23.0",
-    "nodemailer": "^8.0.10",
+    "nodemailer": "^9.0.1",
     "pdfkit": "^0.18.0",
     "ws": "^8.21.0",
     "zod": "^4.4.3"
