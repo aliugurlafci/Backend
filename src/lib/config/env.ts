@@ -25,12 +25,24 @@ const intish = (def: number) =>
     .transform((v) => (v === undefined || v === "" ? def : Number(v)))
     .pipe(z.number().int());
 
+/** Parse an optional, case-insensitive enum with a default. */
+const lowerEnum = <T extends readonly [string, ...string[]]>(values: T, def: T[number]) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() ? v.trim().toLowerCase() : def))
+    .pipe(z.enum(values));
+
 const schema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
 
   // HTTP server
   PORT: intish(4000),
   CORS_ORIGINS: z.string().optional().default("http://localhost:3000"),
+
+  // Which SQL engine the durable backend talks to: "mssql" (SQL Server, default)
+  // or "mysql" (MySQL 8.0+ / MariaDB 10.2+). Ignored when AULA_PERSISTENCE=memory.
+  DB_CLIENT: lowerEnum(["mssql", "mysql"] as const, "mssql"),
 
   // MSSQL
   MSSQL_SERVER: z.string().default("localhost"),
@@ -51,15 +63,31 @@ const schema = z.object({
   MSSQL_POOL_MAX: intish(30),
   MSSQL_POOL_MIN: intish(2),
 
+  // MySQL (used when DB_CLIENT=mysql). Same pool sizing rationale as MSSQL above.
+  MYSQL_HOST: z.string().default("localhost"),
+  MYSQL_PORT: intish(3306),
+  MYSQL_DATABASE: z.string().default("aula_crm"),
+  MYSQL_USER: z.string().default("root"),
+  MYSQL_PASSWORD: z.string().default(""),
+  MYSQL_SSL: boolish(false),
+  MYSQL_POOL_MAX: intish(30),
+  MYSQL_POOL_MIN: intish(2),
+
   // Auth / secrets
   AULA_JWT_SECRET: z.string().optional(),
   AULA_JWT_TTL: intish(3600),
   AULA_ENCRYPTION_KEY: z.string().optional(),
   AULA_DEV_AUTH: boolish(true),
 
-  // Persistence: "mssql" (default, durable) or "memory" (process-local, no DB —
-  // handy for local dev, CI and integration tests; data is lost on restart).
-  AULA_PERSISTENCE: z.enum(["mssql", "memory"]).optional().default("mssql"),
+  // Persistence: "sql" (default, durable — the engine is picked by DB_CLIENT) or
+  // "memory" (process-local, no DB — handy for local dev, CI and integration
+  // tests; data is lost on restart). Legacy values "mssql"/"mysql" are accepted
+  // and treated as "sql" (set DB_CLIENT to choose the engine).
+  AULA_PERSISTENCE: z
+    .string()
+    .optional()
+    .transform((v) => ((v ?? "sql").trim().toLowerCase() === "memory" ? "memory" : "sql"))
+    .pipe(z.enum(["sql", "memory"])),
 
   // Email (SMTP send + IMAP receive). All optional — when unset the mailbox is
   // DB-only (compose just stores to "sent"; sync is a no-op).
@@ -109,9 +137,13 @@ function load(): Env {
     if (!env.AULA_ENCRYPTION_KEY || env.AULA_ENCRYPTION_KEY === INSECURE_KEY) {
       problems.push("AULA_ENCRYPTION_KEY must be set to a strong value");
     }
-    // MSSQL credentials are only required when actually persisting to MSSQL.
-    if (env.AULA_PERSISTENCE !== "memory" && !env.MSSQL_PASSWORD) {
-      problems.push("MSSQL_PASSWORD must be set");
+    // DB credentials are only required when actually persisting to a SQL engine.
+    if (env.AULA_PERSISTENCE !== "memory") {
+      if (env.DB_CLIENT === "mysql" && !env.MYSQL_PASSWORD) {
+        problems.push("MYSQL_PASSWORD must be set");
+      } else if (env.DB_CLIENT === "mssql" && !env.MSSQL_PASSWORD) {
+        problems.push("MSSQL_PASSWORD must be set");
+      }
     }
     if (env.AULA_DEV_AUTH) {
       problems.push("AULA_DEV_AUTH must be false in production");
@@ -138,10 +170,17 @@ export const corsOrigins: string | string[] =
     : env.CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
 
 /**
- * Whether record persistence runs in process-local memory (no MSSQL). Drives the
- * store wiring and the /health backend-mode report. Defaults to MSSQL.
+ * Whether record persistence runs in process-local memory (no SQL database).
+ * Drives the store wiring and the /health backend-mode report. Defaults to a
+ * durable SQL backend (the engine is chosen by {@link env.DB_CLIENT}).
  */
 export const usingInMemoryBackends = env.AULA_PERSISTENCE === "memory";
+
+/** The active SQL engine for the durable backend (meaningful unless in memory mode). */
+export const sqlClient = env.DB_CLIENT;
+
+/** True when the durable backend talks to MySQL rather than SQL Server. */
+export const usingMysql = !usingInMemoryBackends && env.DB_CLIENT === "mysql";
 
 /** True when enough SMTP settings are present to actually send mail. */
 export const smtpConfigured = Boolean(env.SMTP_HOST && env.SMTP_USER);

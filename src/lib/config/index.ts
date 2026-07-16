@@ -11,4 +11,4 @@ export { publishMetadata, rollbackMetadata } from "./governance";
 export { releaseLog, ReleaseLog } from "./release";
 export type { ReleaseRecord, ReleaseKind } from "./release";
 // Schema provisioning lives entirely in the metadata-driven migrator
-// (`@/lib/data/mssql/migrate`); the old Postgres-era placeholder is retired.
+// (`@/lib/data/sql/migrate`), which targets SQL Server or MySQL via the dialect.

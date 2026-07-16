@@ -44,12 +44,20 @@ export const SYSTEM_SETTINGS: SystemSettingDef[] = [
 
   // ---- persistence (bootstrap — read-only) ----
   { key: "AULA_PERSISTENCE", label: "Persistence mode", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.AULA_PERSISTENCE },
-  { key: "MSSQL_SERVER", label: "SQL Server", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_SERVER },
-  { key: "MSSQL_PORT", label: "SQL Port", group: "Persistence", type: "number", readonly: true, restart: true, envValue: () => String(env.MSSQL_PORT) },
-  { key: "MSSQL_DATABASE", label: "Database", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_DATABASE },
-  { key: "MSSQL_USER", label: "DB user", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_USER },
-  { key: "MSSQL_PASSWORD", label: "DB password", group: "Persistence", type: "password", secret: true, readonly: true, restart: true, envValue: () => env.MSSQL_PASSWORD },
+  { key: "DB_CLIENT", label: "SQL engine", group: "Persistence", type: "text", readonly: true, restart: true, help: "mssql (SQL Server) or mysql", envValue: () => env.DB_CLIENT },
+  // SQL Server connection (used when DB_CLIENT=mssql).
+  { key: "MSSQL_SERVER", label: "SQL Server host", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_SERVER },
+  { key: "MSSQL_PORT", label: "SQL Server port", group: "Persistence", type: "number", readonly: true, restart: true, envValue: () => String(env.MSSQL_PORT) },
+  { key: "MSSQL_DATABASE", label: "SQL Server database", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_DATABASE },
+  { key: "MSSQL_USER", label: "SQL Server user", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MSSQL_USER },
+  { key: "MSSQL_PASSWORD", label: "SQL Server password", group: "Persistence", type: "password", secret: true, readonly: true, restart: true, envValue: () => env.MSSQL_PASSWORD },
   { key: "MSSQL_ENCRYPT", label: "Encrypt connection", group: "Persistence", type: "boolean", readonly: true, restart: true, envValue: () => b(env.MSSQL_ENCRYPT) },
+  // MySQL connection (used when DB_CLIENT=mysql).
+  { key: "MYSQL_HOST", label: "MySQL host", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MYSQL_HOST },
+  { key: "MYSQL_PORT", label: "MySQL port", group: "Persistence", type: "number", readonly: true, restart: true, envValue: () => String(env.MYSQL_PORT) },
+  { key: "MYSQL_DATABASE", label: "MySQL database", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MYSQL_DATABASE },
+  { key: "MYSQL_USER", label: "MySQL user", group: "Persistence", type: "text", readonly: true, restart: true, envValue: () => env.MYSQL_USER },
+  { key: "MYSQL_PASSWORD", label: "MySQL password", group: "Persistence", type: "password", secret: true, readonly: true, restart: true, envValue: () => env.MYSQL_PASSWORD },
 
   // ---- storage ----
   { key: "UPLOAD_DIR", label: "Upload directory", group: "Storage", type: "text", restart: true, help: "Where uploaded file bytes are stored", envValue: () => env.UPLOAD_DIR || "<cwd>/uploads" },

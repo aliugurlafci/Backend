@@ -2,8 +2,8 @@
  * CLI: provision/refresh the database schema from metadata.
  *   npm run migrate
  */
-import { runMigrations } from "@/lib/data/mssql/migrate";
-import { closePool } from "@/lib/data/mssql/connection";
+import { runMigrations } from "@/lib/data/sql/migrate";
+import { closePool } from "@/lib/data/sql/connection";
 import { logger } from "@/lib/observability/logger";
 
 async function main(): Promise<void> {

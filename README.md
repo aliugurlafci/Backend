@@ -1,15 +1,15 @@
-# Aula CRM — Backend (Node.js + Express + MSSQL)
+# Aula CRM — Backend (Node.js + Express + SQL Server / MySQL)
 
 A standalone, metadata-driven backend service for the **Aula CRM** frontend. It
 exposes the same versioned REST API the frontend already speaks (`/api/v1/**`),
-but persists data in **Microsoft SQL Server** instead of memory, and adds real
-**JWT authentication** (with a dev-persona fallback for parity with the
-frontend's persona switcher).
+but persists data in a **SQL database — Microsoft SQL Server or MySQL** (pick one
+with `DB_CLIENT`) — instead of memory, and adds real **JWT authentication** (with
+a dev-persona fallback for parity with the frontend's persona switcher).
 
 It is a faithful port of the frontend's embedded backend (`src/lib/**`): the
 proven metadata, permissions, query-engine, domain, finance and workflow layers
-are reused verbatim; only the **data repository** (now MSSQL) and the **HTTP
-layer** (now Express) are new.
+are reused verbatim; only the **data repository** (now a SQL database) and the
+**HTTP layer** (now Express) are new.
 
 > Guiding principle (unchanged): **UI = f(metadata + state + permissions + data
 > + locale + featureFlags + tenantContext)**. Declaring an entity yields its
@@ -27,36 +27,46 @@ Domain / Finance / Workflow   src/lib/{domain,finance,workflow}/**
   │  (lifecycle, invariants, audit, events, billing/AR)
 Query Engine (gateway)        src/lib/data/query-engine.ts
   │  (tenant scope · permissions · validation · uniqueness · concurrency · PII)
-MSSQL Repository              src/lib/data/mssql/**     ← the new persistence adapter
-  │  (parameterized SQL, metadata-generated tables)
-Microsoft SQL Server
+SQL Repository                src/lib/data/sql/**       ← persistence adapter (dialect-driven)
+  │  (parameterized SQL, metadata-generated tables; one dialect + driver per engine)
+Microsoft SQL Server   ·   MySQL 8.0+ / MariaDB      ← selected by DB_CLIENT
 ```
 
 - **Single data gateway:** every read/write flows through the `QueryEngine`,
   which enforces tenant isolation, RBAC/ABAC, metadata validation, unique
   constraints, optimistic concurrency and field-level PII projection. The
   repository below it is a "dumb", tenant-scoped persistence contract.
-- **Metadata-driven DDL:** `src/lib/data/mssql/ddl.ts` generates one typed table
+- **Metadata-driven DDL:** `src/lib/data/sql/ddl.ts` generates one typed table
   per entity (system columns + one column per field) with indexes on
-  filterable/sortable fields and tenant-scoped filtered unique indexes. Adding
-  an entity = declaring metadata + running `npm run migrate`.
+  filterable/sortable fields and tenant-scoped unique indexes, rendered for the
+  active engine by the dialect. Adding an entity = declaring metadata + running
+  `npm run migrate`.
 - **Injection-safe:** all values are bound as SQL parameters; identifiers are
-  bracket-quoted and aggregation fields are whitelisted against metadata.
+  quoted per dialect (brackets on SQL Server, backticks on MySQL) and aggregation
+  fields are whitelisted against metadata.
+- **Two engines, one code path:** `DB_CLIENT` selects a dialect + driver
+  (`mssql` → node-mssql, `mysql` → mysql2). The repository, DDL and migrator are
+  written once against the dialect interface (`src/lib/data/sql/dialect.ts`).
 
 ## 2. Requirements
 
 - **Node.js 20+** (developed on 22.x).
-- **Microsoft SQL Server** 2016+ (or Azure SQL). You do **not** need to pre-create
-  the database — `migrate` connects to `master` and creates `MSSQL_DATABASE` if
-  it's missing. The login just needs permission to `CREATE DATABASE` (or have a
-  DBA create the empty database and grant `CREATE TABLE`/`CREATE INDEX`). On
-  Azure SQL, create the database via the portal and the create step is skipped.
+- **A SQL database — one of:**
+  - **Microsoft SQL Server** 2016+ (or Azure SQL) with `DB_CLIENT=mssql`. You do
+    **not** need to pre-create the database — `migrate` connects to `master` and
+    creates `MSSQL_DATABASE` if missing (the login needs `CREATE DATABASE`, or a
+    DBA pre-creates it and grants `CREATE TABLE`/`CREATE INDEX`). On Azure SQL,
+    create the database via the portal and the create step is skipped.
+  - **MySQL 8.0+** (or **MariaDB 10.2+**) with `DB_CLIENT=mysql`. `migrate`
+    connects without a database and runs `CREATE DATABASE IF NOT EXISTS`
+    (utf8mb4), or point `MYSQL_DATABASE` at a pre-created one. MySQL 8.0 is
+    required for window functions (`COUNT(*) OVER()`).
 
 ## 3. Setup
 
 ```bash
 npm install
-cp .env.example .env      # then edit .env with your SQL Server details
+cp .env.example .env      # then set DB_CLIENT=mssql|mysql and that engine's connection details
 npm run setup             # = migrate + seed: creates the DB if missing,
                           #   provisions the schema, loads demo data (idempotent)
 npm run dev               # start on http://localhost:4000 (tsx watch)
@@ -78,12 +88,19 @@ See [.env.example](.env.example). Key ones:
 |---|---|---|
 | `PORT` | HTTP port | `4000` |
 | `CORS_ORIGINS` | Allowed origins (comma list or `*`) | `http://localhost:3000` |
-| `MSSQL_SERVER` / `MSSQL_PORT` | SQL Server host / port | `localhost` / `1433` |
-| `MSSQL_DATABASE` | Target database (must exist) | `aula_crm` |
+| `DB_CLIENT` | **SQL engine: `mssql` or `mysql`** | `mssql` |
+| `AULA_PERSISTENCE` | `sql` (durable, engine = `DB_CLIENT`) or `memory` | `sql` |
+| `MSSQL_SERVER` / `MSSQL_PORT` | SQL Server host / port (when `DB_CLIENT=mssql`) | `localhost` / `1433` |
+| `MSSQL_DATABASE` | Target database (auto-created if missing) | `aula_crm` |
 | `MSSQL_USER` / `MSSQL_PASSWORD` | SQL login | `sa` / — |
 | `MSSQL_ENCRYPT` | TLS (true for Azure SQL) | `false` |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | Trust self-signed cert (on-prem/dev) | `true` |
 | `MSSQL_INSTANCE` | Named instance (e.g. `SQLEXPRESS`); blank ⇒ host+port | — |
+| `MYSQL_HOST` / `MYSQL_PORT` | MySQL host / port (when `DB_CLIENT=mysql`) | `localhost` / `3306` |
+| `MYSQL_DATABASE` | Target database (auto-created if missing) | `aula_crm` |
+| `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL login | `root` / — |
+| `MYSQL_SSL` | Connect over TLS (managed/cloud MySQL) | `false` |
+| `MSSQL_POOL_MAX` / `MYSQL_POOL_MAX` | Max pooled connections | `10` |
 | `AULA_JWT_SECRET` | HS256 signing secret (**required in prod**) | dev fallback |
 | `AULA_JWT_TTL` | Token lifetime (seconds) | `3600` |
 | `AULA_ENCRYPTION_KEY` | AES-256-GCM key (**required in prod**) | dev fallback |
@@ -91,8 +108,9 @@ See [.env.example](.env.example). Key ones:
 | `AULA_AUTO_MIGRATE` / `AULA_AUTO_SEED` | Provision/seed on boot | `true` |
 
 In **production** (`NODE_ENV=production`) the app refuses to start with insecure
-defaults: `AULA_JWT_SECRET`, `AULA_ENCRYPTION_KEY` and `MSSQL_PASSWORD` must be
-set and `AULA_DEV_AUTH` must be `false`.
+defaults: `AULA_JWT_SECRET`, `AULA_ENCRYPTION_KEY` and the active engine's
+password (`MSSQL_PASSWORD` or `MYSQL_PASSWORD`) must be set and `AULA_DEV_AUTH`
+must be `false`.
 
 ## 5. Scripts
 
@@ -141,9 +159,9 @@ errors are `{ error: { code, message, details?, correlationId? } }`.
 
 ## 8. Persistence model
 
-**Durable in MSSQL:** all entity records (one typed table per entity), document
-number sequences (`_seq_counter`, atomic), and the schema-version ledger
-(`_schema_migrations`).
+**Durable in the SQL database (SQL Server or MySQL):** all entity records (one
+typed table per entity), document number sequences (`_seq_counter`, atomic),
+file blobs (`_file_blob`), and the schema-version ledger (`_schema_migrations`).
 
 **In-memory (per process, like the frontend's default):** audit log, the event
 bus / outbox / idempotency, the search index, the stats cache, and the
@@ -155,7 +173,7 @@ points remain — see §9).
 
 | Concern | Default | Swap point |
 |---|---|---|
-| Persistence | `MssqlRepository` | already MSSQL; implement `Repository` for another store |
+| Persistence | `SqlRepository` (SQL Server / MySQL) | switch engines with `DB_CLIENT`, or implement `Repository` for another store |
 | Auth | JWT + dev personas | `configureAuth()` / `jwtAuthenticator` (wire OIDC) |
 | Cache | in-memory | `src/lib/cache/cache.ts` → Redis |
 | Event bus | in-memory | `src/lib/workflow/event-bus.ts` → broker |
@@ -184,7 +202,7 @@ API directly from the browser.
 ### Run the whole stack locally (no database required)
 
 ```bash
-# Terminal 1 — backend on :4000, in-memory persistence (no SQL Server needed)
+# Terminal 1 — backend on :4000, in-memory persistence (no database needed)
 cd Backend
 npm install
 AULA_PERSISTENCE=memory npm run dev        # seeds demo data on boot
@@ -195,8 +213,9 @@ npm install
 BACKEND_API_URL=http://localhost:4000 npm run dev
 ```
 
-Open http://localhost:3000. For durable storage, drop `AULA_PERSISTENCE=memory`
-and configure the `MSSQL_*` variables (see §3/§4).
+Open http://localhost:3000. For durable storage, drop `AULA_PERSISTENCE=memory`,
+set `DB_CLIENT=mssql` or `mysql`, and configure that engine's `MSSQL_*` / `MYSQL_*`
+variables (see §3/§4).
 
 This backend also exposes `GET /api/v1/jobs` (scheduled-job status for the
 Automation screen) and accepts `GET /api/v1/activity?limit=N`.

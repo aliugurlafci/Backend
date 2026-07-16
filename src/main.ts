@@ -1,14 +1,15 @@
 /**
  * Server entrypoint.
  *
- * Boot sequence: validate env → install auth → connect MSSQL (+ migrate + seed)
- * → register platform subscribers + reindex → listen. Handles graceful shutdown.
+ * Boot sequence: validate env → install auth → connect the SQL database (+
+ * migrate + seed) → register platform subscribers + reindex → listen. Handles
+ * graceful shutdown.
  */
 import { env } from "@/lib/config/env";
 import { logger } from "@/lib/observability/logger";
 import { configureAuth } from "@/lib/security/auth-config";
 import { getQueryEngine } from "@/lib/data/store";
-import { closePool } from "@/lib/data/mssql/connection";
+import { closePool } from "@/lib/data/sql/connection";
 import { bootstrapPlatform } from "@/lib/bootstrap";
 import { startScheduler } from "@/lib/jobs/scheduler";
 import { createApp } from "@/http/server";

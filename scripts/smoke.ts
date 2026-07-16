@@ -4,7 +4,8 @@
  * auth wiring and JWT signing. Run with `tsx scripts/smoke.ts`.
  */
 import { metadata } from "@/lib/metadata";
-import { allStatements, entityStatements } from "@/lib/data/mssql/ddl";
+import { allStatements, entityStatements } from "@/lib/data/sql/ddl";
+import { getDialect } from "@/lib/data/sql/dialect";
 import { createApp } from "@/http/server";
 import { configureAuth, issuePersonaToken } from "@/lib/security/auth-config";
 import { verifyJwt } from "@/lib/security/auth";
@@ -12,8 +13,10 @@ import { jwtSecret } from "@/lib/config/env";
 
 configureAuth();
 
+// Offline DDL generation for the active dialect (no DB connection needed).
+const dialect = await getDialect();
 const entities = metadata.listEntities();
-const stmts = allStatements(entities);
+const stmts = allStatements(entities, dialect);
 const app = createApp();
 const issued = issuePersonaToken("admin");
 const claims = issued ? verifyJwt(issued.token, jwtSecret) : null;
@@ -33,7 +36,7 @@ console.log(
   ),
 );
 
-console.log("\n--- sample DDL (lead) ---");
-console.log(entityStatements(metadata.getEntity("lead")).join("\n\n"));
+console.log(`\n--- sample DDL (deal) — ${dialect.client} ---`);
+console.log(entityStatements(metadata.getEntity("deal"), dialect).join("\n\n"));
 
 process.exit(0);

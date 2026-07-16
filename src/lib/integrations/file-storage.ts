@@ -7,8 +7,9 @@
  * bytes, keyed by the same `file` record id.
  *
  * Backends (chosen by persistence mode):
- *   - mssql  : bytes in the `_file_blob` table (VARBINARY(MAX)) — durable, shared
- *              across instances, restored together with the database.
+ *   - sql    : bytes in the `_file_blob` table (VARBINARY(MAX) on SQL Server,
+ *              LONGBLOB on MySQL) — durable, shared across instances, restored
+ *              together with the database.
  *   - memory : in-process Map (dev / smoke tests, no DB or disk required).
  *
  * Read falls back to legacy local-disk blobs (`UPLOAD_DIR/<id>`) so files
@@ -65,41 +66,69 @@ async function deleteDisk(id: string): Promise<void> {
 const memStore: Map<string, StoredBlob> =
   ((globalThis as unknown as { __aulaBlobs?: Map<string, StoredBlob> }).__aulaBlobs ??= new Map());
 
-// ---- MSSQL backend ---------------------------------------------------------
+// ---- SQL backend (SQL Server / MySQL) --------------------------------------
 
-async function mssqlSave(id: string, data: Buffer, mime: string | null): Promise<void> {
-  const { getPool, sql } = await import("@/lib/data/mssql/connection");
-  const pool = await getPool();
-  await pool
-    .request()
-    .input("id", sql.NVarChar(80), id)
-    .input("data", sql.VarBinary(sql.MAX), data)
-    .input("mime", sql.NVarChar(160), mime)
-    .input("size", sql.Int, data.length)
-    .input("sha", sql.NVarChar(64), sha256Of(data))
-    .input("at", sql.NVarChar(40), systemClock.isoNow())
-    .query(
-      `MERGE [dbo].[_file_blob] AS t USING (SELECT @id AS id) AS s ON t.[id] = s.id ` +
-        `WHEN MATCHED THEN UPDATE SET [data] = @data, [mimeType] = @mime, [sizeBytes] = @size, [sha256] = @sha, [createdAt] = @at ` +
-        `WHEN NOT MATCHED THEN INSERT ([id],[data],[mimeType],[sizeBytes],[sha256],[createdAt]) VALUES (@id,@data,@mime,@size,@sha,@at);`,
-    );
+async function sqlDeps() {
+  const [{ getDriver }, { getDialect }, { T }] = await Promise.all([
+    import("@/lib/data/sql/driver"),
+    import("@/lib/data/sql/dialect"),
+    import("@/lib/data/sql/types"),
+  ]);
+  const [driver, dialect] = await Promise.all([getDriver(), getDialect()]);
+  return { driver, dialect, T };
 }
 
-async function mssqlRead(id: string): Promise<StoredBlob | null> {
-  const { getPool, sql } = await import("@/lib/data/mssql/connection");
-  const pool = await getPool();
-  const res = await pool.request().input("id", sql.NVarChar(80), id).query(
-    `SELECT [data], [mimeType] FROM [dbo].[_file_blob] WHERE [id] = @id`,
+async function sqlSave(id: string, data: Buffer, mime: string | null): Promise<void> {
+  const { driver, dialect, T } = await sqlDeps();
+  const t = dialect.table("_file_blob");
+  const c = (n: string) => dialect.id(n);
+  const size = data.length;
+  const sha = sha256Of(data);
+  const at = systemClock.isoNow();
+  const bId = { value: id, type: T.string(80) };
+  const bData = { value: data, type: T.binary };
+  const bMime = { value: mime, type: T.string(160) };
+  const bSize = { value: size, type: T.int };
+  const bSha = { value: sha, type: T.string(64) };
+  const bAt = { value: at, type: T.string(40) };
+
+  if (dialect.client === "mysql") {
+    await driver.query(
+      `INSERT INTO ${t} (${c("id")}, ${c("data")}, ${c("mimeType")}, ${c("sizeBytes")}, ${c("sha256")}, ${c("createdAt")}) ` +
+        `VALUES (?, ?, ?, ?, ?, ?) ` +
+        `ON DUPLICATE KEY UPDATE ${c("data")} = ?, ${c("mimeType")} = ?, ${c("sizeBytes")} = ?, ${c("sha256")} = ?, ${c("createdAt")} = ?`,
+      [bId, bData, bMime, bSize, bSha, bAt, bData, bMime, bSize, bSha, bAt],
+    );
+    return;
+  }
+  const p0 = dialect.placeholder(0);
+  await driver.query(
+    `MERGE ${t} AS tgt USING (SELECT ${p0} AS id) AS s ON tgt.${c("id")} = s.id ` +
+      `WHEN MATCHED THEN UPDATE SET ${c("data")} = ${dialect.placeholder(1)}, ${c("mimeType")} = ${dialect.placeholder(2)}, ` +
+      `${c("sizeBytes")} = ${dialect.placeholder(3)}, ${c("sha256")} = ${dialect.placeholder(4)}, ${c("createdAt")} = ${dialect.placeholder(5)} ` +
+      `WHEN NOT MATCHED THEN INSERT (${c("id")}, ${c("data")}, ${c("mimeType")}, ${c("sizeBytes")}, ${c("sha256")}, ${c("createdAt")}) ` +
+      `VALUES (${p0}, ${dialect.placeholder(1)}, ${dialect.placeholder(2)}, ${dialect.placeholder(3)}, ${dialect.placeholder(4)}, ${dialect.placeholder(5)});`,
+    [bId, bData, bMime, bSize, bSha, bAt],
   );
-  const row = res.recordset[0] as { data: Buffer; mimeType: string | null } | undefined;
+}
+
+async function sqlRead(id: string): Promise<StoredBlob | null> {
+  const { driver, dialect, T } = await sqlDeps();
+  const res = await driver.query(
+    `SELECT ${dialect.id("data")}, ${dialect.id("mimeType")} FROM ${dialect.table("_file_blob")} WHERE ${dialect.id("id")} = ${dialect.placeholder(0)}`,
+    [{ value: id, type: T.string(80) }],
+  );
+  const row = res.rows[0] as { data: Buffer; mimeType: string | null } | undefined;
   if (!row) return null;
   return { data: row.data, mimeType: row.mimeType ?? null };
 }
 
-async function mssqlDelete(id: string): Promise<void> {
-  const { getPool, sql } = await import("@/lib/data/mssql/connection");
-  const pool = await getPool();
-  await pool.request().input("id", sql.NVarChar(80), id).query(`DELETE FROM [dbo].[_file_blob] WHERE [id] = @id`);
+async function sqlDelete(id: string): Promise<void> {
+  const { driver, dialect, T } = await sqlDeps();
+  await driver.query(
+    `DELETE FROM ${dialect.table("_file_blob")} WHERE ${dialect.id("id")} = ${dialect.placeholder(0)}`,
+    [{ value: id, type: T.string(80) }],
+  );
 }
 
 // ---- public API ------------------------------------------------------------
@@ -111,7 +140,7 @@ export async function saveBlob(id: string, data: Buffer, mime?: string | null): 
     memStore.set(id, { data, mimeType });
     return;
   }
-  await mssqlSave(id, data, mimeType);
+  await sqlSave(id, data, mimeType);
 }
 
 /** Read a file's bytes (durable store first, then legacy disk with backfill). */
@@ -122,13 +151,13 @@ export async function readBlob(id: string): Promise<StoredBlob | null> {
     const disk = await readDisk(id);
     return disk ? { data: disk, mimeType: null } : null;
   }
-  const durable = await mssqlRead(id);
+  const durable = await sqlRead(id);
   if (durable) return durable;
   // Legacy blob still on local disk → serve it and migrate it into the DB.
   const disk = await readDisk(id);
   if (!disk) return null;
   try {
-    await mssqlSave(id, disk, null);
+    await sqlSave(id, disk, null);
     await deleteDisk(id);
   } catch (e) {
     logger.warn("file blob disk→db backfill failed", { id, error: e instanceof Error ? e.message : String(e) });
@@ -142,7 +171,7 @@ export async function blobExists(id: string): Promise<boolean> {
     if (memStore.has(id)) return true;
     return (await readDisk(id)) !== null;
   }
-  const durable = await mssqlRead(id);
+  const durable = await sqlRead(id);
   if (durable) return true;
   return (await readDisk(id)) !== null;
 }
@@ -153,7 +182,7 @@ export async function deleteBlob(id: string): Promise<void> {
     memStore.delete(id);
   } else {
     try {
-      await mssqlDelete(id);
+      await sqlDelete(id);
     } catch (e) {
       logger.warn("file blob delete failed", { id, error: e instanceof Error ? e.message : String(e) });
     }

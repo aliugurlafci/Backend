@@ -17,13 +17,15 @@ import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import { numberSequence } from "@/lib/finance/number-sequence";
 import { internalEan13 } from "@/lib/barcode/check-digit";
 import type { Repository } from "./repository";
-import { getPool } from "./mssql/connection";
+import { getDriver } from "./sql/driver";
+import { getDialect } from "./sql/dialect";
 
 /** Whether demo data has already been seeded (any account row exists). */
 export async function isSeeded(): Promise<boolean> {
-  const pool = await getPool();
-  const result = await pool.request().query("SELECT COUNT(*) AS c FROM [dbo].[account]");
-  return Number((result.recordset[0] as { c: number }).c) > 0;
+  const driver = await getDriver();
+  const dialect = await getDialect();
+  const result = await driver.query(`SELECT COUNT(*) AS c FROM ${dialect.table("account")}`, []);
+  return Number((result.rows[0] as { c: number }).c) > 0;
 }
 
 const T0 = "2026-01-15T09:00:00.000Z";

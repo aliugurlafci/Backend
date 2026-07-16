@@ -12,12 +12,12 @@ import { metadata } from "@/lib/metadata";
 import { permissionEngine } from "@/lib/permissions/engine";
 import { QueryEngine } from "./query-engine";
 import { InMemoryRepository } from "./memory-repository";
-import { MssqlRepository } from "./mssql/mssql-repository";
-import { getPool } from "./mssql/connection";
-import { runMigrations } from "./mssql/migrate";
+import { SqlRepository } from "./sql/repository";
+import { getDriver } from "./sql/driver";
+import { runMigrations } from "./sql/migrate";
 import { ensureAdminSeed } from "@/lib/security/auth-seed";
 
-type StoreRepository = MssqlRepository | InMemoryRepository;
+type StoreRepository = SqlRepository | InMemoryRepository;
 
 interface Singletons {
   repo: StoreRepository;
@@ -30,7 +30,7 @@ const globalRef = globalThis as unknown as { __aulaStore?: Singletons };
 function create(): Singletons {
   const repo: StoreRepository = usingInMemoryBackends
     ? new InMemoryRepository()
-    : new MssqlRepository(metadata);
+    : new SqlRepository(metadata);
   const queryEngine = new QueryEngine(repo, metadata, permissionEngine);
   return { repo, queryEngine, ready: null };
 }
@@ -47,7 +47,7 @@ async function init(): Promise<void> {
   if (env.AULA_AUTO_MIGRATE) {
     await runMigrations(); // first boot: provision the whole schema once (then never again)
   } else {
-    await getPool(); // assume the database + schema already exist
+    await getDriver(); // assume the database + schema already exist (pool connects on first query)
   }
   // The only data seeded on boot is the admin login user (idempotent). Demo data
   // is opt-in: `npm run seed`.

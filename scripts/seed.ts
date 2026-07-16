@@ -5,8 +5,8 @@
  * want the full demo populated.
  *   npm run seed
  */
-import { closePool } from "@/lib/data/mssql/connection";
-import { runMigrations } from "@/lib/data/mssql/migrate";
+import { closePool } from "@/lib/data/sql/connection";
+import { runMigrations } from "@/lib/data/sql/migrate";
 import { getRepository } from "@/lib/data/store";
 import { isSeeded, seedInto } from "@/lib/data/seed";
 import { ensureAdminSeed, ensureDemoUsers } from "@/lib/security/auth-seed";

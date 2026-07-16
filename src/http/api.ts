@@ -60,7 +60,7 @@ import {
 } from "@/lib/automation";
 import { publishMetadata } from "@/lib/config/governance";
 import { releaseLog } from "@/lib/config/release";
-import { schemaStatus } from "@/lib/data/mssql/migrate";
+import { schemaStatus } from "@/lib/data/sql/migrate";
 import { metrics } from "@/lib/observability/metrics";
 import { getInflight } from "@/lib/http/resilience";
 import { env, isProduction, usingInMemoryBackends } from "@/lib/config/env";
