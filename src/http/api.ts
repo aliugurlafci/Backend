@@ -81,8 +81,10 @@ import { rateLimit, peekRateLimit, clearRateLimit } from "@/lib/security/rate-li
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { screenCatalog } from "@/lib/config/screens";
+import { SETTINGS_AREAS, canSettings, areaForUserSettingKey } from "@/lib/config/settings-permissions";
 import { resolveMobileConfig, mobileScreenCatalog } from "@/lib/mobile/service";
 import type { EntityRecord } from "@/lib/metadata/types";
+import type { RequestContext } from "@/lib/context/types";
 
 /** Minimum length for any password set through the API. */
 const MIN_PASSWORD_LEN = 8;
@@ -156,6 +158,22 @@ function stripHash(user: EntityRecord): Record<string, unknown> {
   delete rest.passwordHash;
   delete rest.twoFactorSecret;
   return rest;
+}
+
+/** The caller's effective grants — the position's matrix, else its role defaults. */
+function effectiveGrants(rc: RequestContext): string[] {
+  return rc.grants ? [...rc.grants] : [...grantsFor(rc.roles)];
+}
+
+/**
+ * Gate one Settings-screen operation (see lib/config/settings-permissions).
+ * Administrators hold `*` and pass everything; every other position needs the
+ * area grant the admin ticked in the permission matrix.
+ */
+function assertSettings(rc: RequestContext, area: string, action: string): void {
+  if (!canSettings(effectiveGrants(rc), area, action)) {
+    throw new ForbiddenError(`this position is not granted "${area}:${action}"`);
+  }
 }
 
 /** Best-effort client IP for the security activity log. */
@@ -319,6 +337,11 @@ export function buildApiRouter(): Router {
           bio?: string | null;
           notificationPrefs?: unknown;
         };
+        // Profile fields and notification preferences are separately grantable.
+        const profileKeys = ["displayName", "email", "phone", "timezone", "jobTitle", "location", "bio"] as const;
+        if (profileKeys.some((k) => body[k] !== undefined)) assertSettings(rc, "settings.profile", "update");
+        if (body.avatarId !== undefined) assertSettings(rc, "settings.profile", "avatar");
+        if (body.notificationPrefs !== undefined) assertSettings(rc, "settings.notifications", "update");
         const user = await findUserById(rc.userId);
         if (!user) throw new BadRequestError("no editable profile for this account");
         const patch: Record<string, unknown> = {};
@@ -347,6 +370,12 @@ export function buildApiRouter(): Router {
       async (rc, req) => {
         const body = readJson(req) as { settings?: Record<string, unknown> };
         const entries = Object.entries(body.settings ?? {});
+        // Each key belongs to a settings area (theme/density → appearance,
+        // mailSyncInterval → notifications), so both are gated independently.
+        for (const [key] of entries) {
+          const { area, action } = areaForUserSettingKey(key);
+          assertSettings(rc, area, action);
+        }
         const domain = await getDomainService();
         const sys = systemContext(rc.tenantId, rc.orgId);
         const existing = await domain.list(sys, "userSetting", {
@@ -377,6 +406,7 @@ export function buildApiRouter(): Router {
     "/auth/password",
     runApi(
       async (rc, req) => {
+        assertSettings(rc, "settings.security", "password");
         const body = readJson(req) as { currentPassword?: string; newPassword?: string };
         if (!body.currentPassword || !body.newPassword) {
           throw new BadRequestError("currentPassword and newPassword are required");
@@ -407,6 +437,7 @@ export function buildApiRouter(): Router {
   r.post(
     "/auth/2fa/setup",
     runApi(async (rc) => {
+      assertSettings(rc, "settings.security", "twoFactor");
       const user = await findUserById(rc.userId);
       if (!user) throw new BadRequestError("no editable profile for this account");
       const secret = randomBase32Secret();
@@ -423,6 +454,7 @@ export function buildApiRouter(): Router {
   r.post(
     "/auth/2fa/enable",
     runApi(async (rc, req) => {
+      assertSettings(rc, "settings.security", "twoFactor");
       const body = readJson(req) as { code?: string };
       const user = await findUserById(rc.userId);
       if (!user?.twoFactorSecret) throw new BadRequestError("start 2FA setup first");
@@ -445,6 +477,7 @@ export function buildApiRouter(): Router {
   r.post(
     "/auth/2fa/disable",
     runApi(async (rc, req) => {
+      assertSettings(rc, "settings.security", "twoFactor");
       const body = readJson(req) as { password?: string };
       const user = await findUserById(rc.userId);
       if (!user) throw new BadRequestError("no editable profile for this account");
@@ -466,6 +499,7 @@ export function buildApiRouter(): Router {
 
   // Recent security activity for the signed-in user (sign-ins + security changes).
   r.get("/auth/security/activity", runApi(async (rc) => {
+    assertSettings(rc, "settings.security", "activity");
     const qe = await getQueryEngine();
     const page = await qe.list(systemContext(rc.tenantId, rc.orgId), "securityEvent", {
       filters: [{ field: "userId", op: "eq", value: rc.userId }],
@@ -498,7 +532,7 @@ export function buildApiRouter(): Router {
 
   // Toggleable screen catalog (full web catalog, flagged with mobile support).
   r.get("/mobile/screens", runApi(async (rc) => {
-    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    assertSettings(rc, "settings.mobile", "read");
     return { screens: mobileScreenCatalog() };
   }));
 
@@ -511,7 +545,7 @@ export function buildApiRouter(): Router {
   };
 
   r.get("/mobile/configs", runApi(async (rc) => {
-    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    assertSettings(rc, "settings.mobile", "read");
     const domain = await getDomainService();
     const page = await domain.list(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", {
       pageSize: 500,
@@ -535,7 +569,7 @@ export function buildApiRouter(): Router {
     "/mobile/configs",
     runApi(
       async (rc, req) => {
-        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        assertSettings(rc, "settings.mobile", "create");
         const body = readJson(req) as Record<string, unknown>;
         const domain = await getDomainService();
         const created = await domain.create(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", {
@@ -556,7 +590,7 @@ export function buildApiRouter(): Router {
     "/mobile/configs/:id",
     runApi(
       async (rc, req) => {
-        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        assertSettings(rc, "settings.mobile", "update");
         const body = readJson(req) as Record<string, unknown>;
         const patch: Record<string, unknown> = {};
         if (body.clientId !== undefined) patch.clientId = String(body.clientId) || "*";
@@ -577,7 +611,7 @@ export function buildApiRouter(): Router {
     "/mobile/configs/:id",
     runApi(
       async (rc, req) => {
-        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        assertSettings(rc, "settings.mobile", "delete");
         const domain = await getDomainService();
         await domain.remove(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", req.params.id);
         return { deleted: true, id: req.params.id };
@@ -586,10 +620,11 @@ export function buildApiRouter(): Router {
     ),
   );
 
-  // Permission catalog (admin only) — every entity's grantable operations + the
-  // special (non-entity) grants + each base role's default grants (matrix presets).
+  // Permission catalog — every entity's grantable operations, the Settings-screen
+  // areas + their operations, the special (non-entity) grants, and each base
+  // role's default grants (matrix presets).
   r.get("/permissions/catalog", runApi(async (rc) => {
-    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    assertSettings(rc, "settings.roles", "read");
     const CRUD = ["read", "create", "update", "delete"];
     const entities = metadata
       .listEntities()
@@ -610,12 +645,17 @@ export function buildApiRouter(): Router {
       value: role,
       grants: roleGrants(role),
     }));
-    return { entities, special, roles };
+    // The Settings screen, area by area — the fine-grained layer on top of the
+    // coarse `settings` screen key.
+    return { entities, special, roles, settings: SETTINGS_AREAS };
   }));
 
-  // ---- user administration (admin only) --------------------------------
+  // ---- user administration ----------------------------------------------
+  // Administrators always pass; other positions need the `settings.users` grants
+  // an admin ticked in the permission matrix (read / create / update / password
+  // / twoFactor / activate are separately grantable).
   r.get("/admin/users", runApi(async (rc) => {
-    if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+    assertSettings(rc, "settings.users", "read");
     const domain = await getDomainService();
     const page = await domain.list(rc, "user", { pageSize: 500, sort: [{ field: "displayName", dir: "asc" }] });
     return { users: page.items.map(stripHash) };
@@ -625,7 +665,7 @@ export function buildApiRouter(): Router {
     "/admin/users",
     runApi(
       async (rc, req) => {
-        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
+        assertSettings(rc, "settings.users", "create");
         const body = readJson(req) as {
           email?: string; displayName?: string; password?: string; positionId?: string; active?: boolean;
           managerId?: string | null; phone?: string | null; jobTitle?: string | null;
@@ -662,12 +702,18 @@ export function buildApiRouter(): Router {
     "/admin/users/:id",
     runApi(
       async (rc, req) => {
-        if (!rc.roles.includes("admin")) throw new ForbiddenError("admins only");
         const body = readJson(req) as {
           displayName?: string; positionId?: string; active?: boolean; password?: string;
           email?: string; managerId?: string | null; phone?: string | null; jobTitle?: string | null;
           resetTwoFactor?: boolean;
         };
+        // Editing a user, resetting their password, clearing their second factor
+        // and enabling/disabling the account are separate privileges.
+        const editKeys = ["displayName", "email", "positionId", "managerId", "phone", "jobTitle"] as const;
+        if (editKeys.some((k) => body[k] !== undefined)) assertSettings(rc, "settings.users", "update");
+        if (body.password !== undefined) assertSettings(rc, "settings.users", "password");
+        if (body.resetTwoFactor) assertSettings(rc, "settings.users", "twoFactor");
+        if (body.active !== undefined) assertSettings(rc, "settings.users", "activate");
         // A manager can't be their own supervisor.
         if (body.managerId && String(body.managerId) === req.params.id) {
           throw new BadRequestError("a user cannot be their own manager");
@@ -895,6 +941,7 @@ export function buildApiRouter(): Router {
   // Empty import template (one header row of the entity's writable fields), as a
   // real .xlsx workbook (default) or CSV — the file users fill and re-import.
   r.get("/import/:entity/template", runApi(async (rc, req, res) => {
+    assertSettings(rc, "settings.import", "execute");
     assertKnownEntity(req.params.entity);
     const format = String(req.query.format ?? "xlsx").toLowerCase() === "csv" ? "csv" : "xlsx";
     const { buffer, contentType, ext } = await buildImportTemplate(req.params.entity, metadata, format);
@@ -924,6 +971,7 @@ export function buildApiRouter(): Router {
     "/import/:entity",
     runApi(
       async (rc, req) => {
+        assertSettings(rc, "settings.import", "execute");
         assertKnownEntity(req.params.entity);
         const body = readJson(req) as { csv?: string; xlsx?: string; aliases?: Record<string, string> };
         const domain = await getDomainService();
@@ -944,6 +992,7 @@ export function buildApiRouter(): Router {
     "/import/:entity/job",
     runApi(
       async (rc, req) => {
+        assertSettings(rc, "settings.import", "execute");
         assertKnownEntity(req.params.entity);
         const body = readJson(req) as { csv?: string; xlsx?: string; aliases?: Record<string, string> };
         const domain = await getDomainService();
@@ -2407,6 +2456,7 @@ export function buildApiRouter(): Router {
     "/admin/metadata/republish",
     runApi(
       async (rc) => {
+        assertSettings(rc, "settings.metadata", "publish");
         const published = publishMetadata(rc, metadata.version, "re-published from settings");
         return { version: published.version, publishedAt: published.publishedAt, publishedBy: published.publishedBy };
       },
@@ -2415,7 +2465,7 @@ export function buildApiRouter(): Router {
   );
 
   r.get("/admin/releases", runApi(async (rc) => {
-    if (!rc.roles.includes("admin")) throw new ForbiddenError("only administrators may view the release trail");
+    assertSettings(rc, "settings.releases", "read");
     // Real applied schema versions from the `_schema_migrations` ledger (empty in
     // memory mode, which has no physical schema).
     const migrations = usingInMemoryBackends ? [] : await schemaStatus().catch(() => []);

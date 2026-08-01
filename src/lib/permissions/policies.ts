@@ -5,9 +5,10 @@
  * intentionally least-privileged: read across the tenant, but may only mutate
  * records it owns and cannot read PII or win deals.
  */
+import { SELF_SERVICE_SETTINGS_GRANTS } from "@/lib/config/settings-permissions";
 import type { RoleDef } from "./types";
 
-export const ROLES: Record<string, RoleDef> = {
+const BASE_ROLES: Record<string, RoleDef> = {
   admin: {
     name: "admin",
     label: "Administrator",
@@ -182,6 +183,20 @@ export const ROLES: Record<string, RoleDef> = {
     grants: ["*", "pii:read"],
   },
 };
+
+/**
+ * The published role presets: every role that isn't a super-user (`*`) also
+ * carries the personal Settings grants — profile, security, notifications and
+ * appearance. Managing your own account is not an administrative privilege, so
+ * it belongs to every base role; the administrative Settings areas (users,
+ * positions, mobile, data model…) stay opt-in per position.
+ */
+export const ROLES: Record<string, RoleDef> = Object.fromEntries(
+  Object.entries(BASE_ROLES).map(([name, def]) => [
+    name,
+    def.grants.includes("*") ? def : { ...def, grants: [...def.grants, ...SELF_SERVICE_SETTINGS_GRANTS] },
+  ]),
+);
 
 /** Verbs that mutate a record and therefore trigger record-level ABAC. */
 export const MUTATING_VERBS = new Set(["update", "delete", "win", "lose", "convert"]);

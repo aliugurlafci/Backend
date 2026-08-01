@@ -11,6 +11,7 @@ import { systemClock } from "@/lib/core/clock";
 import type { EntityRecord } from "@/lib/metadata/types";
 import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
 import { env, jwtSecret } from "@/lib/config/env";
+import { expandSettingsGrants } from "@/lib/config/settings-permissions";
 import { decrypt, totpVerify, verifyPassword } from "./crypto";
 import { signJwt } from "./auth";
 
@@ -72,11 +73,15 @@ export function parsePermissions(position: EntityRecord | null): string[] {
  * engine fall back to the base role's defaults. Admins are always super-users
  * (no embedded matrix), and an empty matrix inherits the role — so only a
  * customised non-admin position carries an authoritative grant list.
+ *
+ * Settings-area grants are expanded into the entity grants they imply (the
+ * administrative Settings screens read `user`/`position` records), so ticking
+ * "User management → view" in the matrix is enough to make the screen work.
  */
 export function grantsClaimFor(role: string, position: EntityRecord | null): string[] | undefined {
   if (role === "admin") return undefined;
   const explicit = parsePermissions(position);
-  return explicit.length ? explicit : undefined;
+  return explicit.length ? expandSettingsGrants(explicit) : undefined;
 }
 
 export interface LoginResult {
