@@ -12,7 +12,7 @@ import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { retryOnConflict } from "@/lib/data/optimistic";
 import { systemClock } from "@/lib/core/clock";
-import { DEMO_ORG, DEMO_TENANT, DEMO_USERS } from "@/lib/context/dev";
+import { ORG_ID, TENANT_ID } from "@/lib/config/env";
 import type { RequestContext } from "@/lib/context/types";
 import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import type { Filter } from "@/lib/data/query";
@@ -698,160 +698,16 @@ export class AutomationStore {
     return def ? def.envValue() : null;
   }
 
-  // ---- seed ----------------------------------------------------------------
+  // ---- bootstrap -----------------------------------------------------------
 
-  /** Seed realistic demo content for the demo tenant the first time it's empty. */
-  async seedDemo(tenantId = DEMO_TENANT, orgId = DEMO_ORG): Promise<void> {
-    if (tenantId !== DEMO_TENANT || orgId !== DEMO_ORG) return;
-    const existing = await this.listRules(tenantId, orgId);
-    if (existing.length > 0) return;
-
-    const grp = (children: ConditionGroup["children"], logic: "AND" | "OR" = "AND"): ConditionGroup => ({
-      type: "group",
-      logic,
-      children,
-    });
-    const aid = (n: number) => `seedact_${n}`;
-    const ago = (mins: number) => new Date(Date.now() - mins * 60_000).toISOString();
-
-    const welcome = await this.createRule({
-      tenantId,
-      orgId,
-      name: "Welcome new accounts",
-      description: "Email new accounts and create a first-touch task for the owner.",
-      status: "active",
-      trigger: { kind: "event", entity: "account", event: "created" },
-      conditions: grp([]),
-      actions: [
-        { id: aid(1), type: "send_email", to: "{{record.email}}", subject: "Welcome to Aula", body: "Thanks for your interest — we'll be in touch shortly." },
-        { id: aid(2), type: "create_task", taskSubject: "First-touch call with new account" },
-        { id: aid(3), type: "ai_score", model: "account-propensity", field: "score" },
-      ],
-      tags: ["sales", "onboarding"],
-      by: "system",
-    });
-
-    const bigDeal = await this.createRule({
-      tenantId,
-      orgId,
-      name: "Escalate high-value deals",
-      description: "When a deal over $50k changes stage, alert the team and assign round-robin.",
-      status: "active",
-      trigger: { kind: "event", entity: "deal", event: "stage_changed" },
-      conditions: grp([{ type: "condition", field: "amount", op: "gte", value: 50000 }]),
-      actions: [
-        { id: aid(4), type: "notify", subject: "High-value deal moved", body: "A deal over $50k changed stage." },
-        { id: aid(5), type: "assign_owner" },
-        {
-          id: aid(6),
-          type: "branch",
-          condition: grp([{ type: "condition", field: "stage", op: "eq", value: "won" }]),
-          thenActions: [{ id: aid(7), type: "create_task", taskSubject: "Kick off onboarding for won deal" }],
-          elseActions: [{ id: aid(8), type: "create_reminder", reminderInDays: 3 }],
-        },
-      ],
-      tags: ["sales", "priority"],
-      requiresApproval: true,
-      by: "system",
-    });
-    await this.setStatus(tenantId, orgId, bigDeal.id, "active", "system");
-
-    await this.createRule({
-      tenantId,
-      orgId,
-      name: "Overdue invoice reminders",
-      description: "Daily: nudge customers on overdue invoices and notify the accountant.",
-      status: "paused",
-      trigger: { kind: "schedule", schedule: "daily" },
-      conditions: grp([{ type: "condition", field: "status", op: "eq", value: "overdue" }]),
-      actions: [
-        { id: aid(9), type: "send_email", to: "{{record.email}}", subject: "Invoice overdue", body: "Your invoice is past due." },
-        { id: aid(10), type: "notify", subject: "Overdue invoices need attention", body: "Dunning run completed." },
-      ],
-      tags: ["finance"],
-      by: "system",
-    });
-
-    await this.createRule({
-      tenantId,
-      orgId,
-      name: "Re-engage stale opportunities",
-      description: "After 14 days of inactivity on an open deal, create a follow-up reminder.",
-      status: "draft",
-      trigger: { kind: "inactivity", entity: "deal", inactivityDays: 14 },
-      conditions: grp([
-        { type: "condition", field: "stage", op: "ne", value: "won" },
-        { type: "condition", field: "stage", op: "ne", value: "lost" },
-      ]),
-      actions: [{ id: aid(11), type: "create_reminder", reminderInDays: 1 }],
-      tags: ["sales", "retention"],
-      by: "system",
-    });
-
-    // A few historical runs so the dashboard + logs are populated (drive stats).
-    await this.recordRun({
-      id: "", tenantId, orgId, ruleId: welcome.id, ruleName: welcome.name, status: "success",
-      trigger: "lead.created", input: { id: "ld_demo", name: "Dana Prospect", email: "dana@prospect.test" },
-      output: { created: 1, emails: 1 },
-      steps: [
-        { name: "Trigger: lead.created", type: "trigger", status: "ok", ms: 0, output: "matched lead Dana Prospect" },
-        { name: "Send email", type: "send_email", status: "ok", ms: 92, output: "Email → dana@prospect.test" },
-        { name: "Create task", type: "create_task", status: "ok", ms: 71, output: "created task tsk_demo" },
-        { name: "AI score", type: "ai_score", status: "ok", ms: 21, output: "lead-propensity: score=72" },
-      ],
-      startedAt: ago(33), finishedAt: ago(33), durationMs: 184, test: false,
-    });
-    await this.recordRun({
-      id: "", tenantId, orgId, ruleId: bigDeal.id, ruleName: bigDeal.name, status: "success",
-      trigger: "deal.stage_changed", input: { id: "dl_demo", name: "Globex Expansion", amount: 82000, stage: "negotiation" },
-      output: { advanced: 1, notifications: 1 },
-      steps: [
-        { name: "Trigger: deal.stage_changed", type: "trigger", status: "ok", ms: 0 },
-        { name: "Conditions (1)", type: "condition", status: "ok", ms: 1, output: "all matched" },
-        { name: "Notify team", type: "notify", status: "ok", ms: 40 },
-        { name: "Assign owner", type: "assign_owner", status: "ok", ms: 55, output: "assigned to Riley Rep" },
-        { name: "If / Else", type: "branch", status: "ok", ms: 60, output: "else →" },
-      ],
-      startedAt: ago(120), finishedAt: ago(120), durationMs: 240, test: false,
-    });
-    await this.recordRun({
-      id: "", tenantId, orgId, ruleId: welcome.id, ruleName: welcome.name, status: "failed",
-      trigger: "lead.created", input: { id: "ld_demo2", email: "sam@prospect.test" },
-      output: {}, error: "SMTP timeout contacting mail provider",
-      steps: [
-        { name: "Trigger: lead.created", type: "trigger", status: "ok", ms: 0 },
-        { name: "Send email", type: "send_email", status: "failed", ms: 120, error: "SMTP timeout contacting mail provider" },
-      ],
-      startedAt: ago(20), finishedAt: ago(20), durationMs: 130, test: false,
-    });
-
-    // Processing-queue sample — DEAD-LETTER ONLY. We must NOT seed live
-    // pending/retry items: processQueue() drains them with real side effects, so
-    // a seeded `welcome` send_email item would actually email its fake recipient
-    // (e.g. sam@prospect.test) on the next scheduler tick. `dead` items are never
-    // processed, so this is display-only and safe. (Live items are also ephemeral
-    // — they'd drain within one tick — so seeding them serves no purpose.)
-    await this.enqueue({
-      tenantId, orgId, ruleId: bigDeal.id, ruleName: bigDeal.name, state: "dead",
-      attempts: 3, maxAttempts: 3, nextAttemptAt: null, enqueuedAt: ago(180),
-      lastError: "Webhook endpoint returned 500 after 3 attempts", input: { id: "dl_demo3", amount: 64000 },
-    });
-
-    // Assignment rules.
-    await this.upsertAssignment({
-      tenantId, orgId, name: "Inbound account rotation", entity: "account", strategy: "round_robin",
-      pool: [DEMO_USERS.manager.userId, DEMO_USERS.rep.userId], enabled: true,
-    });
-    await this.upsertAssignment({
-      tenantId, orgId, name: "Deal desk (load-based)", entity: "deal", strategy: "load_based",
-      pool: [DEMO_USERS.rep.userId, DEMO_USERS.manager.userId], enabled: true,
-    });
-
-    // Persist default settings so they're managed in the DB from the start.
+  /**
+   * Provision the automation defaults a fresh tenant needs: the DB-backed system
+   * settings and the Email integration row (seeded from the SMTP/IMAP env vars so
+   * the connection is managed from the Integrations screen going forward).
+   * Idempotent by way of upsert; no sample rules, runs or assignment pools.
+   */
+  async ensureDefaults(tenantId = TENANT_ID, orgId = ORG_ID): Promise<void> {
     await this.updateSettings(tenantId, orgId, defaultSettings() as unknown as Record<string, unknown>);
-
-    // Migrate the SMTP/IMAP env config into the DB-backed Email integration so
-    // the connection is managed from the Integrations screen going forward.
     await this.upsertIntegration(tenantId, orgId, "email", {
       enabled: emailEnabledByDefault(),
       config: integrationDefaults("email"),

@@ -9,14 +9,13 @@ import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { systemClock } from "@/lib/core/clock";
 import type { EntityRecord } from "@/lib/metadata/types";
-import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
-import { env, jwtSecret } from "@/lib/config/env";
+import { env, jwtSecret, ORG_ID, TENANT_ID } from "@/lib/config/env";
 import { expandSettingsGrants } from "@/lib/config/settings-permissions";
 import { decrypt, totpVerify, verifyPassword } from "./crypto";
 import { signJwt } from "./auth";
 
 /** A privileged context for auth lookups (bypasses RBAC for self-resolution). */
-const sys = () => systemContext(DEMO_TENANT, DEMO_ORG);
+const sys = () => systemContext(TENANT_ID, ORG_ID);
 
 export async function findUserByEmail(email: string): Promise<EntityRecord | null> {
   const qe = await getQueryEngine();
@@ -36,7 +35,7 @@ export async function getPosition(id: string): Promise<EntityRecord | null> {
   }
 }
 
-/** Fetch a user record by id (null if missing, e.g. for dev personas). */
+/** Fetch a user record by id (null if the row is gone). */
 export async function findUserById(id: string): Promise<EntityRecord | null> {
   const qe = await getQueryEngine();
   try {

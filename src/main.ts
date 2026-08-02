@@ -32,7 +32,7 @@ async function main(): Promise<void> {
     logger.info("aula-crm backend listening", {
       port: env.PORT,
       env: env.NODE_ENV,
-      devAuth: env.AULA_DEV_AUTH,
+      tenant: env.AULA_TENANT_ID,
     });
   });
 

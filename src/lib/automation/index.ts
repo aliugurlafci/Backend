@@ -4,9 +4,9 @@ import { automationStore } from "./store";
 export * from "./types";
 export { automationStore, AutomationStore } from "./store";
 
-/** Seed demo automations for the demo tenant if none exist yet (idempotent). */
+/** Provision the automation defaults (system settings + email integration). */
 export async function seedAutomations(): Promise<void> {
-  await automationStore.seedDemo();
+  await automationStore.ensureDefaults();
 }
 export {
   registerAutomationEngine,

@@ -7,9 +7,9 @@ import { metadata } from "@/lib/metadata";
 import { allStatements, entityStatements } from "@/lib/data/sql/ddl";
 import { getDialect } from "@/lib/data/sql/dialect";
 import { createApp } from "@/http/server";
-import { configureAuth, issuePersonaToken } from "@/lib/security/auth-config";
-import { verifyJwt } from "@/lib/security/auth";
-import { jwtSecret } from "@/lib/config/env";
+import { configureAuth } from "@/lib/security/auth-config";
+import { signJwt, verifyJwt } from "@/lib/security/auth";
+import { jwtSecret, ORG_ID, TENANT_ID } from "@/lib/config/env";
 
 configureAuth();
 
@@ -18,8 +18,13 @@ const dialect = await getDialect();
 const entities = metadata.listEntities();
 const stmts = allStatements(entities, dialect);
 const app = createApp();
-const issued = issuePersonaToken("admin");
-const claims = issued ? verifyJwt(issued.token, jwtSecret) : null;
+// Round-trip a token through the real signer/verifier (no DB, no login needed).
+const token = signJwt(
+  { sub: "1", name: "Administrator", email: "admin@example.test", roles: ["admin"], tenantId: TENANT_ID, orgId: ORG_ID },
+  jwtSecret,
+  60,
+);
+const claims = verifyJwt(token, jwtSecret);
 
 console.log(
   JSON.stringify(
@@ -28,7 +33,7 @@ console.log(
       entityCount: entities.length,
       ddlStatementCount: stmts.length,
       appConstructed: typeof app === "function",
-      tokenIssued: Boolean(issued?.token),
+      tokenIssued: Boolean(token),
       tokenClaims: claims && { sub: claims.sub, roles: claims.roles, tenantId: claims.tenantId, orgId: claims.orgId },
     },
     null,

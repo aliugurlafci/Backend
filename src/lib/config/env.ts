@@ -77,7 +77,19 @@ const schema = z.object({
   AULA_JWT_SECRET: z.string().optional(),
   AULA_JWT_TTL: intish(3600),
   AULA_ENCRYPTION_KEY: z.string().optional(),
-  AULA_DEV_AUTH: boolish(true),
+
+  // Tenant identity: the scope stamped on every row (`tenantId` / `orgId`).
+  // Single-tenant deployments keep the defaults; changing them after data
+  // exists requires re-scoping the existing rows (scripts/retenant.ts).
+  AULA_TENANT_ID: z.string().min(1).default("AULA-CRM"),
+  AULA_ORG_ID: z.string().min(1).default("Uğur Corp"),
+
+  // Bootstrap administrator, created only when the database has no admin
+  // position yet (see lib/security/auth-seed). Change the password from
+  // Settings → Security after the first sign-in.
+  AULA_ADMIN_EMAIL: z.string().email().default("ali.ugur.lafci@gmail.com"),
+  AULA_ADMIN_PASSWORD: z.string().min(8).default("Aliugur1"),
+  AULA_ADMIN_NAME: z.string().min(1).default("Administrator"),
 
   // Persistence: "sql" (default, durable — the engine is picked by DB_CLIENT) or
   // "memory" (process-local, no DB — handy for local dev, CI and integration
@@ -109,7 +121,6 @@ const schema = z.object({
 
   // Bootstrap behaviour
   AULA_AUTO_MIGRATE: boolish(true),
-  AULA_AUTO_SEED: boolish(true),
 
   // Inventory policy: when false (default) a stock issue/transfer that would
   // drive on-hand negative is rejected; set true to permit overselling/backorders.
@@ -145,9 +156,6 @@ function load(): Env {
         problems.push("MSSQL_PASSWORD must be set");
       }
     }
-    if (env.AULA_DEV_AUTH) {
-      problems.push("AULA_DEV_AUTH must be false in production");
-    }
     if (problems.length) {
       throw new Error(`Insecure production configuration: ${problems.join("; ")}`);
     }
@@ -162,6 +170,15 @@ export const env = load();
 export const jwtSecret = env.AULA_JWT_SECRET ?? INSECURE_JWT;
 
 export const isProduction = env.NODE_ENV === "production";
+
+/**
+ * The tenant scope every record is written under. Multi-tenancy is enforced
+ * throughout the data layer, but a deployment serves one organisation: these two
+ * values are the `tenantId` / `orgId` stamped on every row, the JWT claims and
+ * the system contexts used by seeds, jobs and auth lookups.
+ */
+export const TENANT_ID = env.AULA_TENANT_ID;
+export const ORG_ID = env.AULA_ORG_ID;
 
 /** Allowed CORS origins (parsed from the comma-separated env var). */
 export const corsOrigins: string | string[] =

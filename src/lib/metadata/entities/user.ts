@@ -23,6 +23,9 @@ export const userEntity: EntityDef = {
     { name: "twoFactorEnabled", label: "Two-Factor Enabled", type: "boolean", filterable: true, defaultValue: false },
     { name: "twoFactorSecret", label: "Two-Factor Secret", type: "string", computed: true, max: 400 },
     { name: "positionId", label: "Position", type: "reference", referenceEntity: "position", required: true, filterable: true },
+    // The legal entity this user belongs to. Set when the user is created and
+    // surfaced on the Settings → Account card.
+    { name: "companyId", label: "Company", type: "reference", referenceEntity: "company", filterable: true },
     // Direct supervisor (üst amir). Drives purchase-order approval routing: a PO
     // submitted by this user is sent to their manager; users with no manager are
     // auto-approved.

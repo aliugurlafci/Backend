@@ -7,7 +7,7 @@
  */
 import type { RequestContext } from "@/lib/context/types";
 import { systemContext } from "@/lib/context/resolver";
-import { DEMO_ORG, DEMO_TENANT } from "@/lib/context/dev";
+import { ORG_ID, TENANT_ID } from "@/lib/config/env";
 import { getFinanceService } from "@/lib/finance/service";
 import { runScheduledAutomations, processQueue } from "@/lib/automation/engine";
 import { retryFailedPostings } from "@/lib/accounting/postings";
@@ -130,7 +130,7 @@ export function startScheduler(): void {
 
   const tick = async (): Promise<void> => {
     try {
-      const ctx = systemContext(DEMO_TENANT, DEMO_ORG);
+      const ctx = systemContext(TENANT_ID, ORG_ID);
       await runAllJobs(ctx);
       await retryFailedPostings(); // re-attempt any GL/stock postings that failed
       await runScheduledAutomations(ctx); // cadence-aware (no force)

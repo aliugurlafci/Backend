@@ -84,7 +84,6 @@ export const SETTINGS_AREAS: SettingsAreaDef[] = [
     actions: ["read"],
   },
   { key: "settings.featureFlags", label: "Feature flags", group: "settingsWorkspace", actions: ["read"] },
-  { key: "settings.metadata", label: "Data model", group: "settingsWorkspace", actions: ["read", "publish"] },
   { key: "settings.import", label: "Data import", group: "settingsWorkspace", actions: ["read", "execute"] },
   { key: "settings.export", label: "Data export", group: "settingsWorkspace", actions: ["read", "execute"] },
   { key: "settings.releases", label: "Release & audit trail", group: "settingsWorkspace", actions: ["read"] },

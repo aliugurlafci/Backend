@@ -26,6 +26,7 @@ import { cartLineEntity } from "./entities/cart-line";
 import { salesReturnEntity } from "./entities/sales-return";
 import { salesReturnLineEntity } from "./entities/sales-return-line";
 import { branchEntity } from "./entities/branch";
+import { companyEntity } from "./entities/company";
 import { dealerEntity } from "./entities/dealer";
 import { warehouseEntity } from "./entities/warehouse";
 import { supplierEntity } from "./entities/supplier";
@@ -85,6 +86,7 @@ export const crmEntities: EntityDef[] = [
   invoiceLineEntity,
   // branches & dealers
   branchEntity,
+  companyEntity,
   dealerEntity,
   // people
   departmentEntity,

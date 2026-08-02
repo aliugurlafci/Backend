@@ -45,8 +45,6 @@ export function createApp(): express.Express {
         "content-type",
         "authorization",
         "if-match",
-        "x-actor",
-        "x-tenant",
         "x-locale",
         "x-correlation-id",
         "x-csrf-token",

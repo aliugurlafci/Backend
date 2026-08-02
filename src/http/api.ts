@@ -66,7 +66,6 @@ import { getInflight } from "@/lib/http/resilience";
 import { env, isProduction, usingInMemoryBackends } from "@/lib/config/env";
 import { BadRequestError, ForbiddenError, NotFoundError, toAppError } from "@/lib/enforcement/errors";
 import type { Filter, Measure } from "@/lib/data/query";
-import { issuePersonaToken } from "@/lib/security/auth-config";
 import { saveBlob, readBlob } from "@/lib/integrations/file-storage";
 import { sendMail, fetchHeaders, fetchBodiesByUid, deleteOnServer, restoreOnServer } from "@/lib/integrations/email-transport";
 import { sendSms } from "@/lib/integrations/sms-transport";
@@ -75,6 +74,19 @@ import { sendSlack } from "@/lib/integrations/slack-transport";
 import { restTestConnection } from "@/lib/integrations/rest-transport";
 import { erpTestConnection } from "@/lib/integrations/erp-transport";
 import { login, getPosition, parseScreens, findUserById, recordSecurityEvent } from "@/lib/security/auth-service";
+import {
+  assertPositionVisible,
+  assertUserVisible,
+  isAdmin,
+  visiblePositions,
+  visibleUsers,
+} from "@/lib/security/visibility";
+import {
+  assertGrantsDelegatable,
+  assertScreensDelegatable,
+  callerScreens,
+  narrowCatalog,
+} from "@/lib/security/delegation";
 import { randomBase32Secret, totpUri, totpVerify, encrypt, decrypt, hashPassword, verifyPassword } from "@/lib/security/crypto";
 import { SESSION_COOKIE } from "@/lib/security/auth";
 import { rateLimit, peekRateLimit, clearRateLimit } from "@/lib/security/rate-limit";
@@ -176,6 +188,50 @@ function assertSettings(rc: RequestContext, area: string, action: string): void 
   }
 }
 
+/**
+ * Administrative visibility for the two system entities reachable through the
+ * generic CRUD routes. Everything else is governed by the permission engine
+ * alone; `user` and `position` additionally hide administrators and stay inside
+ * the caller's creation subtree.
+ */
+async function assertAdminRecordVisible(rc: RequestContext, entity: string, id: string): Promise<void> {
+  if (entity === "user") await assertUserVisible(rc, id);
+  else if (entity === "position") await assertPositionVisible(rc, id);
+}
+
+/** Parse a JSON-text array field ("[\"a\",\"b\"]") from an entity payload. */
+function jsonArrayField(value: unknown): string[] | null {
+  if (value === undefined || value === null) return null;
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
+    return Array.isArray(parsed) ? parsed.map(String) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A position write may never carry screens or grants the caller lacks — the
+ * editor already hides them, this is the enforcement behind it.
+ */
+async function assertPositionPayloadDelegatable(rc: RequestContext, body: Record<string, unknown>): Promise<void> {
+  const screens = jsonArrayField(body.screens);
+  if (screens) await assertScreensDelegatable(rc, screens);
+  const permissions = jsonArrayField(body.permissions);
+  if (permissions) assertGrantsDelegatable(rc, permissions);
+}
+
+/**
+ * A mobile visibility rule may only mention screens the caller can open, and
+ * may only target a position/user inside their own subtree.
+ */
+async function assertMobileConfigDelegatable(rc: RequestContext, body: Record<string, unknown>): Promise<void> {
+  const screens = jsonArrayField(body.screens);
+  if (screens) await assertScreensDelegatable(rc, screens);
+  if (body.positionId) await assertPositionVisible(rc, String(body.positionId));
+  if (body.userId) await assertUserVisible(rc, String(body.userId));
+}
+
 /** Best-effort client IP for the security activity log. */
 function clientIp(req: Request): string | null {
   const fwd = req.headers["x-forwarded-for"];
@@ -188,10 +244,9 @@ export function buildApiRouter(): Router {
 
   // ---- auth -------------------------------------------------------------
   // Credential login (email + password). Sets an httpOnly session cookie.
-  // Dev-only fallback: `{ actor }` mints a persona token when AULA_DEV_AUTH.
   r.post("/auth/login", async (req: Request, res: Response) => {
     try {
-      const body = (req.body ?? {}) as { email?: string; password?: string; code?: string; actor?: string };
+      const body = (req.body ?? {}) as { email?: string; password?: string; code?: string };
       // Throttle brute-force: cap attempts per source IP (per minute) and lock an
       // email after repeated failures (15-min window). Cleared on a successful login.
       const ip = clientIp(req) ?? "unknown";
@@ -238,17 +293,6 @@ export function buildApiRouter(): Router {
         res.json({ user: outcome.result.user, position: outcome.result.position, screens: outcome.result.screens });
         return;
       }
-      if (env.AULA_DEV_AUTH && body.actor) {
-        const issued = issuePersonaToken(body.actor);
-        if (!issued) {
-          res.status(400).json({ error: { code: "BAD_REQUEST", message: `unknown actor "${body.actor}"` } });
-          return;
-        }
-        res.cookie(SESSION_COOKIE, issued.token, sessionCookieOpts(issued.expiresIn));
-        setApiHeaders(res);
-        res.json(issued);
-        return;
-      }
       res.status(400).json({ error: { code: "BAD_REQUEST", message: "email and password are required" } });
     } catch (error) {
       const appError = toAppError(error);
@@ -257,10 +301,9 @@ export function buildApiRouter(): Router {
     }
   });
 
-  // Clear the session (and any dev persona cookie).
+  // Clear the session.
   r.post("/auth/logout", (_req: Request, res: Response) => {
     res.clearCookie(SESSION_COOKIE, { path: "/" });
-    res.clearCookie("aula_actor", { path: "/" });
     setApiHeaders(res);
     res.json({ ok: true });
   });
@@ -270,7 +313,7 @@ export function buildApiRouter(): Router {
       rc.positionId ? getPosition(rc.positionId) : Promise.resolve(null),
       findUserById(rc.userId),
     ]);
-    // Dev personas / bearer tokens without a position can see every screen.
+    // A principal whose user row carries no position (service tokens) sees every screen.
     const screens = position ? parseScreens(position) : screenCatalog(metadata).map((s) => s.key);
     let notificationPrefs: unknown = null;
     try {
@@ -301,6 +344,8 @@ export function buildApiRouter(): Router {
       featureFlags: rc.featureFlags,
       positionId: rc.positionId ?? null,
       position: position ? { id: position.id, name: String(position.name), role: String(position.role) } : null,
+      // The company this user belongs to (shown on the Settings → Account card).
+      companyId: (userRec?.companyId as string | null) ?? null,
       screens,
       // Screens the companion mobile app may show (a subset of `screens`), plus a
       // version stamp the app polls to pick up admin changes without a full reload.
@@ -533,7 +578,9 @@ export function buildApiRouter(): Router {
   // Toggleable screen catalog (full web catalog, flagged with mobile support).
   r.get("/mobile/screens", runApi(async (rc) => {
     assertSettings(rc, "settings.mobile", "read");
-    return { screens: mobileScreenCatalog() };
+    // Only the screens the caller can open themselves are configurable.
+    const own = await callerScreens(rc);
+    return { screens: mobileScreenCatalog().filter((s) => own.has(s.key)) };
   }));
 
   // Admin CRUD over the raw config rows. `screens`/`hiddenFields` are persisted
@@ -571,6 +618,7 @@ export function buildApiRouter(): Router {
       async (rc, req) => {
         assertSettings(rc, "settings.mobile", "create");
         const body = readJson(req) as Record<string, unknown>;
+        await assertMobileConfigDelegatable(rc, body);
         const domain = await getDomainService();
         const created = await domain.create(systemContext(rc.tenantId, rc.orgId), "mobileScreenConfig", {
           clientId: String(body.clientId ?? "*") || "*",
@@ -592,6 +640,7 @@ export function buildApiRouter(): Router {
       async (rc, req) => {
         assertSettings(rc, "settings.mobile", "update");
         const body = readJson(req) as Record<string, unknown>;
+        await assertMobileConfigDelegatable(rc, body);
         const patch: Record<string, unknown> = {};
         if (body.clientId !== undefined) patch.clientId = String(body.clientId) || "*";
         if (body.positionId !== undefined) patch.positionId = body.positionId ? String(body.positionId) : null;
@@ -646,8 +695,17 @@ export function buildApiRouter(): Router {
       grants: roleGrants(role),
     }));
     // The Settings screen, area by area — the fine-grained layer on top of the
-    // coarse `settings` screen key.
-    return { entities, special, roles, settings: SETTINGS_AREAS };
+    // coarse `settings` screen key. Narrowed to what this caller may delegate:
+    // nobody hands out a privilege they don't hold themselves.
+    return narrowCatalog(rc, { entities, special, roles, settings: SETTINGS_AREAS });
+  }));
+
+  // The screens a caller may grant to a position — their own screen access
+  // (everything, for an administrator). Drives both the position editor and the
+  // mobile-visibility screens so neither can offer more than the caller has.
+  r.get("/screens/grantable", runApi(async (rc) => {
+    const own = await callerScreens(rc);
+    return { screens: screenCatalog(metadata).filter((s) => own.has(s.key)) };
   }));
 
   // ---- user administration ----------------------------------------------
@@ -658,7 +716,9 @@ export function buildApiRouter(): Router {
     assertSettings(rc, "settings.users", "read");
     const domain = await getDomainService();
     const page = await domain.list(rc, "user", { pageSize: 500, sort: [{ field: "displayName", dir: "asc" }] });
-    return { users: page.items.map(stripHash) };
+    // Non-admins see only their own creation subtree, never an administrator.
+    const visible = await visibleUsers(rc, page.items);
+    return { users: visible.map(stripHash) };
   }));
 
   r.post(
@@ -668,11 +728,15 @@ export function buildApiRouter(): Router {
         assertSettings(rc, "settings.users", "create");
         const body = readJson(req) as {
           email?: string; displayName?: string; password?: string; positionId?: string; active?: boolean;
-          managerId?: string | null; phone?: string | null; jobTitle?: string | null;
+          managerId?: string | null; phone?: string | null; jobTitle?: string | null; companyId?: string | null;
         };
         if (!body.email || !body.password || !body.positionId) {
           throw new BadRequestError("email, password and positionId are required");
         }
+        // A creator may only hand out a position they can see themselves, and
+        // only assign a manager from their own subtree.
+        await assertPositionVisible(rc, body.positionId);
+        if (body.managerId) await assertUserVisible(rc, String(body.managerId));
         assertPasswordStrength(body.password);
         const domain = await getDomainService();
         // Go through the domain service (not the raw query engine) so a
@@ -685,6 +749,7 @@ export function buildApiRouter(): Router {
             email: body.email.toLowerCase(),
             displayName: body.displayName || body.email,
             positionId: body.positionId,
+            companyId: body.companyId || null,
             active: body.active ?? true,
             managerId: body.managerId || null,
             phone: body.phone || null,
@@ -705,8 +770,13 @@ export function buildApiRouter(): Router {
         const body = readJson(req) as {
           displayName?: string; positionId?: string; active?: boolean; password?: string;
           email?: string; managerId?: string | null; phone?: string | null; jobTitle?: string | null;
-          resetTwoFactor?: boolean;
+          companyId?: string | null; resetTwoFactor?: boolean;
         };
+        // Administrators are off-limits to everyone else, and a non-admin may
+        // only touch users (and hand out positions) inside their own subtree.
+        await assertUserVisible(rc, req.params.id);
+        if (body.positionId) await assertPositionVisible(rc, body.positionId);
+        if (body.managerId) await assertUserVisible(rc, String(body.managerId));
         // Editing a user, resetting their password, clearing their second factor
         // and enabling/disabling the account are separate privileges.
         const editKeys = ["displayName", "email", "positionId", "managerId", "phone", "jobTitle"] as const;
@@ -723,6 +793,7 @@ export function buildApiRouter(): Router {
         if (body.displayName !== undefined) patch.displayName = body.displayName;
         if (body.email !== undefined) patch.email = String(body.email).toLowerCase();
         if (body.positionId !== undefined) patch.positionId = body.positionId;
+        if (body.companyId !== undefined) patch.companyId = body.companyId || null;
         if (body.active !== undefined) patch.active = body.active;
         if (body.managerId !== undefined) patch.managerId = body.managerId || null;
         if (body.phone !== undefined) patch.phone = body.phone || null;
@@ -754,10 +825,22 @@ export function buildApiRouter(): Router {
   }));
 
   // ---- generic entity CRUD ---------------------------------------------
+  // `user` and `position` carry administrative visibility on top of the
+  // permission matrix (see lib/security/visibility): administrators are hidden
+  // from everyone else, and the rest is scoped to the caller's creation subtree.
   r.get("/entities/:entity", runApi(async (rc, req) => {
     assertKnownEntity(req.params.entity);
     const domain = await getDomainService();
-    return domain.list(rc, req.params.entity, parseListQuery(req, req.params.entity));
+    const page = await domain.list(rc, req.params.entity, parseListQuery(req, req.params.entity));
+    if (req.params.entity === "position") {
+      const items = await visiblePositions(rc, page.items);
+      return { ...page, items, total: items.length };
+    }
+    if (req.params.entity === "user") {
+      const items = await visibleUsers(rc, page.items);
+      return { ...page, items, total: items.length };
+    }
+    return page;
   }));
 
   r.post(
@@ -766,7 +849,16 @@ export function buildApiRouter(): Router {
       async (rc, req) => {
         assertKnownEntity(req.params.entity);
         const domain = await getDomainService();
-        return domain.create(rc, req.params.entity, readJson(req));
+        const body = readJson(req) as Record<string, unknown>;
+        if (req.params.entity === "position") {
+          // Only an administrator may mint an admin-role position, and nobody
+          // may hand out access they don't hold themselves.
+          if (!isAdmin(rc) && String(body.role ?? "") === "admin") {
+            throw new ForbiddenError("only an administrator may create an administrator position");
+          }
+          await assertPositionPayloadDelegatable(rc, body);
+        }
+        return domain.create(rc, req.params.entity, body);
       },
       { mutating: true, status: 201 },
     ),
@@ -774,6 +866,7 @@ export function buildApiRouter(): Router {
 
   r.get("/entities/:entity/:id", runApi(async (rc, req) => {
     assertKnownEntity(req.params.entity);
+    await assertAdminRecordVisible(rc, req.params.entity, req.params.id);
     const domain = await getDomainService();
     return domain.get(rc, req.params.entity, req.params.id);
   }));
@@ -783,8 +876,16 @@ export function buildApiRouter(): Router {
     runApi(
       async (rc, req) => {
         assertKnownEntity(req.params.entity);
+        await assertAdminRecordVisible(rc, req.params.entity, req.params.id);
+        const body = readJson(req) as Record<string, unknown>;
+        if (req.params.entity === "position") {
+          if (!isAdmin(rc) && body.role !== undefined && String(body.role) === "admin") {
+            throw new ForbiddenError("only an administrator may create an administrator position");
+          }
+          await assertPositionPayloadDelegatable(rc, body);
+        }
         const domain = await getDomainService();
-        return domain.update(rc, req.params.entity, req.params.id, readJson(req), parseIfMatch(req));
+        return domain.update(rc, req.params.entity, req.params.id, body, parseIfMatch(req));
       },
       { mutating: true },
     ),
@@ -795,6 +896,7 @@ export function buildApiRouter(): Router {
     runApi(
       async (rc, req) => {
         assertKnownEntity(req.params.entity);
+        await assertAdminRecordVisible(rc, req.params.entity, req.params.id);
         const domain = await getDomainService();
         await domain.remove(rc, req.params.entity, req.params.id, parseIfMatch(req));
         return { deleted: true, id: req.params.id };
@@ -2456,7 +2558,7 @@ export function buildApiRouter(): Router {
     "/admin/metadata/republish",
     runApi(
       async (rc) => {
-        assertSettings(rc, "settings.metadata", "publish");
+        if (!isAdmin(rc)) throw new ForbiddenError("only an administrator may re-publish the data model");
         const published = publishMetadata(rc, metadata.version, "re-published from settings");
         return { version: published.version, publishedAt: published.publishedAt, publishedBy: published.publishedBy };
       },

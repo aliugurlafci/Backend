@@ -36,8 +36,11 @@ export const SYSTEM_SETTINGS: SystemSettingDef[] = [
   { key: "PORT", label: "HTTP port", group: "Server", type: "number", readonly: true, restart: true, envValue: () => String(env.PORT) },
   { key: "CORS_ORIGINS", label: "CORS origins", group: "Server", type: "text", restart: true, help: "Comma-separated allowed origins", envValue: () => env.CORS_ORIGINS },
 
+  // ---- tenant identity (bootstrap — read-only) ----
+  { key: "AULA_TENANT_ID", label: "Tenant id", group: "Server", type: "text", readonly: true, restart: true, help: "Scope stamped on every record", envValue: () => env.AULA_TENANT_ID },
+  { key: "AULA_ORG_ID", label: "Organization id", group: "Server", type: "text", readonly: true, restart: true, help: "Scope stamped on every record", envValue: () => env.AULA_ORG_ID },
+
   // ---- security ----
-  { key: "AULA_DEV_AUTH", label: "Dev persona auth", group: "Security", type: "boolean", restart: true, help: "Allow x-actor/aula_actor login (dev only)", envValue: () => b(env.AULA_DEV_AUTH) },
   { key: "AULA_JWT_TTL", label: "Session lifetime (sec)", group: "Security", type: "number", envValue: () => String(env.AULA_JWT_TTL) },
   { key: "AULA_JWT_SECRET", label: "JWT secret", group: "Security", type: "password", secret: true, readonly: true, help: "Bootstrap secret — set in env", envValue: () => env.AULA_JWT_SECRET ?? "" },
   { key: "AULA_ENCRYPTION_KEY", label: "Encryption key", group: "Security", type: "password", secret: true, readonly: true, help: "Bootstrap secret — set in env", envValue: () => env.AULA_ENCRYPTION_KEY ?? "" },
@@ -64,7 +67,7 @@ export const SYSTEM_SETTINGS: SystemSettingDef[] = [
 
   // ---- bootstrap ----
   { key: "AULA_AUTO_MIGRATE", label: "Auto-migrate on boot", group: "Bootstrap", type: "boolean", restart: true, envValue: () => b(env.AULA_AUTO_MIGRATE) },
-  { key: "AULA_AUTO_SEED", label: "Auto-seed on boot", group: "Bootstrap", type: "boolean", restart: true, envValue: () => b(env.AULA_AUTO_SEED) },
+  { key: "AULA_ADMIN_EMAIL", label: "Bootstrap admin e-mail", group: "Bootstrap", type: "text", readonly: true, restart: true, help: "Created only when no administrator exists yet", envValue: () => env.AULA_ADMIN_EMAIL },
 ];
 
 export function getSystemSettingDef(key: string): SystemSettingDef | undefined {
