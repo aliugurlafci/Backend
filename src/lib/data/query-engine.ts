@@ -39,6 +39,37 @@ export interface UpdateOptions {
   allowLifecycleField?: boolean;
 }
 
+/** Which of an entity's fields may be filtered, sorted and searched on. */
+interface QueryShape {
+  fieldNames: Set<string>;
+  filterable: Set<string>;
+  sortable: Set<string>;
+  searchFields: string[];
+}
+
+/**
+ * Per-entity query shape, derived once instead of on every list call.
+ *
+ * The sets come purely from the entity's field flags, so they are stable for the
+ * lifetime of a metadata version. Keyed on the definition *object*, which a new
+ * version replaces — so a republish naturally yields a fresh entry and the old
+ * one is collected with the old definition.
+ */
+const queryShapes = new WeakMap<EntityDef, QueryShape>();
+
+function queryShape(entity: EntityDef): QueryShape {
+  const cached = queryShapes.get(entity);
+  if (cached) return cached;
+  const shape: QueryShape = {
+    fieldNames: new Set(entity.fields.map((f) => f.name)),
+    filterable: new Set(entity.fields.filter((f) => f.filterable).map((f) => f.name)),
+    sortable: new Set(entity.fields.filter((f) => f.sortable).map((f) => f.name)),
+    searchFields: entity.fields.filter((f) => f.searchable).map((f) => f.name),
+  };
+  queryShapes.set(entity, shape);
+  return shape;
+}
+
 export class QueryEngine {
   constructor(
     private readonly repo: Repository,
@@ -369,10 +400,7 @@ export class QueryEngine {
   // ---- helpers -----------------------------------------------------------
 
   private toRepoQuery(entity: EntityDef, query: Query): RepoQuery {
-    const fieldNames = new Set(entity.fields.map((f) => f.name));
-    const filterable = new Set(entity.fields.filter((f) => f.filterable).map((f) => f.name));
-    const sortable = new Set(entity.fields.filter((f) => f.sortable).map((f) => f.name));
-    const searchFields = entity.fields.filter((f) => f.searchable).map((f) => f.name);
+    const { fieldNames, filterable, sortable, searchFields } = queryShape(entity);
     const { page, pageSize } = normalizePaging(query);
 
     return {
@@ -420,13 +448,17 @@ export class QueryEngine {
     }
   }
 
-  /** Drop fields the caller may not read (field-level enforcement). */
+  /**
+   * Drop fields the caller may not read (field-level enforcement).
+   *
+   * Which fields those are is identical for every record of a page, so ask for
+   * the denied list (cached per identity + entity) and delete only those —
+   * instead of re-deciding all fields, per record.
+   */
   private project(ctx: RequestContext, entity: EntityDef, record: EntityRecord): EntityRecord {
-    const readable = new Set(this.permissions.readableFields(ctx, entity));
+    const denied = this.permissions.deniedFields(ctx, entity);
     const out = { ...record };
-    for (const field of entity.fields) {
-      if (!readable.has(field.name)) delete out[field.name];
-    }
+    for (const field of denied) delete out[field];
     return out;
   }
 }

@@ -69,16 +69,19 @@ export class FinanceService {
     private readonly seq: NumberSequence,
   ) {}
 
-  /** Create a header document with an assigned number and zeroed totals. */
+  /** Create a header document with an assigned number and zeroed totals. Extra
+   *  server-derived values (e.g. a cart's denormalized creator name) may be
+   *  supplied — they are written alongside the standard computed fields. */
   async createDocument(
     ctx: RequestContext,
     entity: string,
     prefix: string,
     header: Record<string, unknown>,
+    extraComputed: Record<string, FieldValue> = {},
   ): Promise<EntityRecord> {
     const number = await this.seq.next(ctx.tenantId, prefix);
     const def = this.metadata.getEntity(entity);
-    const computed: Record<string, FieldValue> = { number, subtotal: 0, taxTotal: 0, total: 0 };
+    const computed: Record<string, FieldValue> = { number, subtotal: 0, taxTotal: 0, total: 0, ...extraComputed };
     if (def.fields.some((f) => f.name === "amountPaid")) computed.amountPaid = 0;
     if (def.fields.some((f) => f.name === "balance")) computed.balance = 0;
     return this.qe.createWithComputed(ctx, entity, header, computed);
@@ -112,7 +115,17 @@ export class FinanceService {
       filters: [{ field: parentField, op: "eq", value: docId }],
       pageSize: 200,
     });
-    for (const l of existing.items) await this.qe.remove(ctx, lineEntity, l.id);
+    // One round-trip for the whole set instead of a read + delete per line: line
+    // entities are never owner-scoped, so the bulk delete's `<entity>:delete`
+    // check is the same gate the per-record path applied (record-level ABAC only
+    // engages for an `ownerId`, which lines never carry).
+    if (existing.items.length) {
+      await this.qe.removeMany(
+        ctx,
+        lineEntity,
+        existing.items.map((l) => String(l.id)),
+      );
+    }
 
     for (const line of lines) {
       const { lineTotal } = lineTotals({ qty: line.qty, unitPrice: line.unitPrice, taxRate: line.taxRate });

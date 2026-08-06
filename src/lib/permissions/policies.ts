@@ -80,7 +80,16 @@ const BASE_ROLES: Record<string, RoleDef> = {
       "salesOrder:read",
       "salesOrder:create",
       "salesOrder:update",
-      "cart:*",
+      // Carts: a rep builds baskets, hands them to the cash desk or rings them
+      // up, and can void their own — but does not extend credit (`cart:credit`)
+      // or manage the register queue's suspensions.
+      "cart:read",
+      "cart:create",
+      "cart:update",
+      "cart:delete",
+      "cart:send",
+      "cart:checkout",
+      "cart:cancel",
       "cartLine:*",
       "salesReturn:read",
       "salesReturn:create",
@@ -123,6 +132,15 @@ const BASE_ROLES: Record<string, RoleDef> = {
       "payment:*",
       "recurringPlan:*",
       "salesOrder:read",
+      // Cash-desk side of the cart: works the register queue (take payment, close
+      // to account, suspend, reject) but does not build or send baskets.
+      "cart:read",
+      "cart:update",
+      "cart:checkout",
+      "cart:credit",
+      "cart:suspend",
+      "cart:cancel",
+      "cartLine:*",
       "salesReturn:read",
       "salesReturnLine:read",
       "branch:read",
@@ -200,6 +218,19 @@ export const ROLES: Record<string, RoleDef> = Object.fromEntries(
 
 /** Verbs that mutate a record and therefore trigger record-level ABAC. */
 export const MUTATING_VERBS = new Set(["update", "delete", "win", "lose", "convert"]);
+
+/**
+ * System entities that still belong in the permission matrix.
+ *
+ * `system: true` normally means "internal, never granted directly" (line items,
+ * users, audit rows) and those entities are kept out of the matrix. A cart is
+ * different: it is flagged system only because it has a bespoke screen instead of
+ * the generic entity browser, while its operations are exactly what an admin needs
+ * to hand out — `cart:send` enables "send to register" on mobile, `cart:checkout`
+ * enables ringing the basket up, and `cart:credit` / `cart:suspend` / `cart:cancel`
+ * are the cash desk's own actions.
+ */
+export const GRANTABLE_SYSTEM_ENTITIES = new Set(["cart"]);
 
 /** The default grant list for a single role (used to pre-fill the permission matrix). */
 export function roleGrants(role: string): string[] {

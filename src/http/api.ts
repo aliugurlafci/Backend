@@ -25,9 +25,10 @@ import { getAccountingService, type JournalLineInput } from "@/lib/accounting/se
 import { getPayablesService } from "@/lib/payables/service";
 import { getInventoryService } from "@/lib/inventory/service";
 import { getPosService, type PosCheckoutInput } from "@/lib/pos/service";
+import { getCartService } from "@/lib/cart/service";
 import { postStockTransfer, postStockAdjustment } from "@/lib/accounting/postings";
 import { permissionEngine } from "@/lib/permissions/engine";
-import { grantsFor, roleGrants } from "@/lib/permissions/policies";
+import { grantsFor, roleGrants, GRANTABLE_SYSTEM_ENTITIES } from "@/lib/permissions/policies";
 import { metadata } from "@/lib/metadata";
 import { search } from "@/lib/search/service";
 import { cache } from "@/lib/cache/cache";
@@ -677,7 +678,7 @@ export function buildApiRouter(): Router {
     const CRUD = ["read", "create", "update", "delete"];
     const entities = metadata
       .listEntities()
-      .filter((e) => !e.system)
+      .filter((e) => !e.system || GRANTABLE_SYSTEM_ENTITIES.has(e.name))
       .map((e) => {
         // Operations = CRUD + the entity's own lifecycle actions (post/approve/win…).
         const extra = new Set<string>();
@@ -1672,22 +1673,37 @@ export function buildApiRouter(): Router {
   );
 
   // ---- sales cart (Sepet) ----------------------------------------------
-  // A persisted basket (cart + cartLine). Checkout rings it through the POS
-  // pipeline (invoice → send: posts AR/Revenue/COGS + issues stock), so the cart
-  // never duplicates GL/stock logic. Drafts can be saved and resumed.
-  r.get("/carts", runApi(async (rc) => {
-    const domain = await getDomainService();
-    const page = await domain.list(rc, "cart", {
-      filters: [{ field: "status", op: "eq", value: "open" }],
-      sort: [{ field: "createdAt", dir: "desc" }],
-      pageSize: 50,
+  // A persisted basket (cart + cartLine), workable two ways: sent to the cash
+  // desk with a short pickup code (`/send`, then the cashier pays / closes to
+  // account / suspends / cancels it), or rung up on the spot (`/checkout`).
+  // Either ending goes through the POS pipeline (invoice → send: posts
+  // AR/Revenue/COGS + issues stock), so the cart never duplicates GL/stock logic.
+  // Which of the two a position may use is decided by its `cart:send` /
+  // `cart:checkout` grants in Settings → Permissions.
+  r.get("/carts", runApi(async (rc, req) => {
+    const cartService = await getCartService();
+    const statusParam = typeof req.query.status === "string" ? req.query.status : "";
+    const codeParam = typeof req.query.code === "string" ? req.query.code.trim() : "";
+    const code = codeParam ? Number(codeParam.replace(/\D/g, "")) : null;
+    const items = await cartService.list(rc, {
+      statuses: statusParam
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      code: code && Number.isFinite(code) && code > 0 ? code : null,
+      mine: req.query.mine === "1" || req.query.mine === "true",
+      search: typeof req.query.q === "string" ? req.query.q : null,
     });
-    return { items: page.items };
+    // The actions each cart offers this caller, so a client renders only buttons
+    // the server will actually honour.
+    return { items, actions: Object.fromEntries(items.map((c) => [String(c.id), cartService.actionsFor(rc, c)])) };
   }));
 
   r.get("/carts/:id", runApi(async (rc, req) => {
     const fin = await getFinanceService();
-    return fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
+    const cartService = await getCartService();
+    const doc = await fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
+    return { ...doc, actions: cartService.actionsFor(rc, doc.doc) };
   }));
 
   r.post(
@@ -1703,14 +1719,22 @@ export function buildApiRouter(): Router {
           notes?: string | null;
           lines?: LineInput[];
         };
-        const doc = await fin.createDocument(rc, "cart", "CART", {
-          accountId: body.accountId ?? null,
-          branchId: body.branchId ?? null,
-          warehouseId: body.warehouseId ?? null,
-          currencyCode: body.currencyCode ?? "USD",
-          status: "open",
-          notes: body.notes ?? null,
-        });
+        const doc = await fin.createDocument(
+          rc,
+          "cart",
+          "CART",
+          {
+            accountId: body.accountId ?? null,
+            branchId: body.branchId ?? null,
+            warehouseId: body.warehouseId ?? null,
+            currencyCode: body.currencyCode ?? "USD",
+            status: "open",
+            notes: body.notes ?? null,
+          },
+          // Denormalized so the cashier sees who built the basket without needing
+          // permission to read user records.
+          { createdByName: rc.displayName },
+        );
         if (body.lines?.length) await fin.replaceLines(rc, "cart", "cartLine", "cartId", doc.id, body.lines);
         return fin.getDocument(rc, "cart", "cartLine", "cartId", doc.id);
       },
@@ -1722,9 +1746,9 @@ export function buildApiRouter(): Router {
     "/carts/:id",
     runApi(
       async (rc, req) => {
-        const fin = await getFinanceService();
+        const cartService = await getCartService();
         const body = readJson(req) as { header?: Record<string, unknown>; lines?: LineInput[] };
-        return fin.saveDocument(rc, "cart", "cartLine", "cartId", req.params.id, body.header, body.lines ?? []);
+        return cartService.save(rc, req.params.id, body.header, body.lines ?? []);
       },
       { mutating: true },
     ),
@@ -1745,37 +1769,78 @@ export function buildApiRouter(): Router {
     ),
   );
 
+  // Hand the basket to the cash desk — assigns the pickup code the cashier
+  // searches by (`cart:send`).
+  r.post(
+    "/carts/:id/send",
+    runApi(
+      async (rc, req) => {
+        const cartService = await getCartService();
+        const cart = await cartService.send(rc, req.params.id);
+        return { cart, code: Number(cart.code ?? 0) };
+      },
+      { mutating: true, status: 201 },
+    ),
+  );
+
+  // Park a queued cart / put it back in the queue (`cart:suspend`).
+  r.post(
+    "/carts/:id/suspend",
+    runApi(
+      async (rc, req) => {
+        const cartService = await getCartService();
+        return { cart: await cartService.suspend(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  r.post(
+    "/carts/:id/resume",
+    runApi(
+      async (rc, req) => {
+        const cartService = await getCartService();
+        return { cart: await cartService.resume(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Reject a cart at the register / void a draft (`cart:cancel`).
+  r.post(
+    "/carts/:id/cancel",
+    runApi(
+      async (rc, req) => {
+        const cartService = await getCartService();
+        return { cart: await cartService.cancel(rc, req.params.id) };
+      },
+      { mutating: true },
+    ),
+  );
+
+  // Close the cart: `paid` tenders at the register (`cart:checkout`), `credit`
+  // invoices it and leaves the balance on the customer's account (`cart:credit`).
   r.post(
     "/carts/:id/checkout",
     runApi(
       async (rc, req) => {
-        if (!permissionEngine.can(rc, { entity: "pos", action: "pos:checkout" })) {
-          throw new ForbiddenError("not allowed to check out sales");
-        }
-        const fin = await getFinanceService();
-        const pos = await getPosService();
-        const domain = await getDomainService();
-        const body = readJson(req) as { payments?: { method: string; amount: number }[] };
-        const { doc: cart, lines } = await fin.getDocument(rc, "cart", "cartLine", "cartId", req.params.id);
-        if (cart.status === "converted") throw new BadRequestError("cart already checked out");
-        if (!lines.length) throw new BadRequestError("cart is empty");
-        const result = await pos.checkout(rc, {
-          idempotencyKey: req.get("Idempotency-Key") || `cart:${req.params.id}`,
-          branchId: (cart.branchId as string) ?? null,
-          warehouseId: (cart.warehouseId as string) ?? null,
-          accountId: (cart.accountId as string) ?? null,
-          currencyCode: String(cart.currencyCode ?? "USD"),
-          lines: lines.map((l) => ({
-            productId: (l.productId as string) ?? null,
-            description: String(l.description ?? ""),
-            qty: Number(l.qty ?? 0),
-            unitPrice: Number(l.unitPrice ?? 0),
-            taxRate: Number(l.taxRate ?? 0),
-          })),
+        const cartService = await getCartService();
+        const body = readJson(req) as {
+          payments?: { method: string; amount: number }[];
+          settlement?: "paid" | "credit";
+        };
+        const result = await cartService.close(rc, req.params.id, {
+          settlement: body.settlement === "credit" ? "credit" : "paid",
           payments: body.payments ?? [],
+          idempotencyKey: req.get("Idempotency-Key") || null,
         });
-        await domain.update(rc, "cart", req.params.id, { status: "converted", convertedInvoiceId: result.invoice.id });
-        return { invoice: result.invoice, total: result.total, change: result.change };
+        return {
+          invoice: result.invoice,
+          cart: result.cart,
+          total: result.total,
+          paid: result.paid,
+          change: result.change,
+        };
       },
       { mutating: true, status: 201 },
     ),
