@@ -35,10 +35,25 @@ export interface AutomationCatalog {
   assignmentStrategies: { value: string; label: string; description: string }[];
 }
 
+/**
+ * System entities that are nonetheless automatable.
+ *
+ * `system: true` means "no auto-generated CRUD screen", which is not the same as
+ * "not worth reacting to" — and the catalog was treating them as one. These are
+ * exactly the records the business wants a rule on: an alert exists in order to
+ * be acted upon, and if the builder cannot see the entity there is no way to
+ * write that rule at all.
+ *
+ * An allowlist rather than dropping the `system` filter: most system entities
+ * are plumbing (outbox rows, notification state, schema versions) and putting
+ * them in the trigger dropdown would bury the handful that matter.
+ */
+const AUTOMATABLE_SYSTEM_ENTITIES = new Set(["stockAlert", "operationsAlert"]);
+
 export function buildCatalog(): AutomationCatalog {
   const entities: CatalogEntity[] = metadata
     .listEntities()
-    .filter((e) => !e.system && !e.parent)
+    .filter((e) => (!e.system || AUTOMATABLE_SYSTEM_ENTITIES.has(e.name)) && !e.parent)
     .map((e) => ({
       name: e.name,
       label: e.label,

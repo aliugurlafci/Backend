@@ -10,13 +10,17 @@
  * Delivery honours each recipient's `notificationPrefs` (the Settings →
  * Notifications page): when a user has muted every channel for an event, the
  * in-app notification is suppressed too. We never notify someone of their own
- * action. Storage is in-memory (like audit/webhook/search — Redis/table in prod).
+ * action. Stored in the database, so a restart does not clear everyone's bell.
  */
-import { newId } from "@/lib/core/ids";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { systemContext } from "@/lib/context/resolver";
+import { pushToUser } from "./push-transport";
+import type { RequestContext } from "@/lib/context/types";
 import { getQueryEngine } from "@/lib/data/store";
+import { MAX_PAGE_SIZE } from "@/lib/data/query";
+import type { EntityRecord } from "@/lib/metadata/types";
 import { logger } from "@/lib/observability/logger";
+import { orgText } from "@/lib/i18n/texts";
 
 export type NotificationChannel = "email" | "system";
 
@@ -30,28 +34,6 @@ export interface NotificationView {
   eventType: string;
   read: boolean;
   href?: string;
-}
-
-interface StoredNotification {
-  id: string;
-  at: string;
-  tenantId: string;
-  orgId: string;
-  /** Target user, or null for an org-wide broadcast. */
-  userId: string | null;
-  channel: NotificationChannel;
-  subject: string;
-  body: string;
-  eventType: string;
-  href?: string;
-  /** Notification-preference category — lets the bell hide muted categories. */
-  prefKey?: string;
-  /** Read flag for personal notifications (userId != null). */
-  read: boolean;
-  /** Per-user read state for broadcasts (userId == null). */
-  readBy: Set<string>;
-  /** Per-user dismiss state for broadcasts (userId == null). */
-  dismissedBy: Set<string>;
 }
 
 export interface AddNotificationInput {
@@ -72,103 +54,223 @@ export interface AddNotificationInput {
 /** A sync predicate telling whether a notification category is muted for the viewer. */
 export type MuteFilter = (prefKey?: string) => boolean;
 
+const NOTIFICATION = "notification";
+const STATE = "notificationState";
+
+const sysCtx = (tenantId: string, orgId: string) => systemContext(tenantId, orgId);
+const stateKeyOf = (notificationId: string, userId: string) => `${notificationId}:${userId}`;
+
+/**
+ * Database-backed notification inbox.
+ *
+ * Rows, not process state: the previous version kept the last 500 in an array
+ * and lost them on every restart — including, notably, the alerts about whatever
+ * had just gone wrong.
+ *
+ * Read/dismiss state lives in a companion table keyed by (notification, user),
+ * because a broadcast has a different answer per viewer. A missing row means
+ * unread and undismissed, so the common case costs no writes.
+ */
 export class NotificationService {
-  private items: StoredNotification[] = [];
-
-  add(input: AddNotificationInput): void {
-    const n: StoredNotification = {
-      id: newId("ntf"),
-      userId: input.userId ?? null,
-      read: false,
-      readBy: new Set<string>(),
-      dismissedBy: new Set<string>(),
-      at: input.at,
-      tenantId: input.tenantId,
-      orgId: input.orgId,
-      channel: input.channel,
-      subject: input.subject,
-      body: input.body,
-      eventType: input.eventType,
-      href: input.href,
-      prefKey: input.prefKey,
-    };
-    this.items.unshift(n);
-    if (this.items.length > 500) this.items.length = 500;
-    logger.info("notification", { channel: n.channel, subject: n.subject, tenantId: n.tenantId, userId: n.userId ?? "*" });
-  }
-
-  /**
-   * Is this notification visible to `userId`? It must be their personal one (or a
-   * broadcast they haven't dismissed) AND its category must not be muted for them.
-   */
-  private visibleTo(n: StoredNotification, userId: string, isMuted?: MuteFilter): boolean {
-    if (isMuted && isMuted(n.prefKey)) return false;
-    if (n.userId === null) return !n.dismissedBy.has(userId);
-    return n.userId === userId;
-  }
-
-  private isReadFor(n: StoredNotification, userId: string): boolean {
-    return n.userId === null ? n.readBy.has(userId) : n.read;
-  }
-
-  private view(n: StoredNotification, userId: string): NotificationView {
-    return {
-      id: n.id,
-      at: n.at,
-      channel: n.channel,
-      subject: n.subject,
-      body: n.body,
-      eventType: n.eventType,
-      href: n.href,
-      read: this.isReadFor(n, userId),
-    };
-  }
-
-  list(tenantId: string, orgId: string, userId: string, isMuted?: MuteFilter, limit = 30): NotificationView[] {
-    return this.items
-      .filter((n) => n.tenantId === tenantId && n.orgId === orgId && this.visibleTo(n, userId, isMuted))
-      .slice(0, limit)
-      .map((n) => this.view(n, userId));
-  }
-
-  unreadCount(tenantId: string, orgId: string, userId: string, isMuted?: MuteFilter): number {
-    return this.items.filter(
-      (n) => n.tenantId === tenantId && n.orgId === orgId && this.visibleTo(n, userId, isMuted) && !this.isReadFor(n, userId),
-    ).length;
-  }
-
-  markAllRead(tenantId: string, orgId: string, userId: string): void {
-    for (const n of this.items) {
-      if (n.tenantId !== tenantId || n.orgId !== orgId || !this.visibleTo(n, userId)) continue;
-      if (n.userId === null) n.readBy.add(userId);
-      else n.read = true;
+  async add(input: AddNotificationInput): Promise<void> {
+    try {
+      const qe = await getQueryEngine();
+      await qe.create(sysCtx(input.tenantId, input.orgId), NOTIFICATION, {
+        at: input.at,
+        userId: input.userId ?? null,
+        channel: input.channel,
+        subject: input.subject,
+        body: input.body,
+        eventType: input.eventType,
+        href: input.href ?? null,
+        prefKey: input.prefKey ?? null,
+      });
+      logger.info("notification", {
+        channel: input.channel,
+        subject: input.subject,
+        tenantId: input.tenantId,
+        userId: input.userId ?? "*",
+      });
+    } catch (error) {
+      // A notification is a courtesy on top of an operation that already
+      // succeeded; failing to store one must not fail the operation.
+      logger.warn("notification not stored", {
+        subject: input.subject,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
   /**
-   * Remove the caller's notifications by id. Personal ones are deleted; broadcasts
-   * are dismissed for this user only (kept for everyone else). Returns how many
-   * the caller no longer sees.
+   * Notifications visible to `userId`: their personal ones plus undismissed
+   * broadcasts, minus muted categories.
+   *
+   * Read as one window over the tenant's recent notifications rather than a
+   * per-user query, because a broadcast belongs to everyone — the visibility
+   * rules are applied here, over a bounded page.
    */
-  remove(tenantId: string, orgId: string, userId: string, ids: string[]): number {
-    const idSet = new Set(ids);
+  private async load(
+    tenantId: string,
+    orgId: string,
+    userId: string,
+    isMuted?: MuteFilter,
+    limit = 30,
+  ): Promise<{ row: EntityRecord; read: boolean }[]> {
+    const qe = await getQueryEngine();
+    const ctx = sysCtx(tenantId, orgId);
+    // Over-read a little: broadcasts this user dismissed are filtered out below,
+    // so a straight `limit` could return fewer than asked for.
+    const window = Math.min(limit * 3, MAX_PAGE_SIZE);
+    const page = await qe.list(ctx, NOTIFICATION, {
+      sort: [{ field: "at", dir: "desc" }],
+      pageSize: window,
+    });
+    const candidates = page.items.filter((n) => {
+      if (isMuted && isMuted(n.prefKey ? String(n.prefKey) : undefined)) return false;
+      const target = n.userId ? String(n.userId) : null;
+      return target === null || target === userId;
+    });
+    if (candidates.length === 0) return [];
+
+    const states = await qe.listComplete(ctx, STATE, {
+      filters: [
+        { field: "userId", op: "eq", value: userId },
+        { field: "notificationId", op: "in", value: candidates.map((n) => String(n.id)) },
+      ],
+    });
+    const byNotification = new Map(states.map((s) => [String(s.notificationId), s]));
+
+    const out: { row: EntityRecord; read: boolean }[] = [];
+    for (const row of candidates) {
+      const state = byNotification.get(String(row.id));
+      if (state?.dismissed) continue;
+      out.push({ row, read: Boolean(state?.read) });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  async list(
+    tenantId: string,
+    orgId: string,
+    userId: string,
+    isMuted?: MuteFilter,
+    limit = 30,
+  ): Promise<NotificationView[]> {
+    const rows = await this.load(tenantId, orgId, userId, isMuted, limit);
+    return rows.map(({ row, read }) => ({
+      id: String(row.id),
+      at: String(row.at),
+      channel: String(row.channel) as NotificationChannel,
+      subject: String(row.subject ?? ""),
+      body: String(row.body ?? ""),
+      eventType: String(row.eventType ?? ""),
+      href: row.href ? String(row.href) : undefined,
+      read,
+    }));
+  }
+
+  async unreadCount(tenantId: string, orgId: string, userId: string, isMuted?: MuteFilter): Promise<number> {
+    const rows = await this.load(tenantId, orgId, userId, isMuted, MAX_PAGE_SIZE);
+    return rows.filter((r) => !r.read).length;
+  }
+
+  async markAllRead(tenantId: string, orgId: string, userId: string): Promise<void> {
+    const rows = await this.load(tenantId, orgId, userId, undefined, MAX_PAGE_SIZE);
+    for (const { row, read } of rows) {
+      if (read) continue;
+      await this.setState(tenantId, orgId, String(row.id), userId, { read: true });
+    }
+  }
+
+  /**
+   * Hide notifications by id for this user.
+   *
+   * A personal notification is deleted outright; a broadcast is marked dismissed
+   * for this user only, since everyone else still has it in their bell.
+   */
+  async remove(tenantId: string, orgId: string, userId: string, ids: string[]): Promise<number> {
+    const qe = await getQueryEngine();
+    const ctx = sysCtx(tenantId, orgId);
     let affected = 0;
-    const keep: StoredNotification[] = [];
-    for (const n of this.items) {
-      const mine = n.tenantId === tenantId && n.orgId === orgId && idSet.has(n.id) && this.visibleTo(n, userId);
-      if (!mine) {
-        keep.push(n);
-        continue;
+    for (const id of ids) {
+      const row = await qe.get(ctx, NOTIFICATION, id).catch(() => null);
+      if (!row) continue;
+      const target = row.userId ? String(row.userId) : null;
+      if (target !== null && target !== userId) continue; // not theirs to clear
+      if (target === null) {
+        await this.setState(tenantId, orgId, id, userId, { dismissed: true });
+      } else {
+        await this.clearStates(ctx, id);
+        await qe.remove(ctx, NOTIFICATION, id);
       }
       affected++;
-      if (n.userId === null) {
-        n.dismissedBy.add(userId); // broadcast: hide for this user only
-        keep.push(n);
-      }
-      // personal: drop it entirely (not pushed to `keep`)
     }
-    this.items = keep;
     return affected;
+  }
+
+  /** Upsert this user's state for one notification. */
+  private async setState(
+    tenantId: string,
+    orgId: string,
+    notificationId: string,
+    userId: string,
+    patch: { read?: boolean; dismissed?: boolean },
+  ): Promise<void> {
+    const qe = await getQueryEngine();
+    const ctx = sysCtx(tenantId, orgId);
+    const stateKey = stateKeyOf(notificationId, userId);
+    const existing = await qe.list(ctx, STATE, {
+      filters: [{ field: "stateKey", op: "eq", value: stateKey }],
+      pageSize: 1,
+    });
+    const current = existing.items[0];
+    if (current) {
+      await qe.patchComputed(ctx, STATE, current.id, patch);
+      return;
+    }
+    await qe.createWithComputed(
+      ctx,
+      STATE,
+      {
+        notificationId,
+        userId,
+        read: patch.read ?? false,
+        dismissed: patch.dismissed ?? false,
+      },
+      { stateKey },
+    );
+  }
+
+  /** Drop the per-user state rows for a notification about to be deleted. */
+  private async clearStates(ctx: RequestContext, notificationId: string): Promise<void> {
+    const qe = await getQueryEngine();
+    const states = await qe.listComplete(ctx, STATE, {
+      filters: [{ field: "notificationId", op: "eq", value: notificationId }],
+    });
+    if (states.length) await qe.removeMany(ctx, STATE, states.map((s) => String(s.id)));
+  }
+
+  /**
+   * Delete notifications older than `days`, with their state rows.
+   *
+   * Nothing reads a month-old bell entry, and the table grows with every event
+   * delivered to every user. Called by the retention job.
+   */
+  async prune(tenantId: string, orgId: string, days = 30): Promise<number> {
+    const qe = await getQueryEngine();
+    const ctx = sysCtx(tenantId, orgId);
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    let removed = 0;
+    for (;;) {
+      const page = await qe.list(ctx, NOTIFICATION, {
+        filters: [{ field: "at", op: "lt", value: cutoff }],
+        pageSize: MAX_PAGE_SIZE,
+      });
+      if (page.items.length === 0) return removed;
+      for (const row of page.items) await this.clearStates(ctx, String(row.id));
+      removed += await qe.removeMany(ctx, NOTIFICATION, page.items.map((r) => String(r.id)));
+    }
   }
 }
 
@@ -296,7 +398,7 @@ export interface NotifyUserInput {
 export async function notifyUser(opts: NotifyUserInput): Promise<void> {
   if (opts.actorId && opts.userId === opts.actorId) return;
   if (opts.prefKey && !(await prefsAllowFor(opts.tenantId, opts.orgId, opts.userId, opts.prefKey, opts.at))) return;
-  notifications.add({
+  await notifications.add({
     tenantId: opts.tenantId,
     orgId: opts.orgId,
     userId: opts.userId,
@@ -308,6 +410,27 @@ export async function notifyUser(opts: NotifyUserInput): Promise<void> {
     href: opts.href,
     prefKey: opts.prefKey,
   });
+
+  // …and reach the phone. The inbox row above requires the app to be open to be
+  // seen, which is the one state a notification exists for — "the basket is at
+  // the till" is useless to a cashier who is looking at the till.
+  //
+  // Deliberately not awaited into the caller's failure path: `pushToUser` never
+  // throws, and a push is a convenience over a notification that is already
+  // recorded. Failing the operation that triggered it because a phone was
+  // unreachable would be the wrong trade entirely.
+  void pushToUser(
+    systemContext(opts.tenantId, opts.orgId, { userId: opts.userId }),
+    opts.userId,
+    {
+      title: opts.subject,
+      body: opts.body,
+      // Enough for the app to open the right screen from the notification.
+      ...(opts.href || opts.eventType
+        ? { data: { ...(opts.href ? { href: opts.href } : {}), ...(opts.eventType ? { eventType: opts.eventType } : {}) } }
+        : {}),
+    },
+  ).catch(() => {});
 }
 
 interface DeliverOptions {
@@ -341,7 +464,7 @@ async function deliver(opts: DeliverOptions): Promise<void> {
     });
     return;
   }
-  notifications.add({
+  await notifications.add({
     at: event.at,
     tenantId: event.tenantId,
     orgId: event.orgId,
@@ -367,8 +490,8 @@ export function registerNotifications(): void {
       event: e,
       userId: null,
       channel: "email",
-      subject: "Quote sent",
-      body: `Quote ${recordNumber(e)} was emailed to the customer.`,
+      subject: orgText("notif.quoteSent.subject"),
+      body: orgText("notif.quoteSent.body", { number: recordNumber(e) }),
       href: `/quote/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "quote_sent",
     }),
@@ -378,8 +501,8 @@ export function registerNotifications(): void {
       event: e,
       userId: null,
       channel: "email",
-      subject: "Invoice sent",
-      body: `Invoice ${recordNumber(e)} was emailed to the customer.`,
+      subject: orgText("notif.invoiceSent.subject"),
+      body: orgText("notif.invoiceSent.body", { number: recordNumber(e) }),
       href: `/invoice/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "invoice_sent",
     }),
@@ -389,8 +512,8 @@ export function registerNotifications(): void {
       event: e,
       userId: null,
       channel: "system",
-      subject: "Deal won 🎉",
-      body: `A deal was marked won (${String(e.payload.id)}).`,
+      subject: orgText("notif.dealWon.subject"),
+      body: orgText("notif.dealWon.body", { id: String(e.payload.id) }),
       href: `/deal?focus=${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "deal_won",
     }),
@@ -403,8 +526,8 @@ export function registerNotifications(): void {
       event: e,
       userId: e.payload.approverId ? String(e.payload.approverId) : null,
       channel: "system",
-      subject: "Purchase order needs approval",
-      body: `PO ${recordNumber(e)} is waiting for your approval.`,
+      subject: orgText("notif.poSubmitted.subject"),
+      body: orgText("notif.poSubmitted.body", { number: recordNumber(e) }),
       href: `/purchaseOrder/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "po_approval",
     }),
@@ -415,8 +538,8 @@ export function registerNotifications(): void {
       event: e,
       userId: e.payload.ownerId ? String(e.payload.ownerId) : null,
       channel: "system",
-      subject: "Purchase order approved",
-      body: `PO ${recordNumber(e)} was approved and is ready to receive.`,
+      subject: orgText("notif.poApproved.subject"),
+      body: orgText("notif.poApproved.body", { number: recordNumber(e) }),
       href: `/purchaseOrder/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "po_approval",
     }),
@@ -427,10 +550,10 @@ export function registerNotifications(): void {
       event: e,
       userId: e.payload.ownerId ? String(e.payload.ownerId) : null,
       channel: "system",
-      subject: "Purchase order rejected",
+      subject: orgText("notif.poRejected.subject"),
       body: e.payload.reason
-        ? `PO ${recordNumber(e)} was rejected: ${String(e.payload.reason)}`
-        : `PO ${recordNumber(e)} was rejected.`,
+        ? orgText("notif.poRejectedReason.body", { number: recordNumber(e), reason: String(e.payload.reason) })
+        : orgText("notif.poRejected.body", { number: recordNumber(e) }),
       href: `/purchaseOrder/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "po_approval",
     }),
@@ -441,8 +564,10 @@ export function registerNotifications(): void {
       event: e,
       userId: e.payload.poOwnerId ? String(e.payload.poOwnerId) : null,
       channel: "system",
-      subject: "Goods received",
-      body: `Goods receipt ${recordNumber(e)} was posted${e.payload.poNumber ? ` for PO ${String(e.payload.poNumber)}` : ""}.`,
+      subject: orgText("notif.goodsReceived.subject"),
+      body: e.payload.poNumber
+        ? orgText("notif.goodsReceivedForPo.body", { number: recordNumber(e), po: String(e.payload.poNumber) })
+        : orgText("notif.goodsReceived.body", { number: recordNumber(e) }),
       href: `/goodsReceipt/${encodeURIComponent(String(e.payload.id ?? ""))}`,
       prefKey: "goods_received",
     }),

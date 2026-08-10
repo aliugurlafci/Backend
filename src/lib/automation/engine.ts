@@ -9,6 +9,8 @@
  * (no trigger recursion).
  */
 import type { RequestContext } from "@/lib/context/types";
+import { entityWord } from "@aula/contracts/i18n/labels";
+import { orgLocale, orgText } from "@/lib/i18n/texts";
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { metadata } from "@/lib/metadata";
@@ -112,7 +114,11 @@ function interpolate(template: string | undefined, record: Rec): string {
 /** The `{{record.field}}` tokens inside a single template string. */
 function templateTokens(template: string | undefined): string[] {
   if (!template) return [];
-  return [...template.matchAll(/\{\{\s*(?:record\.)?([\w.]+)\s*\}\}/g)].map((m) => m[1]);
+  // The capture group is not optional, so it participates in every match; the
+  // filter is what tells the compiler that, without an assertion.
+  return [...template.matchAll(/\{\{\s*(?:record\.)?([\w.]+)\s*\}\}/g)]
+    .map((m) => m[1])
+    .filter((t): t is string => t !== undefined);
 }
 
 /**
@@ -144,7 +150,10 @@ function referencedFields(rule: AutomationRule): Set<string> {
     }
   };
   const fromTemplate = (s: string | undefined): void => {
-    for (const tok of templateTokens(s)) fields.add(tok.split(".")[0]);
+    for (const tok of templateTokens(s)) {
+      const head = tok.split(".")[0];
+      if (head) fields.add(head);
+    }
   };
   const fromActions = (actions: AutomationAction[]): void => {
     for (const a of actions) {
@@ -324,7 +333,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
             // SMTP is not configured — fall back to an in-app notification so the
             // action still has a visible effect (configure Email under Integrations
             // or set SMTP_* env vars to send real mail).
-            notifications.add({
+            await notifications.add({
               at: ec.ctx.at,
               tenantId: ec.ctx.tenantId,
               orgId: ec.ctx.orgId,
@@ -358,7 +367,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
             // No gateway configured — fall back to an in-app notification so the
             // action still has a visible effect (configure the SMS Gateway under
             // Automation → Integrations to send real texts).
-            notifications.add({
+            await notifications.add({
               at: ec.ctx.at,
               tenantId: ec.ctx.tenantId,
               orgId: ec.ctx.orgId,
@@ -393,7 +402,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
           if (res.ok) {
             step.output = `WhatsApp → ${to} (sent${res.id ? `, ${res.id}` : ""})`;
           } else if (res.notConfigured) {
-            notifications.add({
+            await notifications.add({
               at: ec.ctx.at,
               tenantId: ec.ctx.tenantId,
               orgId: ec.ctx.orgId,
@@ -421,7 +430,7 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
         let extra = "";
         if (!ec.dry) {
           // Always record an in-app notification…
-          notifications.add({
+          await notifications.add({
             at: ec.ctx.at,
             tenantId: ec.ctx.tenantId,
             orgId: ec.ctx.orgId,
@@ -443,13 +452,15 @@ async function executeAction(action: AutomationAction, ec: ExecContext): Promise
         break;
       }
       case "create_task": {
-        const subject = interpolate(action.taskSubject, ec.record) || "Automation follow-up";
+        const subject = interpolate(action.taskSubject, ec.record) || orgText("task.automation.subject");
         if (!ec.dry) {
           const qe = await getQueryEngine();
           const rec = await qe.create(ec.ctx, "task", {
             subject,
             status: "open",
-            notes: `Auto-created by automation${id ? ` for ${ec.entity ?? "record"} ${id}` : ""}.`,
+            notes: id
+              ? orgText("task.automationFor.notes", { entity: entityWord(ec.entity ?? "record", orgLocale()), id })
+              : orgText("task.automation.notes"),
             ...(ec.entity === "deal" && id ? { dealId: id } : {}),
           });
           step.output = `created task ${rec.id}`;
@@ -836,7 +847,7 @@ export async function executeRule(
       input: hydrated,
     });
     if (settings.failureAlerts) {
-      notifications.add({
+      await notifications.add({
         at: ctx.at,
         tenantId: ctx.tenantId,
         orgId: ctx.orgId,
@@ -990,8 +1001,11 @@ export async function runScheduledAutomations(
     runNow.map((rule) => executeRule(rule, ctx, { scheduledAt: ctx.at }, { test: false, trigger: "schedule" })),
   );
   return runNow.map((rule, i) => {
+    // `allSettled` returns one result per input in order, so this pairing holds;
+    // a missing entry would mean that guarantee broke, and "failed" is the
+    // honest thing to report about a run whose outcome we do not have.
     const s = settled[i];
-    const status: RunStatus = s.status === "fulfilled" ? s.value.status : "failed";
+    const status: RunStatus = s?.status === "fulfilled" ? s.value.status : "failed";
     return { ruleId: rule.id, status };
   });
 }

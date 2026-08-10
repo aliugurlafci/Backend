@@ -73,22 +73,22 @@ const activeTx = new AsyncLocalStorage<sql.Transaction>();
 function toMssqlType(type: SqlType): sql.ISqlType {
   switch (type.kind) {
     case "int":
-      return sql.Int() as unknown as sql.ISqlType;
+      return sql.Int();
     case "bigint":
-      return sql.BigInt() as unknown as sql.ISqlType;
+      return sql.BigInt();
     case "float":
-      return sql.Float() as unknown as sql.ISqlType;
+      return sql.Float();
     case "decimal":
-      return sql.Decimal(type.precision, type.scale) as unknown as sql.ISqlType;
+      return sql.Decimal(type.precision, type.scale);
     case "bit":
-      return sql.Bit() as unknown as sql.ISqlType;
+      return sql.Bit();
     case "text":
-      return sql.NVarChar(sql.MAX) as unknown as sql.ISqlType;
+      return sql.NVarChar(sql.MAX);
     case "binary":
-      return sql.VarBinary(sql.MAX) as unknown as sql.ISqlType;
+      return sql.VarBinary(sql.MAX);
     case "string":
     default:
-      return sql.NVarChar(type.kind === "string" ? type.length : 4000) as unknown as sql.ISqlType;
+      return sql.NVarChar(type.kind === "string" ? type.length : 4000);
   }
 }
 
@@ -107,6 +107,12 @@ function isTransientLockError(err: unknown): boolean {
 function isAlreadyExistsError(err: unknown): boolean {
   const n = (err as { number?: number })?.number;
   return n === 2714 || n === 1913 || n === 2705;
+}
+
+/** SQL Server unique violations: 2627 (PK/unique constraint), 2601 (unique index). */
+function isUniqueViolationError(err: unknown): boolean {
+  const n = (err as { number?: number })?.number;
+  return n === 2627 || n === 2601;
 }
 
 export const mssqlDriver: SqlDriver = {
@@ -158,6 +164,10 @@ export const mssqlDriver: SqlDriver = {
 
   async ensureDatabase(): Promise<void> {
     const dbName = env.MSSQL_DATABASE;
+    // The escape on `-` is redundant only because it sits last in the class.
+    // This pattern guards a name that is interpolated into DDL, so it is spelled
+    // defensively on purpose and left exactly as written.
+    // eslint-disable-next-line no-useless-escape
     if (!/^[A-Za-z0-9_][A-Za-z0-9_ \-]*$/.test(dbName)) {
       throw new Error(`Unsafe MSSQL_DATABASE name: "${dbName}"`);
     }
@@ -194,4 +204,6 @@ export const mssqlDriver: SqlDriver = {
 
   isDeadlock: isTransientLockError,
   isAlreadyExists: isAlreadyExistsError,
+  isUniqueViolation: isUniqueViolationError,
+  inTransaction: () => activeTx.getStore() !== undefined,
 };

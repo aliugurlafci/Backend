@@ -6,6 +6,7 @@
  * avoid re-emitting domain events and to keep the dependency graph acyclic.
  */
 import { systemContext } from "@/lib/context/resolver";
+import { orgText } from "@/lib/i18n/texts";
 import { getQueryEngine } from "@/lib/data/store";
 import { logger } from "@/lib/observability/logger";
 import { eventBus, type DomainEvent } from "./event-bus";
@@ -30,9 +31,9 @@ export function registerWorkflows(): void {
             correlationId: event.correlationId,
           });
           await qe.create(ctx, "task", {
-            subject: "Kick off onboarding for won deal",
+            subject: orgText("task.dealWonKickoff.subject"),
             status: "open",
-            notes: `Auto-created when deal ${dealId} was won.`,
+            notes: orgText("task.dealWonKickoff.notes", { id: dealId }),
             dealId,
           });
         },

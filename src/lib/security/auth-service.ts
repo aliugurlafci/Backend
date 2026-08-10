@@ -8,10 +8,30 @@
 import { systemContext } from "@/lib/context/resolver";
 import { getQueryEngine } from "@/lib/data/store";
 import { systemClock } from "@/lib/core/clock";
+import { logger } from "@/lib/observability/logger";
 import type { EntityRecord } from "@/lib/metadata/types";
 import { env, jwtSecret, ORG_ID, TENANT_ID } from "@/lib/config/env";
 import { expandSettingsGrants } from "@/lib/config/settings-permissions";
-import { decrypt, totpVerify, verifyPassword } from "./crypto";
+import {
+  consumeRecoveryCode,
+  decrypt,
+  hashPassword,
+  needsRehash,
+  totpVerifyCounter,
+  verifyPassword,
+} from "./crypto";
+
+/** Stored as a JSON array; a corrupt or absent value means "no codes issued". */
+function parseRecoveryCodes(raw: unknown): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(String(raw));
+    return Array.isArray(parsed) ? parsed.filter((c): c is string => typeof c === "string") : [];
+  } catch {
+    return [];
+  }
+}
+import { randomUUID } from "node:crypto";
 import { signJwt } from "./auth";
 
 /** A privileged context for auth lookups (bypasses RBAC for self-resolution). */
@@ -102,9 +122,38 @@ export type LoginOutcome =
 export async function login(email: string, password: string, code?: string): Promise<LoginOutcome> {
   const user = await findUserByEmail(email);
   if (!user || user.active === false) return { status: "invalid" };
-  if (!(await verifyPassword(password, String(user.passwordHash ?? "")))) return { status: "invalid" };
+  const storedHash = String(user.passwordHash ?? "");
+  if (!(await verifyPassword(password, storedHash))) return { status: "invalid" };
 
-  // Second factor (TOTP) when enabled.
+  // The one moment the plaintext exists and the record is known good: rewrite a
+  // hash that was made with weaker parameters. Without this the versioned format
+  // would be an upgrade path nobody walks — existing accounts would keep their
+  // old work factor until someone happened to change their password.
+  //
+  // Deliberately not awaited into the failure path: a login must not fail
+  // because a background improvement did. The user is already authenticated;
+  // the rehash either lands or is retried at their next sign-in.
+  if (needsRehash(storedHash)) {
+    void (async () => {
+      try {
+        const qe = await getQueryEngine();
+        await qe.patchComputed(
+          systemContext(String(user.tenantId), String(user.orgId)),
+          "user",
+          String(user.id),
+          { passwordHash: await hashPassword(password) },
+        );
+        logger.info("password hash upgraded", { userId: String(user.id) });
+      } catch (error) {
+        logger.warn("password hash upgrade failed; will retry at next sign-in", {
+          userId: String(user.id),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+  }
+
+  // Second factor (TOTP, or a recovery code) when enabled.
   if (user.twoFactorEnabled) {
     if (!code) return { status: "2fa_required" };
     let secret = "";
@@ -113,9 +162,60 @@ export async function login(email: string, password: string, code?: string): Pro
     } catch {
       secret = "";
     }
-    if (!secret || !totpVerify(secret, code)) return { status: "invalid_code" };
+    if (!secret) return { status: "invalid_code" };
+
+    const qe = await getQueryEngine();
+    const sys = systemContext(String(user.tenantId), String(user.orgId));
+    const matched = totpVerifyCounter(secret, code);
+
+    if (matched !== null) {
+      // Single use. A code valid across a ±1 step window would otherwise keep
+      // working for ninety seconds, which is the whole property the second
+      // factor is supposed to provide.
+      const last = Number(user.twoFactorLastCounter ?? -1);
+      if (matched <= last) return { status: "invalid_code" };
+      await qe.patchComputed(sys, "user", String(user.id), { twoFactorLastCounter: matched });
+    } else {
+      // Not a TOTP code — try the recovery codes. Someone reaching this has
+      // usually lost their phone, and the alternative was waiting for an
+      // administrator to clear their enrolment.
+      const stored = parseRecoveryCodes(user.twoFactorRecoveryCodes);
+      const remaining = stored.length ? consumeRecoveryCode(code, stored) : null;
+      if (!remaining) return { status: "invalid_code" };
+      await qe.patchComputed(sys, "user", String(user.id), {
+        twoFactorRecoveryCodes: JSON.stringify(remaining),
+      });
+      logger.warn("signed in with a two-factor recovery code", {
+        userId: String(user.id),
+        remaining: remaining.length,
+      });
+    }
   }
 
+  return {
+    status: "ok",
+    userId: String(user.id),
+    tenantId: String(user.tenantId),
+    orgId: String(user.orgId),
+    result: await mintSession(user),
+  };
+}
+
+/**
+ * Mint a session for a user record whose identity has already been established.
+ *
+ * Shared by login and by refresh so the two cannot drift. That matters more
+ * than it looks: the token carries the caller's grants, screens and role, and a
+ * refresh that rebuilt them slightly differently would hand somebody a session
+ * with quietly different permissions from the one they signed in with — the
+ * kind of difference nobody notices until a screen that worked this morning
+ * refuses in the afternoon.
+ *
+ * Everything is re-read from the user's CURRENT position, which is the point of
+ * refreshing rather than re-signing the old claims: a permission change takes
+ * effect at the next refresh instead of waiting out the token's lifetime.
+ */
+export async function mintSession(user: EntityRecord): Promise<LoginResult> {
   const position = user.positionId ? await getPosition(String(user.positionId)) : null;
   const role = position ? String(position.role) : "sales_rep";
   const screens = parseScreens(position);
@@ -124,6 +224,11 @@ export async function login(email: string, password: string, code?: string): Pro
   const token = signJwt(
     {
       sub: user.id,
+      // A per-token id, so this one session can be signed out without ending
+      // the user's other ones, and the epoch it was issued under, so a later
+      // permission or password change can invalidate it. See lib/security/revocation.
+      jti: randomUUID(),
+      epoch: Number(user.tokenEpoch ?? 0),
       name: String(user.displayName ?? user.email),
       email: String(user.email),
       roles: [role],
@@ -137,23 +242,17 @@ export async function login(email: string, password: string, code?: string): Pro
   );
 
   return {
-    status: "ok",
-    userId: String(user.id),
-    tenantId: String(user.tenantId),
-    orgId: String(user.orgId),
-    result: {
-      token,
-      expiresIn: env.AULA_JWT_TTL,
-      user: {
-        id: user.id,
-        email: String(user.email),
-        displayName: String(user.displayName ?? ""),
-        roles: [role],
-        positionId: position ? position.id : null,
-      },
-      position: position ? { id: position.id, name: String(position.name), role } : null,
-      screens,
+    token,
+    expiresIn: env.AULA_JWT_TTL,
+    user: {
+      id: String(user.id),
+      email: String(user.email),
+      displayName: String(user.displayName ?? ""),
+      roles: [role],
+      positionId: position ? position.id : null,
     },
+    position: position ? { id: position.id, name: String(position.name), role } : null,
+    screens,
   };
 }
 

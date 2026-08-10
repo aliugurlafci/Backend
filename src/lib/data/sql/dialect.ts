@@ -9,6 +9,7 @@
  *
  * The active dialect is selected by `DB_CLIENT` (see `@/lib/config/env`).
  */
+import type { DateBucket } from "@/lib/data/query";
 import type { ColumnDesc } from "./schema-map";
 import type { SqlClient, SqlType } from "./types";
 
@@ -75,6 +76,33 @@ export interface SqlDialect {
   escapeLikePattern(term: string): string;
   /** A SELECT returning ≥1 row iff `fromWhere` (e.g. "FROM `t` WHERE …") matches. */
   existsSelect(fromWhere: string): string;
+  /**
+   * A SELECT that takes an exclusive row lock, so a concurrent transaction
+   * serialises behind this one instead of reading a stale value.
+   *
+   * The whole statement is rendered here because the lock hint's *position*
+   * differs: SQL Server puts it after the table (`WITH (UPDLOCK, …)`), MySQL
+   * appends `FOR UPDATE` at the end. Both must also lock a *missing* row, or two
+   * transactions can each conclude "no row yet" and both insert.
+   *
+   * MUST be issued inside a transaction — outside one the lock is released
+   * immediately and the guarantee is worthless.
+   */
+  lockingSelect(selectList: string, table: string, whereClause: string): string;
+  /**
+   * Truncate an ISO-8601 date/datetime *string* column to the start of a period.
+   *
+   * Dates are stored as ISO strings (see `schema-map`), not date types, so
+   * day/month/year are pure prefixes — no `DATEFROMPARTS`/`DATE_FORMAT`, and no
+   * per-row cast that would defeat the column's index. Only `quarter` needs
+   * arithmetic, and that is the one form that differs between the engines.
+   *
+   * The returned key is already human-readable ("2026-Q3") and sorts correctly
+   * under a plain ORDER BY.
+   */
+  dateBucketExpr(colExpr: string, bucket: DateBucket): string;
+  /** `COUNT(DISTINCT col)`. */
+  countDistinctExpr(colExpr: string): string;
 
   // ---- inserts --------------------------------------------------------------
   /**

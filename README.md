@@ -1,285 +1,232 @@
-# Aula CRM — Backend (Node.js + Express + SQL Server / MySQL)
+# Aula — Backend (Node.js · Express · SQL Server / MySQL)
 
-A standalone, metadata-driven backend service for the **Aula CRM** frontend. It
-exposes the same versioned REST API the frontend already speaks (`/api/v1/**`),
-but persists data in a **SQL database — Microsoft SQL Server or MySQL** (pick one
-with `DB_CLIENT`) — instead of memory, and adds real **JWT authentication** (with
-a dev-persona fallback for parity with the frontend's persona switcher).
+Stock, inventory, sales and financial reporting for a single company. A
+metadata-driven service: declaring an entity yields its table, CRUD endpoints,
+validation, RBAC/ABAC, PII projection, optimistic concurrency and lifecycle —
+no per-entity code.
 
-It is a faithful port of the frontend's embedded backend (`src/lib/**`): the
-proven metadata, permissions, query-engine, domain, finance and workflow layers
-are reused verbatim; only the **data repository** (now a SQL database) and the
-**HTTP layer** (now Express) are new.
+> **UI = f(metadata + state + permissions + data + locale + featureFlags + tenantContext)**
 
-> Guiding principle (unchanged): **UI = f(metadata + state + permissions + data
-> + locale + featureFlags + tenantContext)**. Declaring an entity yields its
-> table, CRUD endpoints, validation, RBAC/ABAC, PII projection, optimistic
-> concurrency and lifecycle — no per-entity code.
+Roughly 27,000 lines across 75 entities and 154 endpoints, on either SQL Server
+or MySQL behind one code path.
 
 ---
 
 ## 1. Architecture
 
 ```
-Express HTTP layer            src/http/**            server, routers, runApi wrapper
-  │  (auth · rate limit · CSRF · error serialization · metrics)
-Domain / Finance / Workflow   src/lib/{domain,finance,workflow}/**
-  │  (lifecycle, invariants, audit, events, billing/AR)
+Express HTTP layer            src/http/**           server, router, runApi wrapper
+  │  (edge rate limit · auth · CSRF · error serialisation · metrics · realtime)
+Domain / Finance / Inventory  src/lib/{domain,finance,inventory,accounting}/**
+  │  (lifecycle, invariants, costing, GL postings, audit, outbox events)
 Query Engine (gateway)        src/lib/data/query-engine.ts
   │  (tenant scope · permissions · validation · uniqueness · concurrency · PII)
-SQL Repository                src/lib/data/sql/**       ← persistence adapter (dialect-driven)
-  │  (parameterized SQL, metadata-generated tables; one dialect + driver per engine)
-Microsoft SQL Server   ·   MySQL 8.0+ / MariaDB      ← selected by DB_CLIENT
+SQL Repository                src/lib/data/sql/**   persistence adapter (dialect-driven)
+  │
+SQL Server   ·   MySQL 8.0+ / MariaDB               selected by DB_CLIENT
 ```
 
-- **Single data gateway:** every read/write flows through the `QueryEngine`,
-  which enforces tenant isolation, RBAC/ABAC, metadata validation, unique
-  constraints, optimistic concurrency and field-level PII projection. The
-  repository below it is a "dumb", tenant-scoped persistence contract.
-- **Metadata-driven DDL:** `src/lib/data/sql/ddl.ts` generates one typed table
-  per entity (system columns + one column per field) with indexes on
-  filterable/sortable fields and tenant-scoped unique indexes, rendered for the
-  active engine by the dialect. Adding an entity = declaring metadata + running
-  `npm run migrate`.
-- **Injection-safe:** all values are bound as SQL parameters; identifiers are
-  quoted per dialect (brackets on SQL Server, backticks on MySQL) and aggregation
-  fields are whitelisted against metadata.
-- **Two engines, one code path:** `DB_CLIENT` selects a dialect + driver
-  (`mssql` → node-mssql, `mysql` → mysql2). The repository, DDL and migrator are
-  written once against the dialect interface (`src/lib/data/sql/dialect.ts`).
+**Single data gateway.** Every read and write goes through the `QueryEngine`.
+Tenant isolation, RBAC/ABAC, metadata validation, unique constraints, optimistic
+concurrency and field-level PII projection live there and nowhere else. The
+repository below it is a dumb, tenant-scoped persistence contract.
+
+**Metadata-driven DDL.** `src/lib/data/sql/ddl.ts` generates one typed table per
+entity, with indexes on filterable/sortable fields and tenant-scoped unique
+indexes. On boot the migrator either provisions everything (first run, or after a
+`SCHEMA_VERSION` bump) or reconciles: it introspects the live schema in one query
+and emits DDL only for genuine differences. Adding an entity or a nullable field
+needs no version bump — it appears on the next boot.
+
+**Two engines, one code path.** `DB_CLIENT` selects a dialect and driver
+(`mssql` → node-mssql, `mysql` → mysql2). Repository, DDL and migrator are
+written once against `src/lib/data/sql/dialect.ts`. Every value is bound as a
+parameter; identifiers are quoted per dialect and aggregation fields are
+whitelisted against metadata.
 
 ## 2. Requirements
 
-- **Node.js 20+** (developed on 22.x).
-- **A SQL database — one of:**
-  - **Microsoft SQL Server** 2016+ (or Azure SQL) with `DB_CLIENT=mssql`. You do
-    **not** need to pre-create the database — `migrate` connects to `master` and
-    creates `MSSQL_DATABASE` if missing (the login needs `CREATE DATABASE`, or a
-    DBA pre-creates it and grants `CREATE TABLE`/`CREATE INDEX`). On Azure SQL,
-    create the database via the portal and the create step is skipped.
-  - **MySQL 8.0+** (or **MariaDB 10.2+**) with `DB_CLIENT=mysql`. `migrate`
-    connects without a database and runs `CREATE DATABASE IF NOT EXISTS`
-    (utf8mb4), or point `MYSQL_DATABASE` at a pre-created one. MySQL 8.0 is
-    required for window functions (`COUNT(*) OVER()`).
+- **Node.js 20+** (developed on 22.x)
+- **One SQL engine:**
+  - **SQL Server 2016+** / Azure SQL with `DB_CLIENT=mssql`. The database is
+    created for you if the login has `CREATE DATABASE`; on Azure SQL create it in
+    the portal and that step is skipped.
+  - **MySQL 8.0+** / **MariaDB 10.2+** with `DB_CLIENT=mysql`. MySQL 8.0 is the
+    floor because the repository uses window functions (`COUNT(*) OVER()`).
 
 ## 3. Setup
 
 ```bash
 npm install
-cp .env.example .env      # then set DB_CLIENT=mssql|mysql and that engine's connection details
-npm run setup             # = migrate + seed: creates the DB if missing,
-                          #   provisions the schema, loads demo data (idempotent)
-npm run dev               # start on http://localhost:4000 (tsx watch)
+cp .env.example .env       # set DB_CLIENT and that engine's connection details
+npm run setup              # migrate + seed (idempotent)
+npm run dev                # http://localhost:4000
 ```
 
-`npm run migrate` creates the database if it doesn't exist, then provisions the
-schema; `npm run seed` loads demo data (skips if already populated). Both are
-idempotent and safe to re-run.
-
-`npm run dev`/`npm start` will also auto-migrate and auto-seed on boot when
-`AULA_AUTO_MIGRATE` / `AULA_AUTO_SEED` are `true` (the default in development),
-so the explicit `migrate`/`seed` steps are optional locally.
-
-## 4. Environment variables
-
-See [.env.example](.env.example). Key ones:
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `PORT` | HTTP port | `4000` |
-| `CORS_ORIGINS` | Allowed origins (comma list or `*`) | `http://localhost:3000` |
-| `DB_CLIENT` | **SQL engine: `mssql` or `mysql`** | `mssql` |
-| `AULA_PERSISTENCE` | `sql` (durable, engine = `DB_CLIENT`) or `memory` | `sql` |
-| `MSSQL_SERVER` / `MSSQL_PORT` | SQL Server host / port (when `DB_CLIENT=mssql`) | `localhost` / `1433` |
-| `MSSQL_DATABASE` | Target database (auto-created if missing) | `aula_crm` |
-| `MSSQL_USER` / `MSSQL_PASSWORD` | SQL login | `sa` / — |
-| `MSSQL_ENCRYPT` | TLS (true for Azure SQL) | `false` |
-| `MSSQL_TRUST_SERVER_CERTIFICATE` | Trust self-signed cert (on-prem/dev) | `true` |
-| `MSSQL_INSTANCE` | Named instance (e.g. `SQLEXPRESS`); blank ⇒ host+port | — |
-| `MYSQL_HOST` / `MYSQL_PORT` | MySQL host / port (when `DB_CLIENT=mysql`) | `localhost` / `3306` |
-| `MYSQL_DATABASE` | Target database (auto-created if missing) | `aula_crm` |
-| `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL login | `root` / — |
-| `MYSQL_SSL` | Connect over TLS (managed/cloud MySQL) | `false` |
-| `MSSQL_POOL_MAX` / `MYSQL_POOL_MAX` | Max pooled connections | `10` |
-| `AULA_JWT_SECRET` | HS256 signing secret (**required in prod**) | dev fallback |
-| `AULA_JWT_TTL` | Token lifetime (seconds) | `3600` |
-| `AULA_ENCRYPTION_KEY` | AES-256-GCM key (**required in prod**) | dev fallback |
-| `AULA_DEV_AUTH` | Enable dev persona auth alongside JWT | `true` |
-| `AULA_AUTO_MIGRATE` / `AULA_AUTO_SEED` | Provision/seed on boot | `true` |
-
-In **production** (`NODE_ENV=production`) the app refuses to start with insecure
-defaults: `AULA_JWT_SECRET`, `AULA_ENCRYPTION_KEY` and the active engine's
-password (`MSSQL_PASSWORD` or `MYSQL_PASSWORD`) must be set and `AULA_DEV_AUTH`
-must be `false`.
-
-## 5. Scripts
+`AULA_ADMIN_PASSWORD` has **no default**. Outside production a well-known dev
+value is used and announced loudly on the boot that creates the account;
+production refuses to start without one. A shipped default password is a
+published credential.
 
 | Script | What it does |
-|---|---|
-| `npm run dev` | Start with hot reload (tsx watch). |
-| `npm start` | Start the server. |
-| `npm run migrate` | Generate + apply the schema from metadata (idempotent). |
-| `npm run seed` | Ensure schema, then seed demo data (idempotent). |
-| `npm run typecheck` / `npm run build` | `tsc --noEmit`. |
-| `tsx scripts/smoke.ts` | Offline check (metadata, DDL, app, JWT) — no DB needed. |
+| --- | --- |
+| `npm run dev` | tsx watch |
+| `npm start` | run once |
+| `npm run migrate` | provision/reconcile the schema |
+| `npm run seed` | demo data (idempotent) |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | eslint |
+| `npm test` | node:test — offline, no database needed |
+| `npm run retenant` | re-scope existing rows to a new tenant/org |
 
-## 6. Authentication
+## 4. Configuration
 
-Two modes, controlled by `AULA_DEV_AUTH`:
+Everything is validated at startup by `src/lib/config/env.ts`; see `.env.example`
+for the full annotated list. The settings most worth understanding:
 
-- **JWT (always on):** send `Authorization: Bearer <token>`. Tokens must carry
-  `tenantId`, `orgId`, `roles`, `sub`. Mint one for a demo persona:
+| Variable | Notes |
+| --- | --- |
+| `DB_CLIENT` | `mssql` (default) or `mysql`. Ignored when `AULA_PERSISTENCE=memory`. |
+| `AULA_PERSISTENCE` | `sql` (default) or `memory` — process-local, for local dev, CI and tests. |
+| `AULA_ADMIN_EMAIL` / `AULA_ADMIN_PASSWORD` | Bootstrap administrator. No default password. |
+| `AULA_TRUST_PROXY` | Number of reverse-proxy hops. **Security setting** — see below. |
+| `AULA_EDGE_RATE_LIMIT` | Requests per minute per client IP (default 3000). |
+| `AULA_BASE_CURRENCY` | Currency the ledger is kept in. Defaults to `TRY`. |
+| `AULA_ALLOW_NEGATIVE_STOCK` | `false` (default) rejects an issue that would drive on-hand negative. |
+| `AULA_AUTO_MIGRATE` | DDL on boot. **Production refuses to start with this on** — migration is a deploy step. |
+| `AULA_LOG_LEVEL` | `debug` outside production, `info` in it. |
 
-  ```bash
-  curl -s localhost:4000/api/v1/auth/login -H 'content-type: application/json' \
-    -d '{"actor":"admin"}'      # actor: admin | manager | rep | accountant | globex
-  # → { "token": "...", "tokenType": "Bearer", "expiresIn": 3600, "user": {...} }
-  ```
+**`AULA_TRUST_PROXY` deserves a paragraph.** Express derives `req.ip` from
+`X-Forwarded-For`, and the client writes that header — only hops you actually
+trust may overwrite it. Set it to the number of proxies in front of the process
+(`1` behind a single nginx, `2` behind a CDN as well), or to a list of trusted
+ingress IPs/CIDRs. The default trusts nothing, which is correct for a direct
+listener. Setting it to `true` makes `req.ip` whatever the caller types, which
+silently defeats the login brute-force throttle and the edge rate limit; the
+server logs a warning if you do.
 
-- **Dev personas (when `AULA_DEV_AUTH=true`):** if no bearer token is present,
-  the request is resolved from the `x-actor` header (or `aula_actor` cookie):
-  `admin`, `manager`, `rep`, `accountant`. Send `x-tenant: t_globex` to act as
-  the second tenant. This mirrors the frontend's persona switcher.
+In production the startup check also refuses: a weak `AULA_JWT_SECRET` or
+`AULA_ENCRYPTION_KEY`, a missing database password, `CORS_ORIGINS=*` (it is
+reflected with credentials enabled), and `MSSQL_TRUST_SERVER_CERTIFICATE=true`
+(it disables TLS verification).
 
-`GET /api/v1/auth/me` returns the resolved principal + scope + feature flags.
+## 5. Authentication
 
-## 7. API
+JWT only. `POST /auth/login` returns a token and sets an httpOnly session cookie;
+subsequent requests use either. There is no dev-persona bypass — the resolver
+authenticates or throws.
 
-Base path `/api/v1`. The full surface from the frontend is preserved — generic
-CRUD (`/entities/:entity`...), lifecycle transitions, audit, metadata,
-aggregate, stats, activity, search, CSV import + export (`/export/:entity?format=csv|xlsx|pdf` — real .xlsx via exceljs, table PDF via pdfkit), leads convert, quotes &
-invoices (master-detail) + payments + conversion, recurring billing, cron tick,
-webhooks, notifications, admin governance/releases, and health. See the
-frontend README §13 for the endpoint catalogue; the contract is identical.
+- Login is throttled per source IP and per email address, with the email lock
+  cleared on success.
+- Mutations enforce a double-submit CSRF token when the client presents the
+  cookie (i.e. a browser).
+- Optional TOTP two-factor per user.
 
-Conventions: list params `?q=&page=&pageSize=&sort=field:dir&filter.<field>=v`;
-mutations honour `If-Match: <version>` for optimistic concurrency and a
-double-submit CSRF cookie (`aula_csrf` / `x-csrf-token`) when a cookie is set;
-errors are `{ error: { code, message, details?, correlationId? } }`.
+## 6. Rate limiting
 
-## 8. Persistence model
+Two limiters on different axes, both wanted:
 
-**Durable in the SQL database (SQL Server or MySQL):** all entity records (one
-typed table per entity), document number sequences (`_seq_counter`, atomic),
-file blobs (`_file_blob`), and the schema-version ledger (`_schema_migrations`).
+- **Edge** (`src/lib/security/edge-rate-limit.ts`) — per client IP, every route,
+  as Express middleware ahead of body parsing. This exists because `runApi`
+  authenticates *first*: an unauthenticated request threw before the
+  per-principal counter was reached, so credential stuffing was never limited at
+  all. The liveness probe is exempt — an orchestrator cannot back off, and
+  limiting it turns a traffic spike into a restart loop.
+- **Per principal** (`runApi`) — per user *and* per path. An IP limit cannot
+  express "this account is hammering one endpoint", and in an office everyone
+  shares one NAT address.
 
-**In-memory (per process, like the frontend's default):** audit log, the event
-bus / outbox / idempotency, the search index, the stats cache, and the
-webhook + notification registries. These are wired the same way the frontend
-ships them; back them with SQL/Redis for full production durability (clear swap
-points remain — see §9).
+## 7. Inventory and costing
 
-## 9. Production notes / swap points
+Costing is **perpetual moving weighted average** (VUK-compliant, and the method
+Logo/Mikro/Netsis default to, so an accountant can reconcile against it).
 
-| Concern | Default | Swap point |
-|---|---|---|
-| Persistence | `SqlRepository` (SQL Server / MySQL) | switch engines with `DB_CLIENT`, or implement `Repository` for another store |
-| Auth | JWT + dev personas | `configureAuth()` / `jwtAuthenticator` (wire OIDC) |
-| Cache | in-memory | `src/lib/cache/cache.ts` → Redis |
-| Event bus | in-memory | `src/lib/workflow/event-bus.ts` → broker |
-| Search | in-memory | `src/lib/search/engine.ts` → OpenSearch/Typesense |
-| Audit / webhooks / notifications | in-memory | back with SQL tables for durability |
+Two rules the code depends on:
 
-Because all enforcement lives above the repository, swapping persistence does
-not change permission, validation, isolation or lifecycle behaviour.
+- **`avgCost` is display only.** The authoritative pair is (`qty`, `value`), and
+  issue cost is consumed proportionally: `value × q / qty`. This guarantees
+  `qty → 0 ⟹ value → 0` to the cent. Deriving issue cost from a stored 2-decimal
+  average instead lets rounding accumulate until the Inventory account carries a
+  balance with no units behind it.
+- **The GL and the stock ledger never compute the same number twice.**
+  `writeMovement` returns the value it applied, and the posting layer uses that
+  figure rather than recalculating one. `stock-reconcile` (nightly, report-only)
+  asserts the two still agree; drift means a bug, so it reports rather than
+  quietly repairing.
 
-## 10. Pointing the frontend at this backend
+Negative-stock protection is a locked read of the balance row
+(`UPDLOCK, ROWLOCK, HOLDLOCK` / `FOR UPDATE`), not a plain read plus retry — a
+retry inside the same transaction re-reads the same stale snapshot on MySQL.
 
-The frontend is wired to this backend out of the box (backend-for-frontend
-proxy). The browser only ever talks to the Next.js origin; the frontend:
+## 8. Turkish compliance
 
-- proxies every `/api/v1/*` request to this service via `next.config.ts`
-  (so client `apiFetch`, CSV export links and form posts reach the backend), and
-- fetches data in server components directly from this service through its
-  server-side `serverApi` helper, forwarding the caller's persona cookie /
-  tenant / locale / bearer headers so the backend resolves the same principal.
+- Tekdüzen Hesap Planı (100/101/102/103/120/121/153/191/320/321/326/391/600/621/…)
+- Input vs output VAT kept apart (191 / 391), `devreden KDV` carried forward
+- KDV tevkifat: withheld VAT is a separate posting, not a reduced one
+- VKN/TCKN check-digit validation
+- Cheques and notes (`çek`/`senet`) with their own lifecycle and GL treatment
+- e-Fatura / e-Arşiv: UBL-TR 1.2 documents are built, validated, numbered and
+  stored with **no integrator configured**. Choosing a provider means writing one
+  adapter against `EInvoiceIntegrator` (`isRegistered` / `send` / `status`).
+  Until then transmission fails loudly — an invoice marked sent that the tax
+  office never received is worse than one that was never sent.
 
-Set `BACKEND_API_URL` in the frontend (default `http://localhost:4000`). Because
-requests stay first-party through the Next proxy, no cross-origin cookies are
-needed; the `CORS_ORIGINS` allow-list here remains useful if you ever call the
-API directly from the browser.
+## 9. Realtime
 
-### Run the whole stack locally (no database required)
+A WebSocket at `/ws` carries change notices. Screens use it to stop polling
+blind; the notification bell and the register queue keep a slower timer as a
+backstop, because a socket can die without either end noticing.
+
+**It carries signals, not records.** The frame is `{ type, entity, id, at }` and
+the client refetches through the normal API, where the permission checks apply.
+Piping event payloads down the socket would hand every listener a copy of records
+that never passed through the authorisation layer.
+
+Authentication happens during the HTTP upgrade: `POST /realtime/ticket` mints a
+single-use ticket that expires in 30 seconds, because a browser cannot set an
+`Authorization` header on `new WebSocket(...)` and the query string is the only
+channel it controls.
+
+## 10. Scheduled jobs
+
+Registered in `src/lib/jobs/scheduler.ts`, run in-process and also reachable via
+`POST /cron/tick`. All are idempotent.
+
+| Job | Cadence | Purpose |
+| --- | --- | --- |
+| `billing-run` | daily | Recurring invoices |
+| `mark-overdue` | daily | Move past-due invoices to `overdue` |
+| `outbox-recovery` | frequent | Redeliver events stranded by a crash |
+| `retention` | daily | Prune delivery logs, published events, notifications |
+| `stock-reconcile` | daily | Assert balances still equal the ledger (report-only) |
+| `stock-alerts` | daily | Open/close `stockAlert` records from stock conditions |
+| `calendar-due-dates` | daily | Project PO/invoice/bill dates onto the calendar |
+
+`stock-alerts` is worth a note: it opens an alert **once** when a condition
+starts holding and closes it when it stops. Re-announcing the same shortage every
+night is how an alert channel gets muted, taking the urgent messages with it.
+Opening one emits `stockAlert.created`, which the automation rules act on — who
+gets told and through which channel is a rule, not code.
+
+## 11. Testing
 
 ```bash
-# Terminal 1 — backend on :4000, in-memory persistence (no database needed)
-cd Backend
-npm install
-AULA_PERSISTENCE=memory npm run dev        # seeds demo data on boot
-
-# Terminal 2 — frontend on :3000
-cd Frontend
-npm install
-BACKEND_API_URL=http://localhost:4000 npm run dev
+npm test          # 167 tests, offline
 ```
 
-Open http://localhost:3000. For durable storage, drop `AULA_PERSISTENCE=memory`,
-set `DB_CLIENT=mssql` or `mysql`, and configure that engine's `MSSQL_*` / `MYSQL_*`
-variables (see §3/§4).
+Every test runs without a database — pure functions plus the in-memory
+repository, plus HTTP-level tests that boot the real Express app on an ephemeral
+port. The suite deliberately concentrates on the places where a silent error
+costs money: costing arithmetic, the chart of accounts, VAT and tevkifat, UBL-TR
+serialisation, paging limits, and the realtime fan-out's negative cases (no
+records on the wire, nothing across a tenant boundary).
 
-This backend also exposes `GET /api/v1/jobs` (scheduled-job status for the
-Automation screen) and accepts `GET /api/v1/activity?limit=N`.
+## 12. Deployment
 
-## 11. Real integrations (email, files, chat)
+`Dockerfile` builds a production image; `AULA_AUTO_MIGRATE` must be off, so run
+`npm run migrate` as a deliberate deploy step. `.github/workflows/ci.yml` gates
+typecheck, lint and tests.
 
-The comms/productivity screens are backed by real infrastructure, all env-driven
-and degrading gracefully when unconfigured:
-
-| Integration | Endpoint(s) | Backed by | Config |
-|---|---|---|---|
-| **Email — send** | `POST /api/v1/email/send` | nodemailer (SMTP) | `SMTP_HOST/PORT/USER/PASS/FROM/SECURE` |
-| **Email — receive** | `POST /api/v1/email/sync` | imapflow (IMAP) + mailparser | `IMAP_HOST/PORT/USER/PASS/SECURE/MAILBOX` |
-| **Files — upload** | `POST /api/v1/files/upload` (multipart) | local disk | `UPLOAD_DIR` (default `<cwd>/uploads`) |
-| **Files — download** | `GET /api/v1/files/:id/download` | local disk | — |
-| **Chat — real-time** | `ws://<host>/ws/chat?actor=&tenant=` | `ws` WebSocket | `CORS_ORIGINS` (handshake origin) |
-
-- **Email:** when `SMTP_*` is unset, compose just stores to the `sent` folder;
-  when `IMAP_*` is unset, `/email/sync` is a no-op (`{configured:false}`). Set the
-  vars to send/receive real mail. Bytes never touch the DB — only the parsed
-  `email` rows do.
-- **Files:** uploaded bytes are stored on disk keyed by the record id (metadata
-  in the `file` table); deleting a `file` record removes its blob via a
-  `file.deleted` event subscriber. Swap local disk for S3/Azure by reimplementing
-  `src/lib/integrations/file-storage.ts`. 100 MB upload cap (keep the Next
-  `experimental.proxyClientMaxBodySize` ≥ this so the proxy doesn't truncate).
-  The file manager shows a live upload progress bar (XHR).
-- **Chat:** the browser connects **directly** to this server's WebSocket (outside
-  the Next proxy) at `/ws/chat`; inbound messages are persisted through the domain
-  service (RBAC + validation + audit + events) and broadcast to every socket in
-  the same tenant/org. Point the frontend at it with `NEXT_PUBLIC_WS_URL`
-  (default `ws://localhost:4000`). The handshake origin is checked against
-  `CORS_ORIGINS`. For multi-instance scale, back the broadcast with a Redis
-  pub/sub.
-
-Schema evolution: `migrate` is now additive — declaring a new field on an
-existing entity adds the column (guarded `ALTER TABLE ... ADD`), so you don't
-need to drop tables when metadata grows.
-
-## 12. Authentication & screen access
-
-Real credential login with a DB-backed users + positions model and a two-layer
-authorization model:
-
-- **Login:** `POST /api/v1/auth/login` with `{ email, password }` verifies the
-  scrypt hash in the `user` table and sets an **httpOnly `aula_session` JWT
-  cookie**. `POST /api/v1/auth/logout` clears it. `GET /api/v1/auth/me` returns
-  the signed-in user, their position and their allowed screens. With no valid
-  session, requests are unauthenticated (the Next middleware redirects pages to
-  `/login`).
-- **Positions (`position` table):** each position carries a **base role** (the
-  data-RBAC role: admin / sales_manager / sales_rep / accountant) **and** a JSON
-  list of **screens** it may open. Users (`user` table) belong to a position.
-- **Two layers:** *screen access* (which pages a position can open) is enforced
-  in the app shell (nav filtering + a 403 page) and is fully admin-configurable.
-  *Data access* (which records/fields) is the base role's existing RBAC/ABAC.
-  Grant a position screens whose data its base role can actually read.
-- **Admin management:** Settings → **Positions** (`/settings/roles`) edits the
-  screen matrix per position; Settings → **Users** (`/settings/users`) creates
-  users, assigns positions and resets passwords. Endpoints: `GET /screens`,
-  `GET|POST /admin/users`, `PATCH /admin/users/:id` (admin only).
-
-Seeded on first boot (idempotent): 4 positions (Administrator / Sales Manager /
-Sales Rep / Accountant) and 4 users (`avery@acme.test`, `morgan@acme.test`,
-`riley@acme.test`, `casey@acme.test`) — **default password `Passw0rd!`** (change
-in production). The frontend connects to the chat WebSocket; in production issue
-a short-lived WS ticket instead of the dev `?actor=` param.
+Graceful shutdown closes realtime sockets first — `server.close()` waits for open
+connections to end, and a WebSocket never ends on its own — then drains in-flight
+requests before tearing down the pool.

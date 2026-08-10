@@ -14,17 +14,40 @@ import type { RequestContext } from "@/lib/context/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
 import type { DomainService } from "@/lib/domain/service";
 import type { EntityDef, EntityRecord, FieldDef, FieldValue } from "@/lib/metadata/types";
+import { ENTITY, FIELD } from "@aula/contracts/i18n/entity-labels";
+import { enumWord } from "@aula/contracts/i18n/labels";
+import { localeText } from "@/lib/i18n/texts";
 import { renderEntityXlsx, renderEntityPdf } from "./render-pool";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-/** Human-friendly cell value (enum → option label, boolean → Yes/No). */
-function display(field: FieldDef | undefined, value: FieldValue): string | number {
+/**
+ * Human-friendly cell value in the REQUESTER's language (enum → localized
+ * option label, boolean → Evet/Hayır). An export is an answer to one caller —
+ * a Turkish user's spreadsheet was arriving with "Yes"/"Draft" cells.
+ */
+function display(field: FieldDef | undefined, value: FieldValue, locale: string): string | number {
   if (value === null || value === undefined || value === "") return "";
-  if (field?.type === "enum") return field.options?.find((o) => o.value === value)?.label ?? String(value);
-  if (field?.type === "boolean") return value ? "Yes" : "No";
+  if (field?.type === "enum") {
+    const english = field.options?.find((o) => o.value === value)?.label ?? String(value);
+    if (locale === "tr" || locale === "de") return enumWord(String(value), locale) === String(value) ? english : enumWord(String(value), locale);
+    return english;
+  }
+  if (field?.type === "boolean") return value ? localeText(locale, "export.yes") : localeText(locale, "export.no");
   if (typeof value === "number") return round2(value);
   return String(value);
+}
+
+/** Localized column header for a field, falling back to the metadata label. */
+function headerFor(field: FieldDef, locale: string): string {
+  if (locale === "tr" || locale === "de") return FIELD[locale][field.name] ?? field.label;
+  return field.label;
+}
+
+/** Localized plural entity title, falling back to the metadata plural label. */
+function pluralTitle(entity: EntityDef, locale: string): string {
+  if (locale === "tr" || locale === "de") return ENTITY[locale][entity.name]?.p ?? entity.pluralLabel;
+  return entity.pluralLabel;
 }
 
 async function collect(
@@ -34,8 +57,13 @@ async function collect(
   domain: DomainService,
 ): Promise<{ entity: EntityDef; items: EntityRecord[] }> {
   const entity = metadata.getEntity(entityName);
-  const page = await domain.list(ctx, entityName, { pageSize: 1000 });
-  return { entity, items: page.items };
+  // Stream every row: "Export to Excel" on a 5,000-row table used to hand back
+  // 200 rows with no warning, because the requested page size was clamped.
+  const items: EntityRecord[] = [];
+  await domain.listAll(ctx, entityName, {}, (batch) => {
+    items.push(...batch);
+  });
+  return { entity, items };
 }
 
 /** Build a real .xlsx workbook (one sheet) for an entity. */
@@ -47,17 +75,21 @@ export async function exportXlsx(
 ): Promise<Buffer> {
   const { entity, items } = await collect(ctx, entityName, metadata, domain);
 
+  const locale = ctx.locale;
   const columns = [
     { header: "ID", key: "id", width: 26 },
-    ...entity.fields.map((f) => ({ header: f.label, key: f.name, width: Math.min(40, Math.max(14, f.label.length + 6)) })),
+    ...entity.fields.map((f) => {
+      const header = headerFor(f, locale);
+      return { header, key: f.name, width: Math.min(40, Math.max(14, header.length + 6)) };
+    }),
   ];
   const rows = items.map((r) => {
     const row: Record<string, string | number> = { id: String(r.id) };
-    for (const f of entity.fields) row[f.name] = display(f, r[f.name] ?? null);
+    for (const f of entity.fields) row[f.name] = display(f, r[f.name] ?? null, locale);
     return row;
   });
 
-  return renderEntityXlsx({ sheetName: entity.pluralLabel.slice(0, 31), columns, rows });
+  return renderEntityXlsx({ sheetName: pluralTitle(entity, locale).slice(0, 31), columns, rows });
 }
 
 /** Build a landscape table PDF for an entity (uses listColumns to fit the page). */
@@ -75,13 +107,16 @@ export async function exportPdf(
     .map((c) => fieldByName.get(c.field))
     .filter((f): f is FieldDef => Boolean(f));
   const cols: FieldDef[] = (listed.length ? listed : entity.fields).slice(0, 7);
-  const rows = items.map((r) => cols.map((c) => display(c, r[c.name] ?? null)));
+  const locale = ctx.locale;
+  const rows = items.map((r) => cols.map((c) => display(c, r[c.name] ?? null, locale)));
 
   return renderEntityPdf({
-    title: entity.pluralLabel,
+    title: pluralTitle(entity, locale),
     count: items.length,
     dateStr: new Date().toISOString().slice(0, 10),
-    cols: cols.map((c) => ({ label: c.label })),
+    metaLabel: localeText(locale, "export.recordsMeta", { count: items.length, date: new Date().toISOString().slice(0, 10) }),
+    emptyLabel: localeText(locale, "export.noRecords"),
+    cols: cols.map((c) => ({ label: headerFor(c, locale) })),
     rows,
   });
 }

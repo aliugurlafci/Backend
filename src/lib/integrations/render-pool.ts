@@ -139,6 +139,10 @@ export function renderEntityPdf(input: {
   title: string;
   count: number;
   dateStr: string;
+  /** Localized "{count} records · {date}" line; the renderer falls back to English. */
+  metaLabel?: string;
+  /** Localized empty-table line. */
+  emptyLabel?: string;
   cols: { label: string }[];
   rows: (string | number)[][];
 }): Promise<Buffer> {

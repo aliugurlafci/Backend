@@ -7,14 +7,26 @@
  */
 import { createHmac } from "node:crypto";
 import { newId } from "@/lib/core/ids";
+import { systemContext } from "@/lib/context/resolver";
+import type { RequestContext } from "@/lib/context/types";
+import { getQueryEngine } from "@/lib/data/store";
+import { MAX_PAGE_SIZE } from "@/lib/data/query";
+import type { EntityRecord } from "@/lib/metadata/types";
 import { logger } from "@/lib/observability/logger";
 import { BadRequestError } from "@/lib/enforcement/errors";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { withRetry } from "@/lib/workflow/retry";
 
 /** Whether a dotted-quad IPv4 (as 4 octets) is private/loopback/link-local. */
-function isBlockedIpv4(o: number[]): boolean {
-  const [a, b] = o;
+function isBlockedIpv4(o: readonly number[]): boolean {
+  // Anything that is not four real octets is BLOCKED, not allowed through.
+  // Every caller matches a four-group pattern first, so this cannot happen —
+  // but the fallthrough at the end of this function is `return false`, so an
+  // unparseable address would have been treated as public and fetched. A guard
+  // that cannot identify a host has to refuse it; the alternative is deciding
+  // an address is safe on the grounds that we could not read it.
+  if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b] = o as [number, number, number, number];
   if (a === 0 || a === 127) return true; // this-host / loopback
   if (a === 10) return true; // private
   if (a === 192 && b === 168) return true; // private
@@ -42,13 +54,13 @@ function isBlockedWebhookHost(hostname: string): boolean {
   // IPv4-mapped IPv6: dotted tail (::ffff:127.0.0.1) or hex tail (::ffff:7f00:1).
   const mapped = h.match(/^::ffff:(.+)$/);
   if (mapped) {
-    const tail = mapped[1];
+    const tail = mapped[1] ?? "";
     const td = tail.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (td) return isBlockedIpv4(td.slice(1).map(Number));
     const hx = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hx) {
-      const hi = parseInt(hx[1], 16);
-      const lo = parseInt(hx[2], 16);
+      const hi = parseInt(hx[1] ?? "", 16);
+      const lo = parseInt(hx[2] ?? "", 16);
       return isBlockedIpv4([(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]);
     }
   }
@@ -97,49 +109,186 @@ export interface WebhookDelivery {
   error?: string;
 }
 
+/**
+ * Database-backed webhook registry.
+ *
+ * Endpoints and their delivery log are rows, not process state. They used to be
+ * two arrays: every restart silently deregistered every integration, and on more
+ * than one instance an endpoint was only visible to the node that registered it.
+ *
+ * Reads and writes go through the query engine under a system context — these
+ * are platform records, and access is admin-gated at the API layer.
+ */
+const ENDPOINT = "webhookEndpoint";
+const DELIVERY = "webhookDelivery";
+
+const sysCtx = (tenantId: string, orgId: string): RequestContext => systemContext(tenantId, orgId);
+
+/** Tolerant parse: `events` is stored as JSON text and may predate a shape change. */
+function parseEvents(raw: unknown): string[] {
+  if (raw === null || raw === undefined || raw === "") return ["*"];
+  try {
+    const parsed = JSON.parse(String(raw)) as unknown;
+    return Array.isArray(parsed) ? parsed.map(String) : ["*"];
+  } catch {
+    return ["*"];
+  }
+}
+
+function toEndpoint(row: EntityRecord): WebhookEndpoint {
+  return {
+    id: String(row.id),
+    tenantId: String(row.tenantId),
+    orgId: String(row.orgId),
+    url: String(row.url),
+    secret: String(row.secret ?? ""),
+    events: parseEvents(row.events),
+    createdAt: String(row.createdAt),
+  };
+}
+
+function toDelivery(row: EntityRecord): WebhookDelivery {
+  return {
+    id: String(row.id),
+    endpointId: String(row.endpointId),
+    tenantId: String(row.tenantId),
+    orgId: String(row.orgId),
+    at: String(row.at),
+    type: String(row.type ?? ""),
+    ok: Boolean(row.ok),
+    status: row.status === null || row.status === undefined ? null : Number(row.status),
+    error: row.error ? String(row.error) : undefined,
+  };
+}
+
 export class WebhookRegistry {
-  private endpoints: WebhookEndpoint[] = [];
-  private deliveries: WebhookDelivery[] = [];
+  private async qe() {
+    return getQueryEngine();
+  }
 
-  register(input: Omit<WebhookEndpoint, "id" | "createdAt"> & { createdAt: string }): WebhookEndpoint {
+  async register(input: Omit<WebhookEndpoint, "id" | "createdAt"> & { createdAt: string }): Promise<WebhookEndpoint> {
     assertSafeWebhookUrl(input.url); // reject SSRF targets at registration
-    const endpoint = { id: newId("wh"), ...input };
-    this.endpoints.push(endpoint);
-    return endpoint;
+    const qe = await this.qe();
+    const row = await qe.create(sysCtx(input.tenantId, input.orgId), ENDPOINT, {
+      url: input.url,
+      secret: input.secret,
+      events: JSON.stringify(input.events ?? ["*"]),
+      active: true,
+    });
+    return toEndpoint(row);
   }
 
-  remove(tenantId: string, orgId: string, id: string): boolean {
-    const before = this.endpoints.length;
-    this.endpoints = this.endpoints.filter(
-      (e) => !(e.id === id && e.tenantId === tenantId && e.orgId === orgId),
+  /**
+   * Delete an endpoint and its delivery history.
+   *
+   * The history has to go first: delivery rows reference the endpoint, so the
+   * database refuses to remove one that has ever been used — and swallowing that
+   * error reported "not found" for an endpoint sitting right there in the list.
+   * Absence is the only thing that returns false; anything else propagates.
+   */
+  async remove(tenantId: string, orgId: string, id: string): Promise<boolean> {
+    const qe = await this.qe();
+    const ctx = sysCtx(tenantId, orgId);
+
+    if (!(await this.get(tenantId, orgId, id))) return false;
+
+    for (;;) {
+      const page = await qe.list(ctx, DELIVERY, {
+        filters: [{ field: "endpointId", op: "eq", value: id }],
+        pageSize: MAX_PAGE_SIZE,
+      });
+      if (page.items.length === 0) break;
+      await qe.removeMany(ctx, DELIVERY, page.items.map((r) => String(r.id)));
+    }
+    await qe.remove(ctx, ENDPOINT, id);
+    return true;
+  }
+
+  async get(tenantId: string, orgId: string, id: string): Promise<WebhookEndpoint | undefined> {
+    const qe = await this.qe();
+    try {
+      return toEndpoint(await qe.get(sysCtx(tenantId, orgId), ENDPOINT, id));
+    } catch {
+      return undefined;
+    }
+  }
+
+  async list(tenantId: string, orgId: string): Promise<WebhookEndpoint[]> {
+    const qe = await this.qe();
+    const rows = await qe.listComplete(sysCtx(tenantId, orgId), ENDPOINT);
+    return rows.map(toEndpoint);
+  }
+
+  /**
+   * Endpoints subscribed to this event.
+   *
+   * Runs on every published domain event, so it is a filtered read of a small
+   * admin-managed table rather than a scan — but it is still a database round
+   * trip per event, which is the cost of endpoints surviving a restart.
+   */
+  async matching(event: DomainEvent): Promise<WebhookEndpoint[]> {
+    const qe = await this.qe();
+    const rows = await qe.listComplete(sysCtx(event.tenantId, event.orgId), ENDPOINT, {
+      filters: [{ field: "active", op: "eq", value: true }],
+    });
+    return rows
+      .map(toEndpoint)
+      .filter((e) => e.events.includes("*") || e.events.includes(event.type));
+  }
+
+  async recordDelivery(d: Omit<WebhookDelivery, "id">): Promise<void> {
+    const qe = await this.qe();
+    try {
+      await qe.create(sysCtx(d.tenantId, d.orgId), DELIVERY, {
+        endpointId: d.endpointId,
+        at: d.at,
+        type: d.type,
+        ok: d.ok,
+        status: d.status,
+        error: d.error ?? null,
+      });
+    } catch (error) {
+      // The delivery log is a record of what happened, not part of it — failing
+      // to write it must not turn a successful call into a failed one.
+      logger.warn("webhook delivery not logged", {
+        endpointId: d.endpointId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async listDeliveries(tenantId: string, orgId: string, limit = 20): Promise<WebhookDelivery[]> {
+    const qe = await this.qe();
+    const capped = Math.min(Math.max(1, limit), 200);
+    const page = await qe.list(
+      sysCtx(tenantId, orgId),
+      DELIVERY,
+      { sort: [{ field: "at", dir: "desc" }], pageSize: capped },
+      { maxPageSize: capped },
     );
-    return this.endpoints.length < before;
+    return page.items.map(toDelivery);
   }
 
-  get(tenantId: string, orgId: string, id: string): WebhookEndpoint | undefined {
-    return this.endpoints.find((e) => e.id === id && e.tenantId === tenantId && e.orgId === orgId);
-  }
-
-  list(tenantId: string, orgId: string): WebhookEndpoint[] {
-    return this.endpoints.filter((e) => e.tenantId === tenantId && e.orgId === orgId);
-  }
-
-  matching(event: DomainEvent): WebhookEndpoint[] {
-    return this.endpoints.filter(
-      (e) =>
-        e.tenantId === event.tenantId &&
-        e.orgId === event.orgId &&
-        (e.events.includes("*") || e.events.includes(event.type)),
-    );
-  }
-
-  recordDelivery(d: Omit<WebhookDelivery, "id">): void {
-    this.deliveries.unshift({ id: newId("whd"), ...d });
-    if (this.deliveries.length > 200) this.deliveries.length = 200;
-  }
-
-  listDeliveries(tenantId: string, orgId: string, limit = 20): WebhookDelivery[] {
-    return this.deliveries.filter((d) => d.tenantId === tenantId && d.orgId === orgId).slice(0, limit);
+  /**
+   * Drop delivery rows older than `days`.
+   *
+   * The log grows with every event delivered to every endpoint, and nothing
+   * reads a month-old attempt. Called by the retention job.
+   */
+  async pruneDeliveries(tenantId: string, orgId: string, days = 30): Promise<number> {
+    const qe = await this.qe();
+    const ctx = sysCtx(tenantId, orgId);
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    let removed = 0;
+    // Delete in batches: `deleteMany` takes ids, and the set can be large.
+    for (;;) {
+      const page = await qe.list(ctx, DELIVERY, {
+        filters: [{ field: "at", op: "lt", value: cutoff }],
+        pageSize: MAX_PAGE_SIZE,
+      });
+      if (page.items.length === 0) return removed;
+      removed += await qe.removeMany(ctx, DELIVERY, page.items.map((r) => String(r.id)));
+    }
   }
 }
 
@@ -171,7 +320,7 @@ async function deliver(endpoint: WebhookEndpoint, event: DomainEvent): Promise<v
       },
       { attempts: 3, baseMs: 100 },
     );
-    webhookRegistry.recordDelivery({
+    await webhookRegistry.recordDelivery({
       endpointId: endpoint.id,
       tenantId: endpoint.tenantId,
       orgId: endpoint.orgId,
@@ -182,7 +331,7 @@ async function deliver(endpoint: WebhookEndpoint, event: DomainEvent): Promise<v
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    webhookRegistry.recordDelivery({
+    await webhookRegistry.recordDelivery({
       endpointId: endpoint.id,
       tenantId: endpoint.tenantId,
       orgId: endpoint.orgId,
@@ -216,6 +365,6 @@ export function registerWebhookDelivery(): void {
   if (registered) return;
   registered = true;
   eventBus.subscribe("*", async (event: DomainEvent) => {
-    for (const endpoint of webhookRegistry.matching(event)) await deliver(endpoint, event);
+    for (const endpoint of await webhookRegistry.matching(event)) await deliver(endpoint, event);
   });
 }

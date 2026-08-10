@@ -25,7 +25,7 @@ function ctx(roles: string[], grants?: string[]): RequestContext {
     correlationId: "test",
     at: new Date(0).toISOString(),
     isSystem: false,
-  } as RequestContext;
+  };
 }
 
 const CATALOG = {

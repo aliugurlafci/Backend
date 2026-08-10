@@ -41,7 +41,7 @@ export function assertGrantsDelegatable(rc: RequestContext, permissions: readonl
   const held = callerGrants(rc);
   const excess = permissions.filter((g) => !covers(held, g));
   if (excess.length) {
-    throw new ForbiddenError(`you cannot grant permissions you do not hold: ${excess.slice(0, 5).join(", ")}`);
+    throw new ForbiddenError(`you cannot grant permissions you do not hold: ${excess.slice(0, 5).join(", ")}`).withKey("err.grantExcess", { list: excess.slice(0, 5).join(", ") });
   }
 }
 
@@ -51,7 +51,7 @@ export async function assertScreensDelegatable(rc: RequestContext, screens: read
   const own = await callerScreens(rc);
   const excess = screens.filter((s) => !own.has(s));
   if (excess.length) {
-    throw new ForbiddenError(`you cannot grant screens you cannot open: ${excess.slice(0, 5).join(", ")}`);
+    throw new ForbiddenError(`you cannot grant screens you cannot open: ${excess.slice(0, 5).join(", ")}`).withKey("err.screenExcess", { list: excess.slice(0, 5).join(", ") });
   }
 }
 

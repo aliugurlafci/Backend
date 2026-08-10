@@ -15,3 +15,21 @@ export async function ensureDatabase(): Promise<void> {
 export async function closePool(): Promise<void> {
   await (await getDriver()).close();
 }
+
+/**
+ * Round-trip the pool so a health check reflects reality.
+ *
+ * `SELECT 1` is valid on both engines, needs no dialect support and touches no
+ * schema — it proves a connection can be acquired and a statement executed,
+ * which is exactly what a readiness probe should assert. Never throws: the
+ * caller turns the outcome into a status code.
+ */
+export async function pingDatabase(): Promise<"ok" | "error"> {
+  try {
+    const driver = await getDriver();
+    await driver.query("SELECT 1 AS ok", []);
+    return "ok";
+  } catch {
+    return "error";
+  }
+}

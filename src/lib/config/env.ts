@@ -40,6 +40,35 @@ const schema = z.object({
   PORT: intish(4000),
   CORS_ORIGINS: z.string().optional().default("http://localhost:3000"),
 
+  /**
+   * How many reverse proxies sit in front of this process.
+   *
+   * This is a security setting, not a convenience one. Express derives `req.ip`
+   * from `X-Forwarded-For`, and that header is written by the client — only the
+   * hops we actually trust may overwrite it. Saying "trust everything" makes
+   * `req.ip` whatever the caller types, which silently defeats every IP-based
+   * control we have (the login brute-force throttle above all: rotate one header
+   * and the counter never repeats a key).
+   *
+   * Set it to the number of proxies between the internet and this process — 1
+   * behind a single nginx/Traefik, 2 behind a CDN in front of that. A list of
+   * IPs/CIDRs is also accepted for a fixed ingress. The default trusts nothing,
+   * so `req.ip` is the socket address, which is correct for a direct listener
+   * and merely useless (not dangerous) behind an unconfigured proxy.
+   */
+  AULA_TRUST_PROXY: z.string().optional().default("0"),
+
+  /**
+   * Edge request cap per client IP per minute, across the whole API.
+   *
+   * Deliberately generous: this is a flood backstop, not fairness. An internal
+   * deployment usually reaches the server from ONE office NAT address, so every
+   * member of staff shares this budget — a tight number here locks out the whole
+   * company at the busiest moment, which is the opposite of the goal. Per-user
+   * fairness is the per-principal limiter's job, and it can see the user.
+   */
+  AULA_EDGE_RATE_LIMIT: intish(3000),
+
   // Which SQL engine the durable backend talks to: "mssql" (SQL Server, default)
   // or "mysql" (MySQL 8.0+ / MariaDB 10.2+). Ignored when AULA_PERSISTENCE=memory.
   DB_CLIENT: lowerEnum(["mssql", "mysql"] as const, "mssql"),
@@ -78,17 +107,41 @@ const schema = z.object({
   AULA_JWT_TTL: intish(3600),
   AULA_ENCRYPTION_KEY: z.string().optional(),
 
+  /**
+   * Currency new documents default to, and the one the ledger is kept in.
+   *
+   * Defaults to TRY. The previous USD default meant every invoice, order and
+   * receipt was created in a currency the company does not trade in — a `$` in
+   * front of a lira amount on every screen. Note the GL does NOT convert between
+   * currencies, so using a second one is a reporting problem until FX handling
+   * lands; this setting decides the one the books are in.
+   */
+  AULA_BASE_CURRENCY: z.enum(["TRY", "USD", "EUR", "GBP"]).default("TRY"),
+
   // Tenant identity: the scope stamped on every row (`tenantId` / `orgId`).
   // Single-tenant deployments keep the defaults; changing them after data
-  // exists requires re-scoping the existing rows (scripts/retenant.ts).
+  // exists requires re-scoping the existing rows (scripts/retenant.ts). The
+  // organisation name belongs to the deployment, not to the source — set it in
+  // .env before the first run.
   AULA_TENANT_ID: z.string().min(1).default("AULA-CRM"),
-  AULA_ORG_ID: z.string().min(1).default("Uğur Corp"),
+  AULA_ORG_ID: z.string().min(1).default("Default Org"),
+
+  // The organisation's working language. Texts the backend WRITES rather than
+  // answers with — notification rows, auto-created tasks, ops-alert titles —
+  // have no request locale to follow, so they follow this. Turkish by default:
+  // the platform ships for a Turkish company.
+  AULA_DEFAULT_LOCALE: z.enum(["en", "tr", "de"]).default("tr"),
 
   // Bootstrap administrator, created only when the database has no admin
   // position yet (see lib/security/auth-seed). Change the password from
   // Settings → Security after the first sign-in.
-  AULA_ADMIN_EMAIL: z.string().email().default("ali.ugur.lafci@gmail.com"),
-  AULA_ADMIN_PASSWORD: z.string().min(8).default("Aliugur1"),
+  //
+  // Deliberately has NO default password. A shipped default is a published
+  // credential: anyone who deploys without setting this gets an admin account
+  // whose password is readable in the repository. Outside production the dev
+  // fallback below applies (and is logged); production refuses to start.
+  AULA_ADMIN_EMAIL: z.string().email().default("admin@example.com"),
+  AULA_ADMIN_PASSWORD: z.string().min(8).optional(),
   AULA_ADMIN_NAME: z.string().min(1).default("Administrator"),
 
   // Persistence: "sql" (default, durable — the engine is picked by DB_CLIENT) or
@@ -156,6 +209,26 @@ function load(): Env {
         problems.push("MSSQL_PASSWORD must be set");
       }
     }
+    // The bootstrap admin is a real login with full authority. Omitting it used
+    // to fall back to a password committed to this repository.
+    if (!env.AULA_ADMIN_PASSWORD) {
+      problems.push("AULA_ADMIN_PASSWORD must be set (no default is provided)");
+    }
+    // TLS verification off by default is fine on a developer's box and wrong
+    // against a production database, where it defeats the point of encrypting.
+    if (env.AULA_PERSISTENCE !== "memory" && env.DB_CLIENT === "mssql" && env.MSSQL_TRUST_SERVER_CERTIFICATE) {
+      problems.push("MSSQL_TRUST_SERVER_CERTIFICATE must be false (it disables TLS verification)");
+    }
+    // `*` with credentials:true reflects whatever Origin the browser sends,
+    // which hands any site a session-authenticated cross-origin request.
+    if (env.CORS_ORIGINS.trim() === "*") {
+      problems.push("CORS_ORIGINS must list explicit origins, not '*' (credentials are enabled)");
+    }
+    // Running generated DDL against a production database on every boot is a
+    // deploy step masquerading as a startup default.
+    if (env.AULA_AUTO_MIGRATE) {
+      problems.push("AULA_AUTO_MIGRATE must be false; run `npm run migrate` as a deliberate deploy step");
+    }
     if (problems.length) {
       throw new Error(`Insecure production configuration: ${problems.join("; ")}`);
     }
@@ -169,7 +242,22 @@ export const env = load();
 /** The effective JWT secret (dev fallback used only outside production). */
 export const jwtSecret = env.AULA_JWT_SECRET ?? INSECURE_JWT;
 
+/**
+ * Password for the bootstrap administrator.
+ *
+ * There is no default in the schema on purpose — production refuses to start
+ * without one (see `load`). Outside production a well-known dev value is used so
+ * a fresh checkout still boots, and `ensureAdminSeed` announces it loudly on the
+ * one boot where it actually creates the account.
+ */
+export const INSECURE_ADMIN_PASSWORD = "dev-insecure-admin-change-me";
+export const adminPassword = env.AULA_ADMIN_PASSWORD ?? INSECURE_ADMIN_PASSWORD;
+export const adminPasswordIsInsecureDefault = !env.AULA_ADMIN_PASSWORD;
+
 export const isProduction = env.NODE_ENV === "production";
+
+/** The currency new documents are created in — see `AULA_BASE_CURRENCY`. */
+export const BASE_CURRENCY = env.AULA_BASE_CURRENCY;
 
 /**
  * The tenant scope every record is written under. Multi-tenancy is enforced
@@ -179,6 +267,27 @@ export const isProduction = env.NODE_ENV === "production";
  */
 export const TENANT_ID = env.AULA_TENANT_ID;
 export const ORG_ID = env.AULA_ORG_ID;
+
+/**
+ * Express `trust proxy` value, parsed from `AULA_TRUST_PROXY`.
+ *
+ * Returns a hop count for a number, a CIDR/IP list for a comma-separated value,
+ * and `false` for anything falsy. `true` is accepted but is the one value worth
+ * arguing about: it trusts every hop, which means the leftmost `X-Forwarded-For`
+ * entry wins and that entry is written by the caller. Configure the real hop
+ * count instead — the point of this setting is to know where the address stops
+ * being forgeable.
+ */
+export const trustProxy: boolean | number | string[] = (() => {
+  const raw = env.AULA_TRUST_PROXY.trim();
+  if (!raw || ["0", "false", "no", "off"].includes(raw.toLowerCase())) return false;
+  if (["true", "yes", "on"].includes(raw.toLowerCase())) return true;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+})();
+
+/** Requests per minute per client IP at the edge — see `AULA_EDGE_RATE_LIMIT`. */
+export const EDGE_RATE_LIMIT = env.AULA_EDGE_RATE_LIMIT;
 
 /** Allowed CORS origins (parsed from the comma-separated env var). */
 export const corsOrigins: string | string[] =

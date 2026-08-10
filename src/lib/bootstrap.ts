@@ -16,6 +16,8 @@ import { registerAccountingPostings } from "@/lib/accounting/postings";
 import { seedFeatureFlags } from "@/lib/config/feature-flags";
 import { eventBus, type DomainEvent } from "@/lib/workflow/event-bus";
 import { deleteBlob } from "@/lib/integrations/file-storage";
+import { logger } from "@/lib/observability/logger";
+import { loadRevocations } from "@/lib/security/revocation";
 
 let booted = false;
 
@@ -40,10 +42,51 @@ export function ensurePlatform(): void {
   registerFileCleanup();
 }
 
-/** Register subscribers and rebuild the search index from the repository. */
+/**
+ * Register subscribers, then start the search reindex in the background.
+ *
+ * The reindex is deliberately NOT awaited. Search is a convenience over data the
+ * database already serves, so blocking the listener on it made startup time a
+ * function of table size and turned a slow index into an outage. Subscribers are
+ * registered first, so any record written while the rebuild runs is still
+ * indexed incrementally.
+ *
+ * Until it finishes, `/search` returns fewer results — never wrong ones.
+ */
 export async function bootstrapPlatform(): Promise<void> {
   ensurePlatform();
-  await reindexAll();
+
+  // Custom fields, before anything reads the data model.
+  //
+  // Awaited and ordered first: the model has to include them before the search
+  // indexer, the automation engine or the first request looks at an entity. A
+  // field that appears half a second late is a column the API says does not
+  // exist.
+  try {
+    const { applyCustomFields } = await import("@/lib/metadata/custom-fields");
+    const { systemContext } = await import("@/lib/context/resolver");
+    const { TENANT_ID, ORG_ID } = await import("@/lib/config/env");
+    await applyCustomFields(systemContext(TENANT_ID, ORG_ID));
+  } catch (error) {
+    // Non-fatal. A system that will not start because a customisation could not
+    // be applied is worse than one that starts with the built-in model — and the
+    // built-in model is what every existing record already conforms to.
+    logger.warn("custom fields could not be applied; continuing with the built-in model", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // Awaited, unlike the search reindex below. An empty denylist means every
+  // revoked token is accepted again, so serving requests before it is loaded
+  // would make a restart a way to undo a sign-out.
+  await loadRevocations();
+
+  void reindexAll().catch((error) => {
+    logger.warn("search reindex failed; search will fill in from live writes", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+
   // Seed demo automations once (idempotent — only when the demo tenant is empty).
   try {
     await seedAutomations();

@@ -1,3 +1,4 @@
+import { BASE_CURRENCY } from "@/lib/config/env";
 /**
  * Point-of-sale service — orchestrates an over-the-counter sale on top of the
  * existing finance/accounting/inventory machinery so POS reuses (not duplicates)
@@ -27,7 +28,17 @@ export interface PosLine {
   description?: string;
   qty: number;
   unitPrice: number;
+  /** Discount rung up at the till. Requires `pos:discount` — checked at the route. */
+  discountRate?: number;
+  discountAmount?: number;
   taxRate: number;
+  /**
+   * The unit the quantity is in — a case, a six-pack.
+   *
+   * Set when the cashier scanned a pack barcode rather than the item's own. Null
+   * means the base unit, which is every sale rung up before pack codes existed.
+   */
+  uomId?: string | null;
 }
 export interface PosPayment {
   method: string;
@@ -40,6 +51,9 @@ export interface PosCheckoutInput {
   accountId?: string | null;
   sessionId?: string | null;
   currencyCode?: string;
+  /** Basket-level discount, apportioned across the lines. */
+  discountRate?: number;
+  discountAmount?: number;
   lines: PosLine[];
   payments: PosPayment[];
   /** Client-supplied dedupe token: a double-submit (same key) returns the first
@@ -57,6 +71,22 @@ export interface PosCheckoutResult {
   total: number;
   paid: number;
   change: number;
+}
+
+/** A scan resolved to a product and to what one of that code actually is. */
+export interface ScanResult {
+  product: EntityRecord;
+  /**
+   * The unit one scan represents — a case, a six-pack — or null for the base
+   * unit. Handed to the caller rather than converted here: the till puts it on
+   * the LINE, and `replaceLines` is the single place that converts a line's unit
+   * into base units for the ledger.
+   */
+  uomId: string | null;
+  /** How many of that unit one scan is. One, until a code means "a dozen of". */
+  qty: number;
+  /** The alias row that matched, when it was not the primary barcode. */
+  barcode?: EntityRecord;
 }
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
@@ -102,12 +132,52 @@ export class PosService {
   /** Resolve a product by barcode (matching every equivalent symbology form of
    *  the scan — UPC-A/EAN-13/UPC-E), then by SKU. Returns null if not found. */
   async lookup(ctx: RequestContext, code: string): Promise<EntityRecord | null> {
+    return (await this.scan(ctx, code))?.product ?? null;
+  }
+
+  /**
+   * Resolve a scan to a product AND what one scan of that code means.
+   *
+   * A product has more than one barcode: the bottle, the six-pack and the case
+   * each carry their own, and they are not the same quantity. Returning only the
+   * product loses that — the case gets rung up as one bottle, and the shelf and
+   * the ledger part company by eleven.
+   *
+   * Order matters. The product's primary barcode is tried first because it is
+   * what every existing row carries and what the label designer prints; the
+   * alias table is searched after it, and the SKU last.
+   */
+  async scan(ctx: RequestContext, code: string): Promise<ScanResult | null> {
     const candidates = barcodeCandidates(code);
     if (!candidates.length) return null;
-    const byBarcode = await this.qe.list(ctx, "product", { filters: [{ field: "barcode", op: "in", value: candidates }], pageSize: 1 });
-    if (byBarcode.items[0]) return byBarcode.items[0];
-    const bySku = await this.qe.list(ctx, "product", { filters: [{ field: "sku", op: "eq", value: candidates[0] }], pageSize: 1 });
-    return bySku.items[0] ?? null;
+
+    const byBarcode = await this.qe.list(ctx, "product", {
+      filters: [{ field: "barcode", op: "in", value: candidates }],
+      pageSize: 1,
+    });
+    // The primary barcode is always one base unit — that is what it has always
+    // meant, and re-interpreting it now would change the quantity of every scan
+    // already in use.
+    if (byBarcode.items[0]) return { product: byBarcode.items[0], uomId: null, qty: 1 };
+
+    const alias = await this.qe.list(ctx, "productBarcode", {
+      filters: [{ field: "code", op: "in", value: candidates }],
+      pageSize: 1,
+    });
+    const hit = alias.items[0];
+    if (hit) {
+      const product = await this.qe.get(ctx, "product", String(hit.productId)).catch(() => null);
+      // A barcode whose product has been deleted is a dangling row, not a match.
+      // Falling through to the SKU search is better than returning half an
+      // answer the till would then try to price.
+      if (product) return { product, uomId: hit.uomId ? String(hit.uomId) : null, qty: 1, barcode: hit };
+    }
+
+    const bySku = await this.qe.list(ctx, "product", {
+      filters: [{ field: "sku", op: "eq", value: candidates[0] ?? "" }],
+      pageSize: 1,
+    });
+    return bySku.items[0] ? { product: bySku.items[0], uomId: null, qty: 1 } : null;
   }
 
   private async defaultAccountId(ctx: RequestContext): Promise<string | null> {
@@ -131,22 +201,45 @@ export class PosService {
 
     return this.qe.runInTransaction(async () => {
       const invoice = await this.finance.createDocument(sys, "invoice", "INV", {
+        // Which shift rang this. Without it a session's sales, tax and voids
+        // cannot be reported at all — the till could only ever say how much
+        // cash it held.
+        sessionId: input.sessionId ?? null,
         accountId,
         branchId: input.branchId ?? null,
         dealerId: input.dealerId ?? null,
         warehouseId: input.warehouseId ?? null,
-        currencyCode: input.currencyCode ?? "USD",
+        currencyCode: input.currencyCode ?? BASE_CURRENCY,
         issueDate,
         dueDate: issueDate,
         status: "draft",
+        // A basket-level discount, apportioned across the lines when totals are
+        // computed — see `finance/totals`.
+        discountRate: input.discountRate ?? 0,
+        discountAmount: input.discountAmount ?? 0,
         notes: input.sessionId ? `POS sale · session ${input.sessionId}` : "POS sale",
       });
 
+      // Prices come from the terminal, which already resolved them through
+      // `/pricing/resolve` when the item was scanned. They are NOT re-resolved
+      // here: the customer was shown a price and agreed to it, and silently
+      // charging a different one because a list changed mid-basket is the one
+      // outcome a till must never produce.
       const lineInputs: LineInput[] = input.lines.map((l) => ({
         productId: l.productId ?? null,
         description: l.description ?? "",
         qty: l.qty,
+        // The unit reaches the LINE, and `replaceLines` converts it to base
+        // units for the ledger — the single place that conversion happens.
+        // Dropping it here is how one scanned case would leave the shelf as one
+        // bottle.
+        uomId: l.uomId ?? null,
         unitPrice: l.unitPrice,
+        // Carried through, not dropped. A discount the cashier applied and the
+        // customer was told about has to reach the document, or the receipt and
+        // the invoice disagree about what was charged.
+        discountRate: l.discountRate ?? 0,
+        discountAmount: l.discountAmount ?? 0,
         taxRate: l.taxRate,
       }));
       await this.finance.replaceLines(sys, "invoice", "invoiceLine", "invoiceId", invoice.id, lineInputs);
@@ -183,7 +276,14 @@ export class PosService {
         if (p.amount <= 0 || remaining <= 0) continue;
         const applied = round2(Math.min(p.amount, remaining));
         if (applied <= 0) continue;
-        await this.finance.applyPayment(sys, invoice.id, { amount: applied, method: p.method, paidAt: issueDate });
+        await this.finance.applyPayment(sys, invoice.id, {
+          amount: applied,
+          method: p.method,
+          paidAt: issueDate,
+          // The shift that took the money, so the report can split takings by
+          // method rather than into "cash" and "everything else".
+          sessionId: input.sessionId ?? null,
+        });
         paid = round2(paid + applied);
         remaining = round2(remaining - applied);
       }

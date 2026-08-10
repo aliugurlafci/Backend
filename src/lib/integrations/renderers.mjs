@@ -7,8 +7,41 @@
  * the worker pool is disabled. Keeping it framework-free (and .mjs, not .ts) lets
  * the worker load it natively without a TypeScript loader.
  */
+import { existsSync } from "node:fs";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
+
+// ── fonts ────────────────────────────────────────────────────────────────────
+//
+// pdfkit's built-in Helvetica is WinAnsi-encoded: no ğ, ş, ı, İ. Turkish
+// product names (and now Turkish headers) render as garbage without a Unicode
+// face, so we embed the first system TTF we can find. Helvetica remains the
+// last resort — a PDF with mangled diacritics still beats no PDF.
+const FONT_CANDIDATES = [
+  "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", // macOS
+  "/Library/Fonts/Arial Unicode.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian/Ubuntu (Docker)
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  "/usr/share/fonts/dejavu/DejaVuSans.ttf", // Fedora/Alpine (fontconfig layouts)
+];
+const UNICODE_FONT = FONT_CANDIDATES.find((p) => existsSync(p)) ?? null;
+const BOLD_CANDIDATES = [
+  "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+];
+const UNICODE_FONT_BOLD = BOLD_CANDIDATES.find((p) => existsSync(p)) ?? UNICODE_FONT;
+
+function bodyFont(doc) {
+  if (UNICODE_FONT) doc.font(UNICODE_FONT);
+  else doc.font("Helvetica");
+  return doc;
+}
+
+function boldFont(doc) {
+  if (UNICODE_FONT_BOLD) doc.font(UNICODE_FONT_BOLD);
+  else doc.font("Helvetica-Bold");
+  return doc;
+}
 
 // ── entity export: xlsx ──────────────────────────────────────────────────────
 
@@ -28,7 +61,7 @@ export async function renderEntityXlsx({ sheetName, columns, rows }) {
 // ── entity export: pdf ───────────────────────────────────────────────────────
 
 /** Build a landscape table PDF from column labels + display-string rows. */
-export async function renderEntityPdf({ title, count, dateStr, cols, rows }) {
+export async function renderEntityPdf({ title, count, dateStr, metaLabel, emptyLabel, cols, rows }) {
   return await new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 36 });
     const chunks = [];
@@ -43,17 +76,17 @@ export async function renderEntityPdf({ title, count, dateStr, cols, rows }) {
     const rowH = 16;
     let y = doc.page.margins.top;
 
-    doc.fontSize(16).fillColor("#111").text(title, left, y);
+    bodyFont(doc).fontSize(16).fillColor("#111").text(title, left, y);
     y = doc.y + 2;
-    doc.fontSize(8).fillColor("#666").text(`${count} records · ${dateStr}`, left, y);
+    doc.fontSize(8).fillColor("#666").text(metaLabel ?? `${count} records · ${dateStr}`, left, y);
     y = doc.y + 8;
 
     const drawHeader = () => {
-      doc.fontSize(8).fillColor("#333").font("Helvetica-Bold");
+      boldFont(doc).fontSize(8).fillColor("#333");
       cols.forEach((c, i) => doc.text(c.label, left + i * colW + 2, y, { width: colW - 4, ellipsis: true }));
       y += rowH;
       doc.moveTo(left, y - 4).lineTo(left + usableWidth, y - 4).strokeColor("#cccccc").lineWidth(0.5).stroke();
-      doc.font("Helvetica").fillColor("#000");
+      bodyFont(doc).fillColor("#000");
     };
 
     drawHeader();
@@ -75,7 +108,7 @@ export async function renderEntityPdf({ title, count, dateStr, cols, rows }) {
       y += rowH;
     }
     if (rows.length === 0) {
-      doc.fontSize(9).fillColor("#888").text("No records.", left, y + 4);
+      doc.fontSize(9).fillColor("#888").text(emptyLabel ?? "No records.", left, y + 4);
     }
 
     doc.end();

@@ -97,15 +97,16 @@ export async function resolveMobileConfig(rc: RequestContext, clientId = "*"): P
   const client = str(clientId) || "*";
   const domain = await getDomainService();
   const sys = systemContext(rc.tenantId, rc.orgId);
-  const rows = await domain.list(sys, "mobileScreenConfig", {
+  // Must be complete: the most specific matching row wins, so a config row past
+  // a page boundary would silently lose to a broader one.
+  const rows = await domain.listComplete(sys, "mobileScreenConfig", {
     filters: [{ field: "active", op: "eq", value: true }],
-    pageSize: 500,
   });
 
   // Pick the most specific applicable row (highest score, newest on a tie).
   let best: EntityRecord | null = null;
   let bestScore = -1;
-  for (const row of rows.items) {
+  for (const row of rows) {
     const s = score(row, rc, client);
     if (s === null) continue;
     if (s > bestScore || (s === bestScore && str(row.updatedAt) > str(best?.updatedAt))) {

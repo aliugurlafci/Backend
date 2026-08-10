@@ -22,7 +22,7 @@ import type { EntityDef } from "@/lib/metadata/types";
 import { metadata } from "@/lib/metadata";
 import { systemClock } from "@/lib/core/clock";
 import { logger } from "@/lib/observability/logger";
-import { getDriver, type SqlDriver } from "./driver";
+import { delay, getDriver, MAX_DEADLOCK_RETRIES, retryBackoff, type SqlDriver } from "./driver";
 import { getDialect, type SqlDialect } from "./dialect";
 import { entityColumns } from "./schema-map";
 import { T } from "./types";
@@ -40,7 +40,15 @@ import {
 // nullable fields are applied automatically by the reconcile without a bump.
 // v3: currency columns DECIMAL(18,2) + foreign-key constraints.
 // v4: `mobileScreenConfig` entity (mobile screen-visibility layer).
-const SCHEMA_VERSION = 4;
+// v5: `stockBalance` (maintained on-hand + value, with a unique index on
+//     stockKey) and `journalLine.entryDate`. The bump is for the unique index —
+//     the reconcile adds new tables and nullable columns, but not indexes on an
+//     existing one — and it also marks a behavioural break: costing moved from
+//     `product.costPrice` to a perpetual moving average, so historical stock
+//     values written under the old scheme are not comparable and cannot be
+//     migrated. Rebuild the database rather than backfill; see the note in
+//     lib/inventory/costing.
+const SCHEMA_VERSION = 5;
 
 /** Run `fn` over `items` with at most `concurrency` in flight. Rejects on first error. */
 async function mapPool<T>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<void>): Promise<void> {
@@ -48,8 +56,12 @@ async function mapPool<T>(items: T[], concurrency: number, fn: (item: T, index: 
   const worker = async (): Promise<void> => {
     for (;;) {
       const i = cursor++;
-      if (i >= items.length) return;
-      await fn(items[i], i);
+      // Reading the item IS the bounds check. `i >= items.length` told the
+      // human but not the compiler, which cannot carry a comparison on `i`
+      // across the increment that produced it.
+      const item = items[i];
+      if (item === undefined) return;
+      await fn(item, i);
     }
   };
   const lanes = Math.max(1, Math.min(concurrency, items.length));
@@ -61,13 +73,31 @@ function ddlConcurrency(driver: SqlDriver): number {
   return Math.max(2, (driver.poolMax || 8) - 1);
 }
 
-/** Execute a DDL statement, swallowing "already exists" (idempotent re-run). */
+/**
+ * Execute a DDL statement, swallowing "already exists" (idempotent re-run) and
+ * retrying a deadlock.
+ *
+ * Provisioning runs several statements at once, and concurrent DDL contends on
+ * the engine's data dictionary — MySQL will pick one as a deadlock victim. That
+ * is transient and the statement is idempotent, so retrying is correct; letting
+ * it escape aborted the whole boot and made a schema-version bump a coin flip.
+ *
+ * The DML path already treats deadlocks this way (`MAX_DEADLOCK_RETRIES` in the
+ * drivers); this brings DDL in line.
+ */
 async function execTolerant(driver: SqlDriver, stmt: string): Promise<void> {
-  try {
-    await driver.exec(stmt);
-  } catch (e) {
-    if (driver.isAlreadyExists(e)) return;
-    throw e;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await driver.exec(stmt);
+      return;
+    } catch (e) {
+      if (driver.isAlreadyExists(e)) return;
+      if (driver.isDeadlock(e) && attempt < MAX_DEADLOCK_RETRIES) {
+        await delay(retryBackoff(attempt));
+        continue;
+      }
+      throw e;
+    }
   }
 }
 
@@ -132,7 +162,10 @@ async function provisionForeignKeys(
   let ok = 0;
   await mapPool(fkStatements, concurrency, async (stmt) => {
     try {
-      await driver.exec(stmt);
+      // Through `execTolerant`, so a deadlock from concurrent ALTERs is retried
+      // rather than logged as "skipped" — a skipped FK is a missing referential
+      // guarantee that nothing afterwards mentions again.
+      await execTolerant(driver, stmt);
       ok++;
     } catch (e) {
       if (driver.isAlreadyExists(e)) {

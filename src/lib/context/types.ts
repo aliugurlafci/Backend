@@ -1,53 +1,10 @@
 /**
- * Phase 4 — Multi-tenant request context contract.
+ * Re-export. The definition lives in `packages/contracts`, shared with the other
+ * application.
  *
- * Every operation in the platform is performed *as* a context. It carries the
- * tenant/org scope used for isolation, the authenticated principal and its
- * roles (for permissions), locale, resolved feature flags and a correlation id
- * for tracing.
+ * The copy that used to sit in the web app was missing `positionId` and
+ * `grants`, which is why its permission engine could not tell an explicit grant
+ * set from a role set — a stale type quietly narrowing what the code below it
+ * could even express.
  */
-
-export interface Principal {
-  userId: string;
-  displayName: string;
-  email: string;
-  roles: string[];
-  /** The user's position (drives screen access); absent for dev personas. */
-  positionId?: string;
-  /**
-   * Explicit operation grants from the position's permission matrix. When set
-   * (authoritative), these replace the role's default grants; when undefined the
-   * engine falls back to the base role's defaults. Resolved at login.
-   */
-  grants?: string[];
-}
-
-export interface RequestContext {
-  readonly tenantId: string;
-  readonly orgId: string;
-  readonly userId: string;
-  readonly displayName: string;
-  readonly email: string;
-  readonly roles: readonly string[];
-  /** The caller's position id (screen access); absent for dev/system actors. */
-  readonly positionId?: string;
-  /**
-   * Explicit operation grants (from the position's permission matrix). When
-   * present they are authoritative; when undefined the permission engine falls
-   * back to the base role's default grants.
-   */
-  readonly grants?: readonly string[];
-  readonly locale: string;
-  readonly featureFlags: Readonly<Record<string, boolean>>;
-  readonly correlationId: string;
-  /** Request timestamp (ISO), single source of truth for audit records. */
-  readonly at: string;
-  /** True for internal/system actors (workflows, migrations) that bypass auth. */
-  readonly isSystem: boolean;
-}
-
-/** Tenant scope extracted from a context — the unit of data isolation. */
-export interface TenantScope {
-  tenantId: string;
-  orgId: string;
-}
+export * from "@aula/contracts/context/types";

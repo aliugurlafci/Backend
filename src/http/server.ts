@@ -10,24 +10,58 @@ import helmet from "helmet";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 
-import { corsOrigins } from "@/lib/config/env";
+import { corsOrigins, trustProxy } from "@/lib/config/env";
 import { CSRF_COOKIE, issueCsrfToken } from "@/lib/security/csrf";
 import { toAppError } from "@/lib/enforcement/errors";
 import { API_VERSION, setApiHeaders } from "@/lib/http/handler";
 import { resilience } from "@/lib/http/resilience";
+import { edgeRateLimit, logEdgeRateLimitPolicy } from "@/lib/security/edge-rate-limit";
 import { buildApiRouter } from "./api";
 
 export function createApp(): express.Express {
   const app = express();
 
   app.disable("x-powered-by");
-  app.set("trust proxy", true);
+  // Configured, not hardcoded to `true`. Trusting every hop makes `req.ip` the
+  // leftmost X-Forwarded-For entry, and the client writes that header — which
+  // silently turns every IP-based control (the login throttle, the edge limiter
+  // below) into a counter the caller can reset at will. See AULA_TRUST_PROXY.
+  app.set("trust proxy", trustProxy);
 
   app.use(
     helmet({
       frameguard: { action: "deny" },
       referrerPolicy: { policy: "strict-origin-when-cross-origin" },
       crossOriginResourcePolicy: { policy: "cross-origin" },
+      /**
+       * An API policy, not a web-app one.
+       *
+       * Helmet's default is written for a page that serves its own HTML: it
+       * permits `script-src 'self'`, inline styles, images and fonts, and
+       * `frame-ancestors 'self'` — which quietly contradicts the `DENY` above.
+       * This service returns JSON and file bytes and never a document that needs
+       * to load anything, so `'none'` is both correct and the strongest setting
+       * available.
+       *
+       * It matters most for the one thing here that IS attacker-influenced:
+       * uploaded files. Their content type is already checked against a
+       * blocklist and anything not known-safe is forced to download as an
+       * attachment — but if something ever renders in a browsing context anyway,
+       * `default-src 'none'` means it can load nothing, call nowhere, and run no
+       * inline script (script-src falls back to default-src). Defence in depth
+       * behind a control that already exists, which is where it belongs.
+       */
+      contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+          "default-src": ["'none'"],
+          // Repeated explicitly rather than left to default-src: these three do
+          // not fall back to it, so omitting them leaves them unrestricted.
+          "frame-ancestors": ["'none'"],
+          "base-uri": ["'none'"],
+          "form-action": ["'none'"],
+        },
+      },
     }),
   );
 
@@ -57,6 +91,27 @@ export function createApp(): express.Express {
   // requests don't even pay the JSON-parse cost, but after CORS so the browser
   // can still read the 503.
   app.use(resilience());
+
+  // Edge cap per client IP. Ahead of body parsing and of the router, so an
+  // unauthenticated flood is rejected on the way in — `runApi`'s per-principal
+  // limiter never saw those requests, because authentication throws first.
+  app.use(edgeRateLimit());
+  logEdgeRateLimitPolicy(trustProxy);
+
+  /**
+   * SAP PI/PO posts raw XML or JSON to the ERP inbound endpoint.
+   *
+   * Mounted BEFORE `express.json` and scoped to that one path, because the JSON
+   * parser would consume a JSON-typed body and hand on a parsed object — and
+   * this endpoint needs the bytes: the codec detects the encoding from the body
+   * rather than trusting a content-type PI/PO sets from channel configuration,
+   * and the message is stored verbatim because when the two systems disagree
+   * about what was sent, a re-serialised copy is not evidence.
+   *
+   * `type: () => true` accepts whatever content-type arrives, for the same
+   * reason.
+   */
+  app.use("/api/v1/erp/inbound", express.text({ type: () => true, limit: "10mb" }));
 
   // 25mb so spreadsheet imports (a base64 .xlsx in the JSON body) aren't rejected.
   app.use(express.json({ limit: "25mb" }));

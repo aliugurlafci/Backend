@@ -27,7 +27,9 @@ function pickLocale(headers: Headers): string {
   const explicit = headers.get("x-locale");
   if (explicit) return explicit;
   const accept = headers.get("accept-language");
-  if (accept) return accept.split(",")[0].trim().split("-")[0] || "en";
+  // "tr-TR,tr;q=0.9" -> "tr". Any part failing to parse falls back to English
+  // rather than to an empty locale, which no message catalogue answers to.
+  if (accept) return accept.split(",")[0]?.trim().split("-")[0] || "en";
   return "en";
 }
 
@@ -51,6 +53,10 @@ export function resolveContext(headers: Headers): RequestContext {
     roles: Object.freeze([...principal.roles]),
     positionId: principal.positionId,
     grants: principal.grants ? Object.freeze([...principal.grants]) : undefined,
+    // Carried through so `assertTokenActive` can check revocation without
+    // re-parsing the token it came from.
+    jti: principal.jti,
+    tokenEpoch: principal.tokenEpoch,
     locale: pickLocale(headers),
     featureFlags: Object.freeze(configStore.featureFlags(scopeKeys)),
     correlationId: headers.get("x-correlation-id") ?? newCorrelationId(),

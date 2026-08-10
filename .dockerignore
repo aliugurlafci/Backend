@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log*
+.git
+.gitignore
+# Never bake real credentials into an image — configuration comes from the
+# environment at run time.
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
+coverage
+*.md
+.claude

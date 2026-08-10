@@ -62,6 +62,33 @@ export const mssqlDialect: SqlDialect = {
   existsSelect(fromWhere) {
     return `SELECT TOP 1 1 AS x ${fromWhere}`;
   },
+  lockingSelect(selectList, table, whereClause) {
+    // UPDLOCK: take an update lock now rather than upgrading a shared lock later
+    // (which deadlocks when two transactions do it at once).
+    // ROWLOCK: keep the granularity at the row so unrelated keys don't serialise.
+    // HOLDLOCK: hold to end of transaction AND range-lock the key — without it a
+    // *missing* row is not locked, so two transactions both see "no balance yet"
+    // and both insert. This is the same reason `NumberSequence` uses
+    // `MERGE … WITH (HOLDLOCK)`.
+    return `SELECT ${selectList} FROM ${table} WITH (UPDLOCK, ROWLOCK, HOLDLOCK) WHERE ${whereClause}`;
+  },
+  dateBucketExpr(colExpr, bucket) {
+    switch (bucket) {
+      case "year":
+        return `LEFT(${colExpr}, 4)`;
+      case "month":
+        return `LEFT(${colExpr}, 7)`;
+      case "day":
+        return `LEFT(${colExpr}, 10)`;
+      case "quarter":
+        // "2026-08-…" → "2026" + "-Q" + ceil(08 / 3) = "2026-Q3".
+        // (month + 2) / 3 under integer division is the ceiling of month/3.
+        return `(LEFT(${colExpr}, 4) + '-Q' + CAST((CAST(SUBSTRING(${colExpr}, 6, 2) AS INT) + 2) / 3 AS VARCHAR(1)))`;
+    }
+  },
+  countDistinctExpr(colExpr) {
+    return `COUNT(DISTINCT ${colExpr})`;
+  },
 
   returningId(idColumn) {
     return `OUTPUT INSERTED.${this.id(idColumn)} AS ${this.id(idColumn)}`;

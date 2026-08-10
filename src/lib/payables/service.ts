@@ -59,12 +59,12 @@ export class PayablesService {
   }
 
   async listBillPayments(ctx: RequestContext, billId: string): Promise<EntityRecord[]> {
-    const page = await this.qe.list(ctx, "billPayment", {
+    // The bill's paid total is derived from these, so a page would misstate the
+    // balance rather than merely shorten a list.
+    return this.qe.listComplete(ctx, "billPayment", {
       filters: [{ field: "billId", op: "eq", value: billId }],
       sort: [{ field: "paidAt", dir: "asc" }],
-      pageSize: 200,
     });
-    return page.items;
   }
 
   /** Pay a bill: record payment, post AP/Cash, recompute — atomically, no overpay. */
@@ -77,7 +77,7 @@ export class PayablesService {
     );
     const balance = round2(Number(bill.total ?? 0) - already);
     if (input.amount > balance + 0.005) {
-      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`);
+      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`).withKey("err.paymentExceedsBalance", { amount: round2(input.amount), balance });
     }
     return this.qe.runInTransaction(async () => {
       const number = await this.seq.next(ctx.tenantId, "BPAY");

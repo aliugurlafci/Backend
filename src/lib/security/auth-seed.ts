@@ -13,7 +13,7 @@
  */
 import { metadata } from "@/lib/metadata";
 import { screenCatalog } from "@/lib/config/screens";
-import { env, ORG_ID, TENANT_ID } from "@/lib/config/env";
+import { adminPassword, adminPasswordIsInsecureDefault, env, ORG_ID, TENANT_ID } from "@/lib/config/env";
 import type { Repository } from "@/lib/data/repository";
 import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import { logger } from "@/lib/observability/logger";
@@ -22,7 +22,7 @@ import { hashPassword } from "./crypto";
 const T0 = "2026-01-15T09:00:00.000Z";
 export const ADMIN_EMAIL = env.AULA_ADMIN_EMAIL;
 export const ADMIN_NAME = env.AULA_ADMIN_NAME;
-const ADMIN_PASSWORD = env.AULA_ADMIN_PASSWORD;
+const ADMIN_PASSWORD = adminPassword;
 
 function rec(id: string, fields: Record<string, FieldValue>): EntityRecord {
   return {
@@ -67,4 +67,13 @@ export async function ensureAdminSeed(repo: Repository): Promise<void> {
     }),
   );
   logger.info("admin seed complete", { email: ADMIN_EMAIL });
+  if (adminPasswordIsInsecureDefault) {
+    // Only reachable outside production — `load()` refuses to start otherwise.
+    // Say it plainly on the one boot that creates the account, rather than
+    // leaving a well-known password in place unnoticed.
+    logger.warn(
+      "administrator created with the INSECURE DEV PASSWORD — set AULA_ADMIN_PASSWORD, or change it from Settings → Security",
+      { email: ADMIN_EMAIL },
+    );
+  }
 }

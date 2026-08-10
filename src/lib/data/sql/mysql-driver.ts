@@ -74,6 +74,12 @@ function isAlreadyExistsError(err: unknown): boolean {
   return n === 1050 || n === 1060 || n === 1061 || n === 1826 || n === 1022;
 }
 
+/** MySQL unique violations: 1062 duplicate entry, 1169 duplicate on unique index. */
+function isUniqueViolationError(err: unknown): boolean {
+  const n = (err as { errno?: number })?.errno;
+  return n === 1062 || n === 1169;
+}
+
 /** Coerce an abstract-typed value to what mysql2 expects on the wire. */
 function coerce(p: BoundParam): unknown {
   if (p.value === undefined || p.value === null) return null;
@@ -159,4 +165,6 @@ export const mysqlDriver: SqlDriver = {
 
   isDeadlock: isDeadlockError,
   isAlreadyExists: isAlreadyExistsError,
+  isUniqueViolation: isUniqueViolationError,
+  inTransaction: () => activeConn.getStore() !== undefined,
 };

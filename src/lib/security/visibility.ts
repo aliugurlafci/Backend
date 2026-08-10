@@ -29,17 +29,21 @@ export function isAdmin(rc: RequestContext): boolean {
   return rc.roles.includes("admin") || rc.isSystem;
 }
 
-/** Every user row in the tenant (system-scoped — visibility is applied on top). */
+/**
+ * Every user row in the tenant (system-scoped — visibility is applied on top).
+ *
+ * Must be complete: the creation subtree is walked over this set, so a missing
+ * row silently hides everyone beneath it. The old `pageSize: 1000` was clamped
+ * to MAX_PAGE_SIZE, so any tenant past 200 users computed the wrong subtree.
+ */
 async function allUsers(): Promise<EntityRecord[]> {
   const qe = await getQueryEngine();
-  const page = await qe.list(sys(), "user", { pageSize: 1000 });
-  return page.items;
+  return qe.listComplete(sys(), "user");
 }
 
 async function allPositions(): Promise<EntityRecord[]> {
   const qe = await getQueryEngine();
-  const page = await qe.list(sys(), "position", { pageSize: 500 });
-  return page.items;
+  return qe.listComplete(sys(), "position");
 }
 
 /** Position ids whose role is `admin` — the ones non-admins may never see. */

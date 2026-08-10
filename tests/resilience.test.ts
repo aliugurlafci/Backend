@@ -31,9 +31,9 @@ function mkRes(): MockRes {
   const res = {
     headersSent: false,
     statusCode: 0,
-    body: null as unknown,
-    headers: {} as Record<string, string>,
-    listeners: {} as Record<string, () => void>,
+    body: null,
+    headers: {},
+    listeners: {},
   } as MockRes;
   res.setHeader = (k, v) => {
     res.headers[k] = v;

@@ -8,19 +8,20 @@
  */
 import { newId } from "@/lib/core/ids";
 import { BadRequestError, ConflictError, assertAllowed } from "@/lib/enforcement";
-import { scopeOf } from "@/lib/context/isolation";
 import { systemContext } from "@/lib/context/resolver";
 import type { RequestContext } from "@/lib/context/types";
 import type { MetadataResolver } from "@/lib/metadata/resolver";
 import type { EntityRecord, FieldValue } from "@/lib/metadata/types";
 import type { PermissionEngine } from "@/lib/permissions/engine";
 import { numberSequence } from "@/lib/finance/number-sequence";
-import type { QueryEngine } from "@/lib/data/query-engine";
-import type { AggregateQuery, AggregateRow, Query, Page } from "@/lib/data/query";
+import { cache } from "@/lib/cache/cache";
+import { headcountsKey } from "@/lib/cache/invalidation";
+import type { ListOptions, QueryEngine } from "@/lib/data/query-engine";
+import type { AggregateQuery, AggregateRow, CursorPage, Query, Page } from "@/lib/data/query";
 import { type DomainEvent, type EventBus } from "@/lib/workflow/event-bus";
 import { IdempotencyStore } from "@/lib/workflow/idempotency";
 import { Outbox } from "@/lib/workflow/outbox";
-import { AuditLog } from "./audit";
+import { AuditLog, type AuditEntry, type AuditInput } from "./audit";
 import { StateMachine } from "./state-machine";
 import { runGuards } from "./invariants";
 
@@ -37,12 +38,47 @@ export class DomainService {
     private readonly bus: EventBus,
     private readonly idempotency: IdempotencyStore,
     private readonly audit: AuditLog,
-  ) {}
+  ) {
+    this.outbox = new Outbox(this.bus, this.idempotency);
+  }
 
-  async list(ctx: RequestContext, entity: string, query?: Query): Promise<Page> {
-    const page = await this.qe.list(ctx, entity, query);
+  /** Durable event staging — one instance, not one per dispatch. */
+  private readonly outbox: Outbox;
+
+  async list(
+    ctx: RequestContext,
+    entity: string,
+    query?: Query,
+    opts?: ListOptions,
+  ): Promise<Page> {
+    const page = await this.qe.list(ctx, entity, query, opts);
     if (entity === "department") await this.fillHeadcounts(ctx, page.items);
     return page;
+  }
+
+  /** One keyset page — see `QueryEngine.listByCursor`. */
+  listByCursor(ctx: RequestContext, entity: string, query?: Query, cursor?: string): Promise<CursorPage> {
+    return this.qe.listByCursor(ctx, entity, query, cursor);
+  }
+
+  /** Stream every matching record a page at a time — see `QueryEngine.listAll`. */
+  listAll(
+    ctx: RequestContext,
+    entity: string,
+    query: Query,
+    onPage: (items: EntityRecord[]) => void | Promise<void>,
+  ): Promise<number> {
+    return this.qe.listAll(ctx, entity, query, onPage);
+  }
+
+  /** Read a whole working set, raising rather than truncating — see `QueryEngine.listComplete`. */
+  listComplete(ctx: RequestContext, entity: string, query?: Query): Promise<EntityRecord[]> {
+    return this.qe.listComplete(ctx, entity, query);
+  }
+
+  /** Resolve records by id in driver-safe chunks — see `QueryEngine.listByIds`. */
+  listByIds(ctx: RequestContext, entity: string, ids: string[]): Promise<EntityRecord[]> {
+    return this.qe.listByIds(ctx, entity, ids);
   }
 
   async get(ctx: RequestContext, entity: string, id: string): Promise<EntityRecord> {
@@ -61,33 +97,48 @@ export class DomainService {
    */
   private async fillHeadcounts(ctx: RequestContext, departments: EntityRecord[]): Promise<void> {
     if (departments.length === 0) return;
+    // Nothing to look up if no department in this batch names a head — which is
+    // the common case on a fresh tenant, and free to check.
+    if (!departments.some((d) => d.head)) {
+      for (const d of departments) d.headcount = 0;
+      return;
+    }
     const sys = systemContext(ctx.tenantId, ctx.orgId);
     try {
-      // Count via aggregate (grouped count) rather than listing rows — so the
-      // tally is exact regardless of how many employees/users exist (a paged
-      // list would silently cap at MAX_PAGE_SIZE and undercount).
-      const [empRows, userRows] = await Promise.all([
-        this.qe.aggregate(sys, "employee", { groupBy: "managerRef", measures: [{ op: "count", as: "c" }] }),
-        this.qe.aggregate(sys, "user", { groupBy: "managerId", measures: [{ op: "count", as: "c" }] }),
-      ]);
-      // One map keyed by the person ref a report points at. Employees group by
-      // `managerRef` ("employee:.." | "user:..") and users by "user:<managerId>",
-      // so a manager's combined report count is a single lookup.
-      const reportsByManager = new Map<string, number>();
-      for (const r of empRows) {
-        const key = r.key != null ? String(r.key).trim() : "";
-        if (key) reportsByManager.set(key, (reportsByManager.get(key) ?? 0) + (r.measures.c ?? 0));
-      }
-      for (const r of userRows) {
-        const mid = r.key != null ? String(r.key).trim() : "";
-        if (mid) {
-          const key = `user:${mid}`;
-          reportsByManager.set(key, (reportsByManager.get(key) ?? 0) + (r.measures.c ?? 0));
-        }
-      }
+      // Two grouped counts over the whole employee and user tables. They are
+      // exact (a paged list would silently cap at MAX_PAGE_SIZE and undercount)
+      // but they ran on every department read, including a single `get` — so the
+      // result is cached and invalidated by employee/user events rather than
+      // recomputed per request.
+      const reportsByManager = await cache.wrap(
+        headcountsKey(ctx.tenantId, ctx.orgId),
+        60_000,
+        async () => {
+          const [empRows, userRows] = await Promise.all([
+            this.qe.aggregate(sys, "employee", { groupBy: "managerRef", measures: [{ op: "count", as: "c" }] }),
+            this.qe.aggregate(sys, "user", { groupBy: "managerId", measures: [{ op: "count", as: "c" }] }),
+          ]);
+          // One map keyed by the person ref a report points at. Employees group by
+          // `managerRef` ("employee:.." | "user:..") and users by "user:<managerId>",
+          // so a manager's combined report count is a single lookup.
+          const counts: Record<string, number> = {};
+          for (const r of empRows) {
+            const key = r.key != null ? String(r.key).trim() : "";
+            if (key) counts[key] = (counts[key] ?? 0) + (r.measures.c ?? 0);
+          }
+          for (const r of userRows) {
+            const mid = r.key != null ? String(r.key).trim() : "";
+            if (mid) {
+              const key = `user:${mid}`;
+              counts[key] = (counts[key] ?? 0) + (r.measures.c ?? 0);
+            }
+          }
+          return counts;
+        },
+      );
       for (const d of departments) {
         const head = d.head ? String(d.head) : "";
-        d.headcount = head ? reportsByManager.get(head) ?? 0 : 0;
+        d.headcount = head ? reportsByManager[head] ?? 0 : 0;
       }
     } catch {
       /* counting failed (e.g. unreadable) — leave the stored headcount as-is */
@@ -112,17 +163,16 @@ export class DomainService {
 
   async create(ctx: RequestContext, entity: string, input: unknown): Promise<EntityRecord> {
     const computed = await this.autoNumber(ctx, entity, input);
-    const record = computed
-      ? await this.qe.createWithComputed(ctx, entity, input, computed)
-      : await this.qe.create(ctx, entity, input);
-    this.audit.append(ctx, {
-      entity,
-      recordId: record.id,
-      action: "create",
-      summary: `created ${entity}`,
+    return this.commitAndPublish(ctx, async () => {
+      const record = computed
+        ? await this.qe.createWithComputed(ctx, entity, input, computed)
+        : await this.qe.create(ctx, entity, input);
+      return {
+        result: record,
+        audit: { entity, recordId: record.id, action: "create", summary: `created ${entity}` },
+        events: [this.event(ctx, `${entity}.created`, { id: record.id, record })],
+      };
     });
-    await this.dispatch(this.event(ctx, `${entity}.created`, { id: record.id, record }));
-    return record;
   }
 
   /**
@@ -137,10 +187,14 @@ export class DomainService {
     input: unknown,
     computed: Record<string, FieldValue>,
   ): Promise<EntityRecord> {
-    const record = await this.qe.createWithComputed(ctx, entity, input, computed);
-    this.audit.append(ctx, { entity, recordId: record.id, action: "create", summary: `created ${entity}` });
-    await this.dispatch(this.event(ctx, `${entity}.created`, { id: record.id, record }));
-    return record;
+    return this.commitAndPublish(ctx, async () => {
+      const record = await this.qe.createWithComputed(ctx, entity, input, computed);
+      return {
+        result: record,
+        audit: { entity, recordId: record.id, action: "create", summary: `created ${entity}` },
+        events: [this.event(ctx, `${entity}.created`, { id: record.id, record })],
+      };
+    });
   }
 
   /** Assign a sequential document number for bespoke entities that need one and
@@ -164,15 +218,14 @@ export class DomainService {
     patch: unknown,
     expectedVersion?: number,
   ): Promise<EntityRecord> {
-    const record = await this.qe.update(ctx, entity, id, patch, { expectedVersion });
-    this.audit.append(ctx, {
-      entity,
-      recordId: id,
-      action: "update",
-      summary: `updated ${entity}`,
+    return this.commitAndPublish(ctx, async () => {
+      const record = await this.qe.update(ctx, entity, id, patch, { expectedVersion });
+      return {
+        result: record,
+        audit: { entity, recordId: id, action: "update", summary: `updated ${entity}` },
+        events: [this.event(ctx, `${entity}.updated`, { id, record })],
+      };
     });
-    await this.dispatch(this.event(ctx, `${entity}.updated`, { id, record }));
-    return record;
   }
 
   /**
@@ -195,11 +248,11 @@ export class DomainService {
     const rule = DomainService.PROTECTED_DELETE[entity];
     if (!rule) return;
     if (rule === "always") {
-      throw new ConflictError(`${entity} records cannot be deleted — void or reverse them instead`);
+      throw new ConflictError(`${entity} records cannot be deleted — void or reverse them instead`).withKey("err.protectedDelete", { entity });
     }
     const record = await this.qe.get(ctx, entity, id);
     if (String(record.status) !== "draft") {
-      throw new ConflictError(`a ${String(record.status)} ${entity} cannot be deleted — void it instead`);
+      throw new ConflictError(`a ${String(record.status)} ${entity} cannot be deleted — void it instead`).withKey("err.protectedDeleteStatus", { status: String(record.status), entity });
     }
   }
 
@@ -209,21 +262,21 @@ export class DomainService {
     // record — otherwise delete-triggered automations could never resolve
     // {{record.*}} (the row is gone by the time they run).
     const record = await this.qe.get(ctx, entity, id).catch(() => undefined);
-    await this.qe.remove(ctx, entity, id, expectedVersion);
-    this.audit.append(ctx, {
-      entity,
-      recordId: id,
-      action: "delete",
-      summary: `deleted ${entity}`,
+    await this.commitAndPublish(ctx, async () => {
+      await this.qe.remove(ctx, entity, id, expectedVersion);
+      return {
+        result: undefined,
+        audit: { entity, recordId: id, action: "delete", summary: `deleted ${entity}` },
+        events: [this.event(ctx, `${entity}.deleted`, record ? { id, record } : { id })],
+      };
     });
-    await this.dispatch(this.event(ctx, `${entity}.deleted`, record ? { id, record } : { id }));
   }
 
   /** Bulk-update many records with one patch (single round-trip). Returns the count changed. */
   async updateMany(ctx: RequestContext, entity: string, ids: string[], patch: unknown): Promise<number> {
     const changed = await this.qe.updateMany(ctx, entity, ids, patch);
     if (changed > 0) {
-      this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "update", summary: `bulk updated ${changed} ${entity}` });
+      await this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "update", summary: `bulk updated ${changed} ${entity}` });
     }
     return changed;
   }
@@ -231,11 +284,11 @@ export class DomainService {
   /** Bulk-delete many records by id (single round-trip). Returns the count deleted. */
   async removeMany(ctx: RequestContext, entity: string, ids: string[]): Promise<number> {
     if (DomainService.PROTECTED_DELETE[entity]) {
-      throw new ConflictError(`${entity} records cannot be bulk-deleted — void or reverse them instead`);
+      throw new ConflictError(`${entity} records cannot be bulk-deleted — void or reverse them instead`).withKey("err.protectedBulkDelete", { entity });
     }
     const removed = await this.qe.removeMany(ctx, entity, ids);
     if (removed > 0) {
-      this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "delete", summary: `bulk deleted ${removed} ${entity}` });
+      await this.audit.append(ctx, { entity, recordId: ids[0] ?? "*", action: "delete", summary: `bulk deleted ${removed} ${entity}` });
     }
     return removed;
   }
@@ -249,7 +302,7 @@ export class DomainService {
     expectedVersion?: number,
   ): Promise<EntityRecord> {
     const def = this.metadata.getEntity(entity);
-    if (!def.lifecycle) throw new BadRequestError(`${def.label} has no lifecycle`);
+    if (!def.lifecycle) throw new BadRequestError(`${def.label} has no lifecycle`).withKey("err.noLifecycle", { entity: def.name });
 
     const current = await this.qe.get(ctx, entity, id);
     const sm = new StateMachine(def.lifecycle);
@@ -257,7 +310,7 @@ export class DomainService {
 
     const transition = sm.find(from, action);
     if (!transition) {
-      throw new ConflictError(`cannot "${action}" a ${def.label} in state "${from}"`);
+      throw new ConflictError(`cannot "${action}" a ${def.label} in state "${from}"`).withKey("err.invalidTransition", { action, entity: def.name, state: from });
     }
 
     if (transition.requires) {
@@ -275,32 +328,37 @@ export class DomainService {
       throw new ConflictError(
         `transition blocked: ${failures.join("; ")}`,
         failures.map((m) => ({ message: m })),
-      );
+      ).withKey("err.transitionBlocked", { reasons: failures.join("; ") });
     }
 
-    const updated = await this.qe.update(
-      ctx,
-      entity,
-      id,
-      { [def.lifecycle.field]: transition.to },
-      { allowLifecycleField: true, expectedVersion },
-    );
-
-    this.audit.append(ctx, {
-      entity,
-      recordId: id,
-      action: "transition",
-      from,
-      to: transition.to,
-      summary: `${action}: ${from} → ${transition.to}`,
+    const lifecycleField = def.lifecycle.field;
+    return this.commitAndPublish(ctx, async () => {
+      const updated = await this.qe.update(
+        ctx,
+        entity,
+        id,
+        { [lifecycleField]: transition.to },
+        { allowLifecycleField: true, expectedVersion },
+      );
+      const payload = { id, from, to: transition.to, record: updated };
+      return {
+        result: updated,
+        audit: {
+          entity,
+          recordId: id,
+          action: "transition" as const,
+          from,
+          to: transition.to,
+          summary: `${action}: ${from} → ${transition.to}`,
+        },
+        // Two events: the specific action (invoice.send) and the generic stage
+        // change, so a rule can subscribe to either.
+        events: [
+          this.event(ctx, `${entity}.${action}`, payload),
+          this.event(ctx, `${entity}.stage_changed`, payload),
+        ],
+      };
     });
-
-    const outbox = new Outbox(this.bus, this.idempotency);
-    outbox.enqueue(this.event(ctx, `${entity}.${action}`, { id, from, to: transition.to, record: updated }));
-    outbox.enqueue(this.event(ctx, `${entity}.stage_changed`, { id, from, to: transition.to, record: updated }));
-    await outbox.drain();
-
-    return updated;
   }
 
   /** Lifecycle actions available to the caller for a record's current state. */
@@ -335,18 +393,45 @@ export class DomainService {
     };
   }
 
-  private async dispatch(event: DomainEvent): Promise<void> {
-    const outbox = new Outbox(this.bus, this.idempotency);
-    outbox.enqueue(event);
-    await outbox.drain();
+  /**
+   * Perform a write, its audit entry and its domain events as ONE unit of work,
+   * then publish after the commit.
+   *
+   * The staging and the change share a transaction, so an event can never
+   * describe something that was rolled back — and a change can never commit
+   * without its event being durably queued. Publication happens afterwards: a
+   * subscriber run inside the transaction would be acting on data nobody else
+   * can see yet, and would have to be undone if the write failed.
+   *
+   * Delivery failures do not propagate. The write has committed; the event stays
+   * `pending` and the outbox recovery job retries it.
+   */
+  private async commitAndPublish<T>(
+    ctx: RequestContext,
+    work: () => Promise<{ result: T; audit?: AuditInput; events: DomainEvent[] }>,
+  ): Promise<T> {
+    const staged = await this.qe.runInTransaction(async () => {
+      const out = await work();
+      if (out.audit) await this.audit.append(ctx, out.audit);
+      for (const event of out.events) await this.outbox.enqueue(event);
+      return out;
+    });
+    for (const event of staged.events) await this.outbox.deliver(event);
+    return staged.result;
   }
 
-  auditTrail(ctx: RequestContext, entity: string, id: string) {
-    return this.audit.query(scopeOf(ctx), { entity, recordId: id });
+  private async dispatch(event: DomainEvent): Promise<void> {
+    await this.outbox.enqueue(event);
+    await this.outbox.deliver(event);
+  }
+
+  auditTrail(ctx: RequestContext, entity: string, id: string): Promise<AuditEntry[]> {
+    return this.audit.query(ctx, { entity, recordId: id });
   }
 
   /** Tenant-wide recent audit activity (for the dashboard feed). */
-  recentActivity(ctx: RequestContext, limit = 12) {
-    return this.audit.query(scopeOf(ctx)).slice(0, limit);
+  recentActivity(ctx: RequestContext, limit = 12): Promise<AuditEntry[]> {
+    // Narrowed in SQL rather than by slicing a full read — the trail only grows.
+    return this.audit.query(ctx, { limit });
   }
 }

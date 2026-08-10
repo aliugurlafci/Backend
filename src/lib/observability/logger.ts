@@ -9,6 +9,29 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type LogFields = Record<string, unknown>;
 
+const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+
+/**
+ * Minimum level actually written.
+ *
+ * Read straight from `process.env` rather than through `lib/config/env`, on
+ * purpose: this is the lowest layer in the process and almost everything imports
+ * it. Routing it through the config module would mean a logger that fails to
+ * load when configuration is invalid — precisely the moment you need it to say
+ * why. An unrecognised value falls back to the default instead of throwing, for
+ * the same reason.
+ *
+ * `debug` was previously emitted unconditionally, which in production buried the
+ * lines that matter under per-request chatter.
+ */
+function configuredLevel(): LogLevel {
+  const raw = (process.env.AULA_LOG_LEVEL ?? "").trim().toLowerCase();
+  if (raw in LEVEL_RANK) return raw as LogLevel;
+  return process.env.NODE_ENV === "production" ? "info" : "debug";
+}
+
+const MIN_RANK = LEVEL_RANK[configuredLevel()];
+
 const REDACT_KEYS = new Set([
   "password",
   "token",
@@ -43,6 +66,7 @@ export class Logger {
   }
 
   log(level: LogLevel, msg: string, fields: LogFields = {}): void {
+    if (LEVEL_RANK[level] < MIN_RANK) return;
     const entry = {
       at: new Date().toISOString(),
       level,

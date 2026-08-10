@@ -69,6 +69,30 @@ export const mysqlDialect: SqlDialect = {
   existsSelect(fromWhere) {
     return `SELECT 1 AS x ${fromWhere} LIMIT 1`;
   },
+  lockingSelect(selectList, table, whereClause) {
+    // Under InnoDB's default REPEATABLE READ, `FOR UPDATE` performs a *current*
+    // read (bypassing the transaction snapshot) and gap-locks the range — so a
+    // row that does not exist yet is locked too, and two transactions cannot
+    // both insert it. That gap lock is the MySQL counterpart of MSSQL HOLDLOCK.
+    return `SELECT ${selectList} FROM ${table} WHERE ${whereClause} FOR UPDATE`;
+  },
+  dateBucketExpr(colExpr, bucket) {
+    switch (bucket) {
+      case "year":
+        return `LEFT(${colExpr}, 4)`;
+      case "month":
+        return `LEFT(${colExpr}, 7)`;
+      case "day":
+        return `LEFT(${colExpr}, 10)`;
+      case "quarter":
+        // Same shape as T-SQL, but MySQL concatenates with CONCAT (`+` is
+        // arithmetic) and needs DIV for integer division (`/` yields a decimal).
+        return `CONCAT(LEFT(${colExpr}, 4), '-Q', (CAST(SUBSTRING(${colExpr}, 6, 2) AS UNSIGNED) + 2) DIV 3)`;
+    }
+  },
+  countDistinctExpr(colExpr) {
+    return `COUNT(DISTINCT ${colExpr})`;
+  },
 
   returningId() {
     // The assigned id is read from the driver's insertId — no OUTPUT clause.

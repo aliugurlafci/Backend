@@ -39,6 +39,17 @@ export interface SqlDriver {
   isDeadlock(err: unknown): boolean;
   /** Is this an "object already exists" error (idempotent DDL re-run)? */
   isAlreadyExists(err: unknown): boolean;
+  /**
+   * Is this a unique-constraint violation?
+   *
+   * Lets a caller treat "someone else inserted this row first" as a race to
+   * re-read rather than an error — the insert-or-lock pattern behind stock
+   * balances.
+   */
+  isUniqueViolation(err: unknown): boolean;
+
+  /** Is a transaction currently active on this driver's async context? */
+  inTransaction(): boolean;
 }
 
 /** Retries for a transaction chosen as a deadlock victim / lock-timeout casualty. */

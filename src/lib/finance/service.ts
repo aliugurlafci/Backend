@@ -13,7 +13,10 @@ import type { RequestContext } from "@/lib/context/types";
 import { getQueryEngine } from "@/lib/data/store";
 import type { QueryEngine } from "@/lib/data/query-engine";
 import { BadRequestError } from "@/lib/enforcement/errors";
+import { BASE_CURRENCY } from "@/lib/config/env";
+import { lineQtyInBase } from "@/lib/inventory/uom";
 import { retryOnConflict } from "@/lib/data/optimistic";
+import { applyTevkifat } from "./tevkifat";
 import { docTotals, lineTotals } from "./totals";
 import { numberSequence, NumberSequence } from "./number-sequence";
 import { postPaymentGL } from "@/lib/accounting/postings";
@@ -24,6 +27,17 @@ export interface LineInput {
   qty: number;
   unitPrice: number;
   taxRate: number;
+  /** Line discount as a percentage of gross. See `finance/totals`. */
+  discountRate?: number;
+  /** Absolute line discount, applied after the percentage. */
+  discountAmount?: number;
+  /**
+   * The unit the quantity was entered in — a case, a kilo, a piece.
+   *
+   * Absent means the product's base unit, which is what every line written
+   * before units existed means. See `inventory/uom`.
+   */
+  uomId?: string | null;
 }
 
 export interface DocumentResult {
@@ -36,6 +50,14 @@ export interface PaymentInput {
   method: string;
   paidAt: string;
   notes?: string | null;
+  /**
+   * The till shift that took the money, when it came over a counter.
+   *
+   * Absent for every other kind of receipt — a bank transfer belongs to no
+   * shift. It is what lets a till report split its takings by method instead of
+   * into "cash" and "everything else".
+   */
+  sessionId?: string | null;
 }
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
@@ -95,11 +117,10 @@ export class FinanceService {
     docId: string,
   ): Promise<DocumentResult> {
     const doc = await this.qe.get(ctx, entity, docId);
-    const linesPage = await this.qe.list(ctx, lineEntity, {
+    const lines = await this.qe.listComplete(ctx, lineEntity, {
       filters: [{ field: parentField, op: "eq", value: docId }],
-      pageSize: 200,
     });
-    return { doc, lines: linesPage.items };
+    return { doc, lines };
   }
 
   /** Replace all lines of a document and recompute its totals. */
@@ -111,24 +132,33 @@ export class FinanceService {
     docId: string,
     lines: LineInput[],
   ): Promise<EntityRecord> {
-    const existing = await this.qe.list(ctx, lineEntity, {
+    // Must see every existing line: a page would leave the remainder orphaned
+    // against a document whose totals no longer account for them.
+    const existing = await this.qe.listComplete(ctx, lineEntity, {
       filters: [{ field: parentField, op: "eq", value: docId }],
-      pageSize: 200,
     });
     // One round-trip for the whole set instead of a read + delete per line: line
     // entities are never owner-scoped, so the bulk delete's `<entity>:delete`
     // check is the same gate the per-record path applied (record-level ABAC only
     // engages for an `ownerId`, which lines never carry).
-    if (existing.items.length) {
+    if (existing.length) {
       await this.qe.removeMany(
         ctx,
         lineEntity,
-        existing.items.map((l) => String(l.id)),
+        existing.map((l) => String(l.id)),
       );
     }
 
     for (const line of lines) {
-      const { lineTotal } = lineTotals({ qty: line.qty, unitPrice: line.unitPrice, taxRate: line.taxRate });
+      const { lineTotal, lineDiscount } = lineTotals(line);
+      // Resolved once, here, and STORED. The stock ledger reads `qtyBase`, so
+      // the quantity that moved is a fact recorded on the line rather than
+      // something re-derived at posting time from a conversion factor that may
+      // have been edited in between — which would make a posting disagree with
+      // the document it came from.
+      const qtyBase = line.productId
+        ? await lineQtyInBase(ctx, String(line.productId), line.qty, line.uomId)
+        : line.qty;
       await this.qe.createWithComputed(
         ctx,
         lineEntity,
@@ -137,20 +167,47 @@ export class FinanceService {
           productId: line.productId ?? null,
           description: line.description,
           qty: line.qty,
+          uomId: line.uomId ?? null,
           unitPrice: line.unitPrice,
+          discountRate: line.discountRate ?? 0,
+          discountAmount: line.discountAmount ?? 0,
           taxRate: line.taxRate,
         },
-        { lineTotal },
+        // `discountTotal` and `qtyBase` are derived, so they are written as
+        // computed rather than accepted from the caller — otherwise a client
+        // could state a discount that disagrees with the rate and amount beside
+        // it, or a base quantity that disagrees with the unit.
+        { lineTotal, discountTotal: lineDiscount, qtyBase },
       );
     }
 
-    const totals = docTotals(lines);
+    // The header discount is read from the document rather than passed in: it is
+    // a property of the document, and recomputing totals must produce the same
+    // answer whether it was triggered by a line edit or a header edit.
+    const header = await this.qe.get(ctx, entity, docId);
+    const totals = docTotals(lines, {
+      discountRate: Number(header.discountRate ?? 0),
+      discountAmount: Number(header.discountAmount ?? 0),
+    });
     const computed: Record<string, FieldValue> = { ...totals };
     const def = this.metadata.getEntity(entity);
+
+    // KDV tevkifatı: when the buyer withholds part of the VAT, the document
+    // total is the base plus only the collectible share. Read the ratio off the
+    // document — it is a header choice, not a per-line one.
+    let documentTotal = totals.total;
+    if (def.fields.some((f) => f.name === "tevkifatRatio")) {
+      const ratio = Number(header.tevkifatRatio ?? 0);
+      const split = applyTevkifat(totals.subtotal, totals.taxTotal, ratio);
+      computed.tevkifatTotal = split.withheld;
+      documentTotal = split.documentTotal;
+      computed.total = documentTotal;
+    }
+
     if (def.fields.some((f) => f.name === "balance")) {
       const current = await this.qe.get(ctx, entity, docId);
       const amountPaid = typeof current.amountPaid === "number" ? current.amountPaid : 0;
-      computed.balance = round2(totals.total - amountPaid);
+      computed.balance = round2(documentTotal - amountPaid);
     }
     return this.qe.patchComputed(ctx, entity, docId, computed);
   }
@@ -173,12 +230,12 @@ export class FinanceService {
   // ---- invoices: payments + conversion (AR) ----
 
   async listPayments(ctx: RequestContext, invoiceId: string): Promise<EntityRecord[]> {
-    const page = await this.qe.list(ctx, "payment", {
+    // The invoice's paid total is derived from these, so a page would misstate
+    // the balance rather than merely shorten a list.
+    return this.qe.listComplete(ctx, "payment", {
       filters: [{ field: "invoiceId", op: "eq", value: invoiceId }],
       sort: [{ field: "paidAt", dir: "asc" }],
-      pageSize: 200,
     });
-    return page.items;
   }
 
   /** Record a payment, post it to the GL, then recompute the invoice — atomically. */
@@ -192,7 +249,7 @@ export class FinanceService {
     );
     const balance = round2(Number(invoice.total ?? 0) - already);
     if (input.amount > balance + 0.005) {
-      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`);
+      throw new BadRequestError(`payment ${round2(input.amount)} exceeds the outstanding balance ${balance}`).withKey("err.paymentExceedsBalance", { amount: round2(input.amount), balance });
     }
     return this.qe.runInTransaction(async () => {
       const number = await this.seq.next(ctx.tenantId, "P");
@@ -207,6 +264,7 @@ export class FinanceService {
           amount: input.amount,
           method: input.method,
           paidAt: input.paidAt,
+          sessionId: input.sessionId ?? null,
           notes: input.notes ?? null,
         },
         { number },
@@ -235,6 +293,59 @@ export class FinanceService {
       }
       return this.qe.patchComputed(ctx, "invoice", invoiceId, { amountPaid, balance, status }, invoice.version);
     });
+  }
+
+  /**
+   * Turn an opportunity into a draft quote.
+   *
+   * The missing first link. The chain ran `quote → invoice → payment`, with the
+   * pipeline sitting beside it unconnected: a deal was worked to `proposal` and
+   * whatever went to the customer was a separate document nobody could trace
+   * back to it.
+   *
+   * A deal has no lines, only an `amount` — a salesperson's estimate of what the
+   * opportunity is worth. So one line is seeded from it, described by the deal's
+   * own name, and the quote is where that estimate becomes an itemised offer.
+   * Seeding the amount rather than leaving the quote empty is the difference
+   * between a starting point and a blank form.
+   *
+   * The deal's stage is NOT advanced. Converting is not the same as having
+   * proposed — the quote is still a draft that nobody has sent — and moving
+   * somebody's pipeline underneath them as a side effect of pressing a button
+   * labelled "create quote" is the kind of helpfulness that gets undone by hand.
+   * `deal:update` is also a separate grant, so it could fail after the quote was
+   * already written.
+   */
+  async convertDealToQuote(ctx: RequestContext, dealId: string): Promise<string> {
+    const deal = await this.qe.get(ctx, "deal", dealId);
+    // A quote is addressed to somebody. A deal without an account is still an
+    // idea, and inventing a customer for it would be worse than refusing.
+    if (!deal.accountId) {
+      throw new BadRequestError("this deal has no customer; set one before creating a quote");
+    }
+    const issueDate = ctx.at.slice(0, 10);
+    // "Q", the same series a directly-raised quote draws from. A separate
+    // prefix would split the numbering in two and make "quote 14" ambiguous.
+    const quote = await this.createDocument(ctx, "quote", "Q", {
+      accountId: String(deal.accountId),
+      dealId,
+      currencyCode: BASE_CURRENCY,
+      validUntil: addDays(issueDate, 30),
+      status: "draft",
+      branchId: deal.branchId ?? null,
+      dealerId: deal.dealerId ?? null,
+    });
+    const amount = Number(deal.amount ?? 0);
+    await this.replaceLines(ctx, "quote", "quoteLine", "quoteId", quote.id, [
+      {
+        productId: null,
+        description: String(deal.name ?? "Opportunity"),
+        qty: 1,
+        unitPrice: amount > 0 ? amount : 0,
+        taxRate: 0,
+      },
+    ]);
+    return quote.id;
   }
 
   /** Convert an accepted quote into a draft invoice (copies lines). */
@@ -268,12 +379,13 @@ export class FinanceService {
   // cap guards against runaway generation from a very stale `nextRun`.
   async generateDueInvoices(ctx: RequestContext, today = ctx.at.slice(0, 10)): Promise<string[]> {
     const MAX_CATCHUP = 60; // safety cap per plan per run
-    const plans = await this.qe.list(ctx, "recurringPlan", {
+    // Every active plan must run: a page would silently stop billing whichever
+    // customers happened to fall past the cap.
+    const plans = await this.qe.listComplete(ctx, "recurringPlan", {
       filters: [{ field: "active", op: "eq", value: true }],
-      pageSize: 200,
     });
     const generated: string[] = [];
-    for (const plan of plans.items) {
+    for (const plan of plans) {
       const startNextRun = String(plan.nextRun ?? "");
       let cursor = startNextRun;
       let cycles = 0;
@@ -307,18 +419,31 @@ export class FinanceService {
     return generated;
   }
 
-  /** Flag sent/partial invoices past their due date as overdue. */
+  /**
+   * Flag sent/partial invoices past their due date as overdue.
+   *
+   * Streams rather than reading a page: the invoice table only ever grows, and
+   * a nightly job that stops looking after N rows leaves the oldest unpaid
+   * invoices — precisely the ones that matter — permanently un-flagged.
+   *
+   * Paging while writing is safe *here* because the query is unfiltered and the
+   * default order (`createdAt DESC, id ASC`) is over immutable columns, so a row
+   * this loop updates neither moves between pages nor drops out of the set. Do
+   * not "optimise" this by filtering on `status` — rows would leave the result
+   * set as they were flagged and every subsequent page would skip that many.
+   */
   async markOverdue(ctx: RequestContext, today = ctx.at.slice(0, 10)): Promise<number> {
-    const page = await this.qe.list(ctx, "invoice", { pageSize: 500 });
     let count = 0;
-    for (const inv of page.items) {
-      const status = String(inv.status);
-      const balance = typeof inv.balance === "number" ? inv.balance : 0;
-      if ((status === "sent" || status === "partial") && balance > 0 && inv.dueDate && String(inv.dueDate) < today) {
-        await this.qe.patchComputed(ctx, "invoice", inv.id, { status: "overdue" });
-        count++;
+    await this.qe.listAll(ctx, "invoice", {}, async (invoices) => {
+      for (const inv of invoices) {
+        const status = String(inv.status);
+        const balance = typeof inv.balance === "number" ? inv.balance : 0;
+        if ((status === "sent" || status === "partial") && balance > 0 && inv.dueDate && String(inv.dueDate) < today) {
+          await this.qe.patchComputed(ctx, "invoice", inv.id, { status: "overdue" });
+          count++;
+        }
       }
-    }
+    });
     return count;
   }
 }

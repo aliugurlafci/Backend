@@ -131,17 +131,37 @@ export function isIdLike(col: ColumnDesc): boolean {
   return Boolean(col.idLike);
 }
 
+/**
+ * A number, or null when the value cannot be one.
+ *
+ * NaN must never leave this function. mysql2 interpolates it as the bare token
+ * `NaN`, which MySQL then parses as a column name — so a filter like
+ * `?filter.qty=abc` came back as "Unknown column 'NaN' in 'where clause'", a 500
+ * from a caller's typo. `Number("")` is 0 rather than NaN, which is its own
+ * trap: an unset reference column would have been stored as id 0.
+ *
+ * Null is the honest answer for both uses. In a filter, `col = NULL` matches
+ * nothing, which is exactly right for "find the rows whose id is 'abc'". In a
+ * write, the metadata schema has already rejected a non-numeric value, so
+ * reaching here at all means an internal caller — and a null is a visible
+ * absence rather than a corrupt number.
+ */
+function numeric(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value === "" || value === true || value === false) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** Coerce a JS value to the storage representation for its column kind. */
 export function toStorage(col: ColumnDesc, value: unknown): unknown {
   if (value === undefined || value === null) return null;
   switch (col.kind) {
     case "float":
     case "decimal":
-      return typeof value === "number" ? value : Number(value);
+      return numeric(value);
     case "int":
-      // "" reaches here for an unset id/reference column → store NULL, not NaN.
-      if (value === "") return null;
-      return typeof value === "number" ? value : Number(value);
+      return numeric(value);
     case "bit":
       return value === true || value === 1 || value === "true";
     default:

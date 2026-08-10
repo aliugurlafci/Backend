@@ -19,7 +19,7 @@ function csvEscape(value: FieldValue): string {
   // Neutralise CSV formula injection: a leading =, +, -, @, tab or CR makes
   // Excel/Sheets treat the cell as a formula. Prefix a single quote so it stays
   // literal text when the export is opened.
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  if (/^[=+@\t\r-]/.test(s)) s = `'${s}`;
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
@@ -65,10 +65,14 @@ export async function exportCsv(
   const entity = metadata.getEntity(entityName);
   const columns = entity.fields.map((f) => f.name);
   const header = ["id", ...columns].join(",");
-  const page = await domain.list(ctx, entityName, { pageSize: 1000 });
-  const lines = page.items.map((r) =>
-    [csvEscape(r.id), ...columns.map((c) => csvEscape(r[c] ?? null))].join(","),
-  );
+  // Stream every row rather than reading one page — the requested page size was
+  // clamped to MAX_PAGE_SIZE, so large exports were silently truncated.
+  const lines: string[] = [];
+  await domain.listAll(ctx, entityName, {}, (batch) => {
+    for (const r of batch) {
+      lines.push([csvEscape(r.id), ...columns.map((c) => csvEscape(r[c] ?? null))].join(","));
+    }
+  });
   return [header, ...lines].join("\n");
 }
 
@@ -105,7 +109,7 @@ function coerceCell(field: FieldDef, raw: string): unknown {
     case "number":
     case "currency":
     case "percent": {
-      const n = Number(raw.replace(/[^\d.\-]/g, "")); // tolerate currency symbols / thousands separators
+      const n = Number(raw.replace(/[^\d.-]/g, "")); // tolerate currency symbols / thousands separators
       return Number.isNaN(n) ? raw : n;
     }
     case "boolean": {
@@ -126,7 +130,7 @@ function coerceCell(field: FieldDef, raw: string): unknown {
 /** Loose match key: lowercased, stripped of spaces and common separators — so
  *  "Annual Revenue" / "annual_revenue" / "annualrevenue" all collide. */
 function normKey(s: string): string {
-  return s.trim().toLowerCase().replace(/[\s._\-/()]+/g, "");
+  return s.trim().toLowerCase().replace(/[\s._/()-]+/g, "");
 }
 
 /**
@@ -166,7 +170,7 @@ export async function importRows(
   if (rows.length < 2) return { created: [], errors: [], ignored: [] };
 
   const ignored: string[] = [];
-  const columns: (FieldDef | null)[] = rows[0].map((h) => {
+  const columns: (FieldDef | null)[] = (rows[0] ?? []).map((h) => {
     const header = h.trim();
     if (!header) return null;
     const field = lookup.get(normKey(header));
@@ -186,7 +190,7 @@ export async function importRows(
     const record: Record<string, unknown> = {};
     columns.forEach((field, idx) => {
       if (!field) return;
-      const raw = (rows[i][idx] ?? "").trim();
+      const raw = (rows[i]?.[idx] ?? "").trim();
       if (raw === "") return;
       record[field.name] = coerceCell(field, raw);
     });

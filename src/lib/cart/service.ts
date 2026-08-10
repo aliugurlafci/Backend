@@ -1,3 +1,4 @@
+import { BASE_CURRENCY } from "@/lib/config/env";
 /**
  * Cart (Sepet) service — the two ways a basket can be worked.
  *
@@ -122,7 +123,7 @@ export class CartService {
   private assertTransition(ctx: RequestContext, cart: EntityRecord, action: string): void {
     const from = String(cart.status ?? "open");
     const transition = this.stateMachine().find(from, action);
-    if (!transition) throw new ConflictError(`cannot "${action}" a cart in state "${from}"`);
+    if (!transition) throw new ConflictError(`cannot "${action}" a cart in state "${from}"`).withKey("err.cartTransition", { action, from });
     if (transition.requires) {
       assertAllowed(
         permissionEngine.evaluate(ctx, {
@@ -301,7 +302,7 @@ export class CartService {
     const cart = await this.qe.get(ctx, "cart", cartId);
     const status = String(cart.status ?? "open");
     if (status === "converted" || status === "cancelled") {
-      throw new ConflictError(`a ${status} cart can no longer be edited`);
+      throw new ConflictError(`a ${status} cart can no longer be edited`).withKey("err.cartNotEditable", { status });
     }
     const queued = (ACTIVE_CART_STATUSES as readonly string[]).includes(status);
     if (!queued) return this.finance.saveDocument(ctx, "cart", "cartLine", "cartId", cartId, header, lines);
@@ -343,7 +344,7 @@ export class CartService {
       branchId: (cart.branchId as string) ?? null,
       warehouseId: (cart.warehouseId as string) ?? null,
       accountId: (cart.accountId as string) ?? null,
-      currencyCode: String(cart.currencyCode ?? "USD"),
+      currencyCode: String(cart.currencyCode ?? BASE_CURRENCY),
       lines: lines.map((l) => ({
         productId: (l.productId as string) ?? null,
         description: String(l.description ?? ""),

@@ -12,17 +12,14 @@
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx scripts/seed.ts",
     "retenant": "tsx scripts/retenant.ts",
+    "openapi": "tsx scripts/openapi.ts",
     "lint": "eslint .",
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
     "stress": "node scripts/stress-test.mjs",
     "setup": "npm run migrate && npm run seed"
   },
   "dependencies": {
-    "@types/busboy": "^1.5.4",
-    "@types/mailparser": "^3.4.6",
-    "@types/nodemailer": "^8.0.0",
-    "@types/pdfkit": "^0.17.6",
-    "@types/ws": "^8.18.1",
+    "@aula/contracts": "file:../packages/contracts",
     "busboy": "^1.6.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -30,6 +27,7 @@
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "express-rate-limit": "^7.4.1",
+    "fast-xml-parser": "^5.10.1",
     "helmet": "^8.0.0",
     "imapflow": "^1.3.5",
     "mailparser": "^3.9.9",
@@ -41,12 +39,20 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/busboy": "^1.5.4",
     "@types/cookie-parser": "^1.4.8",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
+    "@types/mailparser": "^3.4.6",
     "@types/mssql": "^9.1.7",
     "@types/node": "^22",
+    "@types/nodemailer": "^8.0.0",
+    "@types/pdfkit": "^0.17.6",
+    "@types/ws": "^8.18.1",
+    "eslint": "^10.8.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.66.0"
   }
 }

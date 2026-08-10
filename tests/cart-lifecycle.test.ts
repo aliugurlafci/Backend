@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { firstFreeCode, MAX_CART_CODE, ACTIVE_CART_STATUSES } from "@/lib/cart/service";
-import { cartEntity } from "@/lib/metadata/entities/cart";
+import { cartEntity } from "@/lib/metadata/entities";
 import { StateMachine } from "@/lib/domain/state-machine";
 import { GRANTABLE_SYSTEM_ENTITIES, roleGrants, grantMatches } from "@/lib/permissions/policies";
 

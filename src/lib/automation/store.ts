@@ -194,8 +194,10 @@ export class AutomationStore {
 
   async listRules(tenantId: string, orgId: string): Promise<AutomationRule[]> {
     const qe = await getQueryEngine();
-    const page = await qe.list(ctxOf(tenantId, orgId), RULE, { pageSize: 500 });
-    return page.items
+    // Every rule, not a page: the engine evaluates this list on each trigger, so
+    // a rule past the cap would simply never fire.
+    const rows = await qe.listComplete(ctxOf(tenantId, orgId), RULE);
+    return rows
       .map(toRule)
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   }
@@ -393,11 +395,21 @@ export class AutomationStore {
     const filters: Filter[] = [];
     if (opts.ruleId) filters.push({ field: "ruleId", op: "eq", value: opts.ruleId });
     if (opts.status) filters.push({ field: "status", op: "eq", value: opts.status });
-    const page = await qe.list(ctxOf(tenantId, orgId), RUN, { pageSize: 500, filters });
+    // The run log grows without bound, so this is deliberately a window, not the
+    // whole table. Read exactly as many as the caller wants under the repository's
+    // default `createdAt DESC` order — i.e. the most recent runs — then order that
+    // window by `finishedAt` for display. (`finishedAt` is not a sortable field,
+    // so the ordering cannot be pushed into SQL without a schema change.)
+    const limit = opts.limit ?? 100;
+    const page = await qe.list(
+      ctxOf(tenantId, orgId),
+      RUN,
+      { pageSize: limit, filters },
+      { maxPageSize: limit },
+    );
     return page.items
       .map(toRun)
-      .sort((a, b) => (a.finishedAt < b.finishedAt ? 1 : -1))
-      .slice(0, opts.limit ?? 100);
+      .sort((a, b) => (a.finishedAt < b.finishedAt ? 1 : -1));
   }
 
   async getRun(tenantId: string, orgId: string, id: string): Promise<AutomationRun | undefined> {
@@ -430,8 +442,10 @@ export class AutomationStore {
 
   async listQueue(tenantId: string, orgId: string): Promise<QueueItem[]> {
     const qe = await getQueryEngine();
-    const page = await qe.list(ctxOf(tenantId, orgId), QUEUE, { pageSize: 300 });
-    return page.items.map(toQueue).sort((a, b) => (a.enqueuedAt < b.enqueuedAt ? 1 : -1));
+    // Must be complete: the drain loop works from this list, so anything past a
+    // page boundary would sit in the queue forever without ever being attempted.
+    const rows = await qe.listComplete(ctxOf(tenantId, orgId), QUEUE);
+    return rows.map(toQueue).sort((a, b) => (a.enqueuedAt < b.enqueuedAt ? 1 : -1));
   }
 
   async getQueueItem(tenantId: string, orgId: string, id: string): Promise<QueueItem | undefined> {
@@ -451,7 +465,7 @@ export class AutomationStore {
     patch: Partial<Pick<QueueItem, "state" | "attempts" | "lastError" | "nextAttemptAt">>,
   ): Promise<void> {
     const qe = await getQueryEngine();
-    await qe.update(ctxOf(tenantId, orgId), QUEUE, id, patch as Record<string, FieldValue>);
+    await qe.update(ctxOf(tenantId, orgId), QUEUE, id, patch);
   }
 
   async removeQueueItem(tenantId: string, orgId: string, id: string): Promise<boolean> {
@@ -469,8 +483,8 @@ export class AutomationStore {
 
   async listAssignment(tenantId: string, orgId: string): Promise<AssignmentRule[]> {
     const qe = await getQueryEngine();
-    const page = await qe.list(ctxOf(tenantId, orgId), ASSIGN, { pageSize: 200 });
-    return page.items.map(toAssignment).sort((a, b) => (a.name < b.name ? -1 : 1));
+    const rows = await qe.listComplete(ctxOf(tenantId, orgId), ASSIGN);
+    return rows.map(toAssignment).sort((a, b) => (a.name < b.name ? -1 : 1));
   }
 
   async upsertAssignment(input: {
@@ -546,13 +560,15 @@ export class AutomationStore {
 
   async getSettings(tenantId: string, orgId: string): Promise<AutomationSettings> {
     const qe = await getQueryEngine();
-    const page = await qe.list(ctxOf(tenantId, orgId), SETTING, { pageSize: 200 });
+    const rows = await qe.listComplete(ctxOf(tenantId, orgId), SETTING);
     const stored: Record<string, string> = {};
-    for (const row of page.items) stored[String(row.key)] = String(row.value ?? "");
+    for (const row of rows) stored[String(row.key)] = String(row.value ?? "");
     const d = defaultSettings();
     const bool = (k: string, def: boolean) => (k in stored ? stored[k] === "true" : def);
     const num = (k: string, def: number) => (k in stored ? Number(stored[k]) : def);
-    const str = (k: string, def: string) => (k in stored ? stored[k] : def);
+    // `?? def` as well as the `in` check: a key present with an undefined value
+    // would otherwise return undefined from a function that promises a string.
+    const str = (k: string, def: string) => (k in stored ? stored[k] ?? def : def);
     return {
       tenantId,
       orgId,
@@ -577,8 +593,8 @@ export class AutomationStore {
   async updateSettings(tenantId: string, orgId: string, patch: Record<string, unknown>): Promise<AutomationSettings> {
     const qe = await getQueryEngine();
     const ctx = ctxOf(tenantId, orgId);
-    const page = await qe.list(ctx, SETTING, { pageSize: 200 });
-    const byKey = new Map(page.items.map((r) => [String(r.key), r]));
+    const rows = await qe.listComplete(ctx, SETTING);
+    const byKey = new Map(rows.map((r) => [String(r.key), r]));
     const allowed = new Set(Object.keys(defaultSettings()));
     for (const [key, raw] of Object.entries(patch)) {
       if (!allowed.has(key)) continue; // ignore tenantId/orgId and unknowns
@@ -649,8 +665,8 @@ export class AutomationStore {
 
   async getSystemSettings(tenantId: string, orgId: string): Promise<SystemSettingValue[]> {
     const qe = await getQueryEngine();
-    const page = await qe.list(ctxOf(tenantId, orgId), SYSSET, { pageSize: 200 });
-    const stored = new Map(page.items.map((r) => [String(r.key), String(r.value ?? "")]));
+    const rows = await qe.listComplete(ctxOf(tenantId, orgId), SYSSET);
+    const stored = new Map(rows.map((r) => [String(r.key), String(r.value ?? "")]));
     return SYSTEM_SETTINGS.map((def) => {
       const fromDb = stored.has(def.key);
       const raw = fromDb ? stored.get(def.key)! : def.envValue();
@@ -673,8 +689,8 @@ export class AutomationStore {
   async updateSystemSettings(tenantId: string, orgId: string, patch: Record<string, unknown>): Promise<SystemSettingValue[]> {
     const qe = await getQueryEngine();
     const ctx = ctxOf(tenantId, orgId);
-    const page = await qe.list(ctx, SYSSET, { pageSize: 200 });
-    const byKey = new Map(page.items.map((r) => [String(r.key), r]));
+    const rows = await qe.listComplete(ctx, SYSSET);
+    const byKey = new Map(rows.map((r) => [String(r.key), r]));
     const editable = editableSystemKeys();
     for (const [key, raw] of Object.entries(patch)) {
       if (!editable.has(key)) continue; // never write bootstrap/read-only keys
@@ -707,7 +723,7 @@ export class AutomationStore {
    * Idempotent by way of upsert; no sample rules, runs or assignment pools.
    */
   async ensureDefaults(tenantId = TENANT_ID, orgId = ORG_ID): Promise<void> {
-    await this.updateSettings(tenantId, orgId, defaultSettings() as unknown as Record<string, unknown>);
+    await this.updateSettings(tenantId, orgId, defaultSettings());
     await this.upsertIntegration(tenantId, orgId, "email", {
       enabled: emailEnabledByDefault(),
       config: integrationDefaults("email"),

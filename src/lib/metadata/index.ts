@@ -8,74 +8,135 @@
 import { systemClock } from "@/lib/core/clock";
 import { MetadataRegistry } from "./registry";
 import { MetadataResolver } from "./resolver";
-import { accountEntity } from "./entities/account";
-import { dealEntity } from "./entities/deal";
-import { taskEntity } from "./entities/task";
-import { productEntity } from "./entities/product";
-import { currencyEntity } from "./entities/currency";
-import { taxRateEntity } from "./entities/tax-rate";
-import { quoteEntity } from "./entities/quote";
-import { quoteLineEntity } from "./entities/quote-line";
-import { invoiceEntity } from "./entities/invoice";
-import { invoiceLineEntity } from "./entities/invoice-line";
-import { paymentEntity } from "./entities/payment";
-import { recurringPlanEntity } from "./entities/recurring-plan";
-import { salesOrderEntity } from "./entities/sales-order";
-import { cartEntity } from "./entities/cart";
-import { cartLineEntity } from "./entities/cart-line";
-import { salesReturnEntity } from "./entities/sales-return";
-import { salesReturnLineEntity } from "./entities/sales-return-line";
-import { branchEntity } from "./entities/branch";
-import { companyEntity } from "./entities/company";
-import { dealerEntity } from "./entities/dealer";
-import { warehouseEntity } from "./entities/warehouse";
-import { supplierEntity } from "./entities/supplier";
-import { stockMovementEntity } from "./entities/stock-movement";
-import { purchaseOrderEntity } from "./entities/purchase-order";
-import { purchaseOrderLineEntity } from "./entities/purchase-order-line";
-import { goodsReceiptEntity } from "./entities/goods-receipt";
-import { goodsReceiptLineEntity } from "./entities/goods-receipt-line";
-import { ledgerAccountEntity } from "./entities/ledger-account";
-import { fiscalPeriodEntity } from "./entities/fiscal-period";
-import { journalEntryEntity } from "./entities/journal-entry";
-import { journalLineEntity } from "./entities/journal-line";
-import { vendorBillEntity } from "./entities/vendor-bill";
-import { vendorBillLineEntity } from "./entities/vendor-bill-line";
-import { billPaymentEntity } from "./entities/bill-payment";
-import { stockTransferEntity } from "./entities/stock-transfer";
-import { stockAdjustmentEntity } from "./entities/stock-adjustment";
-import { labelTemplateEntity } from "./entities/label-template";
-import { posSessionEntity } from "./entities/pos-session";
-import { departmentEntity } from "./entities/department";
-import { employeeEntity } from "./entities/employee";
-import { noteEntity } from "./entities/note";
-import { todoEntity } from "./entities/todo";
-import { fileEntity } from "./entities/file";
-import { emailEntity } from "./entities/email";
-import { emailFolderEntity } from "./entities/email-folder";
-import { calendarEventEntity } from "./entities/calendar-event";
-import { positionEntity } from "./entities/position";
-import { userEntity } from "./entities/user";
-import { userSettingEntity } from "./entities/user-setting";
-import { mobileScreenConfigEntity } from "./entities/mobile-screen-config";
-import { securityEventEntity } from "./entities/security-event";
+import type { EntityDef } from "./types";
+// Entity definitions come from the shared contracts package, so the backend
+// and the web app cannot describe the same entity differently. Which of them
+// each app REGISTERS still differs, and legitimately: the browser has no use
+// for outbox rows or webhook deliveries.
 import {
+  accountEntity,
+  assignmentRuleEntity,
+  auditEntryEntity,
+  automationIntegrationEntity,
+  automationQueueEntity,
   automationRuleEntity,
   automationRunEntity,
-  automationQueueEntity,
-  assignmentRuleEntity,
   automationSettingEntity,
-  automationIntegrationEntity,
+  billPaymentEntity,
+  branchEntity,
+  calendarEventEntity,
+  cartEntity,
+  cartLineEntity,
+  chequeEntity,
+  companyEntity,
+  currencyEntity,
+  exchangeRateEntity,
+  dealEntity,
+  dealerEntity,
+  departmentEntity,
+  eInvoiceEntity,
+  emailEntity,
+  emailFolderEntity,
+  employeeEntity,
+  fileEntity,
+  fiscalPeriodEntity,
+  goodsReceiptEntity,
+  goodsReceiptLineEntity,
+  invoiceEntity,
+  invoiceLineEntity,
+  journalEntryEntity,
+  journalLineEntity,
+  labelTemplateEntity,
+  ledgerAccountEntity,
+  mobileScreenConfigEntity,
+  noteEntity,
+  notificationEntity,
+  notificationStateEntity,
+  outboxEventEntity,
+  paymentEntity,
+  posSessionEntity,
+  positionEntity,
+  priceListEntity,
+  priceListItemEntity,
+  productEntity,
+  productCategoryEntity,
+  productBarcodeEntity,
+  productVariantValueEntity,
+  supplierProductEntity,
+  landedCostEntity,
+  purchaseReturnEntity,
+  purchaseReturnLineEntity,
+  purchaseRequestEntity,
+  purchaseRequestLineEntity,
+  supplierQuoteEntity,
+  supplierQuoteLineEntity,
+  stockLotEntity,
+  posMovementEntity,
+  customFieldEntity,
+  purchaseOrderEntity,
+  purchaseOrderLineEntity,
+  quoteEntity,
+  quoteLineEntity,
+  recurringPlanEntity,
+  revokedTokenEntity,
+  schedulerLeaseEntity,
+  uomEntity,
+  stockReservationEntity,
+  deviceTokenEntity,
+  clientErrorEntity,
+  productUomEntity,
+  erpMappingEntity,
+  erpMessageEntity,
+  operationsAlertEntity,
+  searchDocumentEntity,
+  salesOrderEntity,
+  salesOrderLineEntity,
+  deliveryNoteEntity,
+  deliveryNoteLineEntity,
+  salesReturnEntity,
+  salesReturnLineEntity,
+  securityEventEntity,
+  stockAdjustmentEntity,
+  stockAlertEntity,
+  stockBalanceEntity,
+  stockCountEntity,
+  stockCountLineEntity,
+  stockMovementEntity,
+  stockTransferEntity,
+  supplierEntity,
   systemSettingEntity,
-} from "./entities/automation";
-import type { EntityDef } from "./types";
+  taskEntity,
+  taxRateEntity,
+  todoEntity,
+  userEntity,
+  userSettingEntity,
+  vendorBillEntity,
+  vendorBillLineEntity,
+  warehouseEntity,
+  webhookDeliveryEntity,
+  webhookEndpointEntity,
+} from "./entities";
 
 export const crmEntities: EntityDef[] = [
   accountEntity,
   dealEntity,
   taskEntity,
   // sales
+  revokedTokenEntity,
+  schedulerLeaseEntity,
+  uomEntity,
+  stockReservationEntity,
+  deviceTokenEntity,
+  clientErrorEntity,
+  productUomEntity,
+  erpMappingEntity,
+  erpMessageEntity,
+  operationsAlertEntity,
+  searchDocumentEntity,
   salesOrderEntity,
+  salesOrderLineEntity,
+  deliveryNoteEntity,
+  deliveryNoteLineEntity,
   cartEntity,
   cartLineEntity,
   salesReturnEntity,
@@ -94,7 +155,19 @@ export const crmEntities: EntityDef[] = [
   // inventory / purchasing
   warehouseEntity,
   supplierEntity,
+  stockCountEntity,
+  stockCountLineEntity,
   stockMovementEntity,
+  stockBalanceEntity,
+  stockAlertEntity,
+  chequeEntity,
+  eInvoiceEntity,
+  auditEntryEntity,
+  outboxEventEntity,
+  webhookEndpointEntity,
+  webhookDeliveryEntity,
+  notificationEntity,
+  notificationStateEntity,
   purchaseOrderEntity,
   purchaseOrderLineEntity,
   goodsReceiptEntity,
@@ -113,8 +186,25 @@ export const crmEntities: EntityDef[] = [
   vendorBillLineEntity,
   billPaymentEntity,
   // finance / catalog
+  priceListEntity,
+  priceListItemEntity,
   productEntity,
+  productCategoryEntity,
+  productBarcodeEntity,
+  productVariantValueEntity,
+  supplierProductEntity,
+  landedCostEntity,
+  purchaseReturnEntity,
+  purchaseReturnLineEntity,
+  purchaseRequestEntity,
+  purchaseRequestLineEntity,
+  supplierQuoteEntity,
+  supplierQuoteLineEntity,
+  stockLotEntity,
+  posMovementEntity,
+  customFieldEntity,
   currencyEntity,
+  exchangeRateEntity,
   taxRateEntity,
   paymentEntity,
   recurringPlanEntity,
